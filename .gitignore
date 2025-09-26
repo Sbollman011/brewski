@@ -1,0 +1,131 @@
+# ---- Node / Expo / React Native base ----
+node_modules/
+**/node_modules/
+
+# Yarn / npm / pnpm logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Lockfiles (keep the one you use; uncomment to ignore others)
+# If you prefer committing lockfiles, remove these lines.
+# package-lock.json
+# yarn.lock
+# pnpm-lock.yaml
+
+# Expo / React Native bundler & cache
+.expo/
+.expo-shared/
+.expo/*
+dist/
+build/
+web-build/
+.expo-dev-cache/
+.expo-go/
+
+# Metro / haste / cache
+.haste-cache/
+metro-cache/
+
+# Watchman
+.watchmanconfig
+
+# iOS / Android native build artifacts (if ejecting or using prebuild)
+android/app/build/
+android/build/
+android/.gradle/
+android/.idea/
+android/local.properties
+android/gradlew
+android/gradlew.bat
+android/gradle/
+
+ios/build/
+ios/DerivedData/
+ios/*.xcodeproj/project.xcworkspace/
+ios/*.xcworkspace/
+ios/Pods/
+ios/Podfile.lock
+
+# Xcode user data
+**/*.xcuserstate
+**/*.xcuserdata/
+
+# Fastlane / provisioning
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+*.ipa
+*.app.dSYM.zip
+*.app.dSYM
+
+# CocoaPods
+Pods/
+
+# Misc system files
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+log.txt
+
+# Temp / caches
+.tmp/
+temp/
+.tmp-local/
+.cache/
+coverage/
+.nyc_output/
+
+# VS Code
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json
+!.vscode/tasks.json
+
+# JetBrains
+.idea/
+
+# Tests output
+junit.xml
+coverage-final.json
+
+# Generated JSON state files (server runtime artifacts)
+server/.push-tokens.json
+server/.thresholds.json
+server/.latest-targets.json
+
+# Backup / swap
+*~
+*.swp
+*.swm
+*.swo
+
+# ESLint / TypeScript caches
+.eslintcache
+.tsbuildinfo
+
+# macOS metadata
+.AppleDouble
+.LSOverride
+
+# Archive bundles
+*.tgz
+
+# Optional: ignore Expo assets cache
+assets/.cache/
+
+# Local scripts or scratch
+scripts/local/
+
+# End of .gitignore

@@ -1,0 +1,1 @@
+Placeholder assets directory. Provide real icon.png, adaptive-icon.png, and favicon.png for production branding.
