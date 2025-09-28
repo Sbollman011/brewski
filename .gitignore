@@ -129,3 +129,5 @@ assets/.cache/
 scripts/local/
 
 # End of .gitignore
+server/cert.pem
+server/key.pem
