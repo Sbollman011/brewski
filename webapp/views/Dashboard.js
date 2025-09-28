@@ -64,6 +64,12 @@ export default function Dashboard() {
   // Host resolution: auto-detect dev server host when running inside Expo in LAN mode.
   // For now this is hardcoded to your laptop LAN IP so the phone can reach the local WS bridge.
   const FORCED_HOST = '172.20.10.5'; // <-- hardcoded LAN IP
+  // If you want the app to connect to the public Cloudflare endpoint instead, set USE_PUBLIC_WS
+  // to true and ensure PUBLIC_WS_HOST matches your hostname (wss://<PUBLIC_WS_HOST>/ws)
+  const USE_PUBLIC_WS = true; // flip to `false` for local LAN development
+  const PUBLIC_WS_HOST = 'appli.railbrewouse.com';
+  // Use an alternate public path to avoid edge redirects on `/ws`
+  const PUBLIC_WS_PATH = '/_ws'; // try '/_ws' instead of '/ws'
 
   // default devices (kept for initial get requests). We'll also dynamically discover devices
   // from incoming sensor/target topics and render gauges for those as they appear.
@@ -104,6 +110,7 @@ export default function Dashboard() {
   const debug = (...args) => { if (DEBUG) console.debug(...args); };
 
   const resolveHost = () => {
+    if (USE_PUBLIC_WS) return PUBLIC_WS_HOST;
     if (FORCED_HOST) return FORCED_HOST;
     // Expo provides debuggerHost in Constants.manifest (or Constants.manifest2) when in dev.
     try {
@@ -122,7 +129,7 @@ export default function Dashboard() {
 
   const connectWebSocket = async () => {
     const host = resolveHost();
-    const url = `ws://${host}:8080`;
+  const url = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;

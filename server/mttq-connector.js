@@ -137,11 +137,14 @@ const MAX_RECENT = 200;
 let wss = null;
 let broadcast = () => {};
 if (wsPort) {
-  try {
+    try {
     const WebSocket = require('ws');
     const http = require('http');
+    const https = require('https');
     const hostBind = wsHost || '0.0.0.0';
-    const server = http.createServer((req, res) => {
+
+    // Shared request handler used by both HTTP and HTTPS servers
+    const requestHandler = (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       if (url.pathname === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -273,9 +276,29 @@ if (wsPort) {
       }
       res.writeHead(404);
       res.end();
-    });
+    };
+
+    // Decide between HTTP and HTTPS based on availability of cert/key files or env vars
+    const certPath = process.env.QUICK_MQTT_CERT || path.join(__dirname, 'cert.pem');
+    const keyPath = process.env.QUICK_MQTT_KEY || path.join(__dirname, 'key.pem');
+    let server;
+    if (fs.existsSync(certPath) && fs.existsSync(keyPath)) {
+      try {
+        const options = { cert: fs.readFileSync(certPath), key: fs.readFileSync(keyPath) };
+        server = https.createServer(options, requestHandler);
+        server._isHttps = true;
+        console.log('Starting HTTPS WebSocket bridge using cert/key:', certPath, keyPath);
+      } catch (e) {
+        console.error('Failed to start HTTPS server, falling back to HTTP:', e.message);
+        server = http.createServer(requestHandler);
+        server._isHttps = false;
+      }
+    } else {
+      server = http.createServer(requestHandler);
+      server._isHttps = false;
+    }
     wss = new WebSocket.Server({ server });
-  server.listen(wsPort, hostBind, () => console.log('WebSocket bridge listening on', hostBind + ':' + wsPort));
+    server.listen(wsPort, hostBind, () => console.log('WebSocket bridge listening on', hostBind + ':' + wsPort, server._isHttps ? '(HTTPS)' : '(HTTP)'));
     wss.on('connection', ws => {
       // optional simple token auth for WebSocket
       const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
