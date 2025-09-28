@@ -144,20 +144,100 @@ if (wsPort) {
     const hostBind = wsHost || '0.0.0.0';
 
     // Shared request handler used by both HTTP and HTTPS servers
+    const allowedOrigins = (process.env.APP_ORIGINS || 'https://appli.railbrewouse.com,https://localhost:19006').split(',').map(s => s.trim()).filter(Boolean);
+
+    // Simple in-memory token-bucket rate limiter (per IP + per-endpoint key)
+    const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 15 * 1000); // 15s default
+    const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 30); // 30 requests per window
+    const buckets = new Map(); // key -> { count, resetAt }
+
+    function rateLimitKey(req) {
+      const ip = req.socket && (req.socket.remoteAddress || req.headers['x-forwarded-for'] || 'unknown');
+      return `${ip}:${req.method}:${req.url.split('?')[0]}`;
+    }
+
+    function checkRateLimit(req) {
+      const key = rateLimitKey(req);
+      const now = Date.now();
+      const entry = buckets.get(key);
+      if (!entry || now > entry.resetAt) {
+        buckets.set(key, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+        return { ok: true, remaining: RATE_LIMIT_MAX - 1 };
+      }
+      if (entry.count >= RATE_LIMIT_MAX) return { ok: false, retryAfterMs: entry.resetAt - now };
+      entry.count += 1;
+      return { ok: true, remaining: RATE_LIMIT_MAX - entry.count };
+    }
+
     const requestHandler = (req, res) => {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+      // Security headers applied to all responses
+      const setSecurityHeaders = () => {
+        // CORS
+        const origin = req.headers.origin;
+        if (origin && allowedOrigins.includes(origin)) {
+          res.setHeader('Access-Control-Allow-Origin', origin);
+          res.setHeader('Vary', 'Origin');
+        }
+        res.setHeader('X-Content-Type-Options', 'nosniff');
+        res.setHeader('X-Frame-Options', 'DENY');
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        res.setHeader('Permissions-Policy', "geolocation=()", { replace: false });
+        // Basic CSP allowing only self for scripts/styles and the websocket wss: for connections
+        res.setHeader('Content-Security-Policy', "default-src 'none'; connect-src 'self' wss: https:; frame-ancestors 'none'; base-uri 'self'; form-action 'self';");
+        // HSTS only on HTTPS server
+        if (server && server._isHttps) {
+          res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains; preload');
+        }
+      };
+
+      // Apply rate limiting for writey or sensitive endpoints
+      const sensitivePaths = ['/publish', '/push/direct', '/thresholds/update', '/register-push', '/push/test'];
+      if (sensitivePaths.includes(url.pathname)) {
+        const rl = checkRateLimit(req);
+        if (!rl.ok) {
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': Math.ceil(rl.retryAfterMs/1000) });
+          res.end(JSON.stringify({ error: 'rate_limited', retry_after_ms: rl.retryAfterMs }));
+          return;
+        }
+        res.setHeader('X-RateLimit-Remaining', String(rl.remaining));
+      }
+
+      // Allow preflight CORS requests
+      if (req.method === 'OPTIONS') {
+        setSecurityHeaders();
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+        res.writeHead(204);
+        res.end();
+        return;
+      }
       if (url.pathname === '/health') {
+        setSecurityHeaders();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
         return;
       }
       if (url.pathname === '/info') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ connectionName, brokerUrl, username: cfg.username }));
+        // Do not expose internal broker connection details to unauthenticated callers.
+        // Only reveal sensitive fields when a BRIDGE_TOKEN is configured and provided by the caller.
+        const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
+        const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');
+        setSecurityHeaders();
+        if (BRIDGE_TOKEN && auth === BRIDGE_TOKEN) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ connectionName, brokerUrl, username: cfg.username }));
+        } else {
+          // Minimal non-sensitive info for public callers
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ server: 'brewski', ok: true }));
+        }
         return;
       }
       // list current threshold overrides (dynamic) and static patterns
       if (url.pathname === '/thresholds' && req.method === 'GET') {
+        setSecurityHeaders();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ overrides: thresholdOverrides, static: STATIC_THRESHOLDS.map(r => ({ regex: r.match.source, min: r.min, max: r.max, label: r.label })) }));
         return;
@@ -174,6 +254,7 @@ if (wsPort) {
             if (!base || Number.isNaN(min) || Number.isNaN(max)) { res.writeHead(400); res.end('base,min,max required'); return; }
             thresholdOverrides[base] = { min, max, label: obj.label || base };
             saveThresholdOverrides();
+            setSecurityHeaders();
             res.writeHead(200, { 'Content-Type':'application/json' });
             res.end(JSON.stringify({ ok:true, base, min, max }));
           } catch(e){ res.writeHead(400); res.end('bad json'); }
@@ -190,6 +271,7 @@ if (wsPort) {
             const topic = obj.topic; const value = Number(obj.value);
             if (!topic || Number.isNaN(value)) { res.writeHead(400); res.end('topic,value required'); return; }
             checkThresholdAndMaybePush(topic, value);
+            setSecurityHeaders();
             res.writeHead(200,{ 'Content-Type':'application/json'}); res.end(JSON.stringify({ ok:true }));
           } catch(e){ res.writeHead(400); res.end('bad json'); }
         });
@@ -204,6 +286,7 @@ if (wsPort) {
             const obj = JSON.parse(body||'{}');
             if (!obj.title || !obj.body) { res.writeHead(400); res.end('title,body required'); return; }
             sendExpoPush({ title: obj.title, body: obj.body, data: obj.data||{} });
+            setSecurityHeaders();
             res.writeHead(200,{ 'Content-Type':'application/json'}); res.end(JSON.stringify({ ok:true }));
           } catch(e){ res.writeHead(400); res.end('bad json'); }
         });
@@ -251,6 +334,7 @@ if (wsPort) {
           payload = found ? found.payload : null;
         }
         const retained = latestRetain.get(topic) || false;
+        setSecurityHeaders();
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ topic, payload, retained }));
         return;
@@ -267,6 +351,7 @@ if (wsPort) {
               pushTokens.add(tok);
               savePushTokens();
               console.log('[push] registered token', tok, 'total=', pushTokens.size);
+              setSecurityHeaders();
               res.writeHead(200,{ 'Content-Type':'application/json'});
               res.end(JSON.stringify({ ok:true, tokens: pushTokens.size }));
             } else { res.writeHead(400); res.end('invalid token'); }
@@ -274,6 +359,7 @@ if (wsPort) {
         });
         return;
       }
+      setSecurityHeaders();
       res.writeHead(404);
       res.end();
     };
@@ -302,9 +388,10 @@ if (wsPort) {
     wss.on('connection', ws => {
       // optional simple token auth for WebSocket
       const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
+      // authed=false if BRIDGE_TOKEN set (we require auth), otherwise authed=true
+      let authed = !BRIDGE_TOKEN;
       if (BRIDGE_TOKEN) {
         // expect a first message { type: 'auth', token: '...' } within 3s
-        let authed = false;
         const authTimer = setTimeout(() => { if (!authed) ws.close(4001, 'auth required'); }, 3000);
         const authHandler = raw => {
           try {
@@ -313,14 +400,17 @@ if (wsPort) {
               authed = true;
               clearTimeout(authTimer);
               ws.removeListener('message', authHandler);
-              // proceed to normal handlers by emitting a synthetic 'connected' message
+              // After successful auth send privileged status containing broker info
+              try {
+                ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username }, ts: Date.now() }));
+              } catch (e) { /* ignore */ }
             }
           } catch (e) { /* ignore */ }
         };
         ws.on('message', authHandler);
       }
-      // send initial state
-        ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username }, ts: Date.now() }));
+      // send minimal initial state to unauthenticated clients (do not leak brokerUrl/username)
+        ws.send(JSON.stringify({ type: 'status', data: { server: 'brewski', connectionName }, ts: Date.now() }));
       // send topics as array of strings: merge configured topics and seen topics
       const configured = Array.isArray(topics) ? topics.slice() : [];
       const seen = Array.from(seenTopics.keys());
