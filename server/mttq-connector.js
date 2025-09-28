@@ -149,6 +149,55 @@ if (wsPort) {
       const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
       const setSecurityHeadersLocal = () => setSecurityHeaders(req, res, server);
 
+      // Static web files handler (serves built web app from webapp/web-build)
+      try {
+        const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
+        if (url.pathname === '/web' || url.pathname === '/web/') {
+          // serve index
+          const indexPath = path.join(webBuildDir, 'index.html');
+          if (fs.existsSync(indexPath)) {
+            setSecurityHeadersLocal();
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            fs.createReadStream(indexPath).pipe(res);
+            return;
+          }
+        }
+        if (url.pathname.startsWith('/web/')) {
+          const rel = decodeURIComponent(url.pathname.replace(/^\/web\//, ''));
+          const filePath = path.join(webBuildDir, rel);
+          const resolved = path.resolve(filePath);
+          if (!resolved.startsWith(path.resolve(webBuildDir))) {
+            res.writeHead(403); res.end('forbidden'); return;
+          }
+          if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+            setSecurityHeadersLocal();
+            const ext = path.extname(resolved).toLowerCase();
+            const mime = ext === '.html' ? 'text/html; charset=utf-8' :
+              ext === '.js' ? 'application/javascript; charset=utf-8' :
+              ext === '.css' ? 'text/css; charset=utf-8' :
+              ext === '.json' ? 'application/json; charset=utf-8' :
+              ext === '.svg' ? 'image/svg+xml' :
+              ext === '.png' ? 'image/png' :
+              ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' :
+              ext === '.ico' ? 'image/x-icon' : 'application/octet-stream';
+            res.setHeader('Content-Type', mime);
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+            fs.createReadStream(resolved).pipe(res);
+            return;
+          }
+          // fallback to index.html for SPA routing
+          const fallback = path.join(webBuildDir, 'index.html');
+          if (fs.existsSync(fallback)) {
+            setSecurityHeadersLocal();
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            fs.createReadStream(fallback).pipe(res);
+            return;
+          }
+        }
+      } catch (e) { /* ignore static serving errors and fall through to other handlers */ }
+
       // Apply rate limiting for writey or sensitive endpoints
       const sensitivePaths = ['/publish', '/push/direct', '/thresholds/update', '/register-push', '/push/test'];
       if (sensitivePaths.includes(url.pathname)) {

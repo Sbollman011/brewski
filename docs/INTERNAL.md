@@ -48,3 +48,18 @@ This file documents runtime env vars, deployment notes, security defaults, and c
 - CI tests: add a small smoke-test that validates public vs. token-authenticated responses and presence of security headers.
 
 If you want, I can add a systemd drop-in to set `BRIDGE_TOKEN`, create a public privacy page (GitHub Pages), and add the CI smoke-test next. Tell me which to prioritize.
+
+8) Running the webapp on the web (quick guide)
+- This repo includes `webapp/` which is an Expo React Native project. Expo supports `react-native-web` and can run the app in a browser using `expo start --web`.
+- To produce a static web build suitable to serve from this server, run in `webapp/`:
+
+```bash
+# from the repo root
+cd webapp
+npm install
+expo prebuild # (if needed by your Expo setup)
+expo build:web   # produces a `web-build/` directory
+```
+
+- Copy the produced `web-build/` contents into `webapp/web-build/` on the server (or build directly on the server). The server exposes these files at `https://appli.railbrewouse.com/web/`.
+- The server will serve `index.html` for `/web/` and fallback to it for SPA routes.
