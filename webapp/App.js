@@ -10,14 +10,29 @@ import { apiFetch } from './src/api';
 // Removed push notification registration logic per request
 
 // Importing necessary components
+function ToastBanner({ toast }) {
+  if (!toast || !toast.text) return null;
+  const bg = toast.type === 'error' ? '#ffefef' : toast.type === 'success' ? '#eefaf1' : '#fffbe6';
+  const color = toast.type === 'error' ? '#a70000' : toast.type === 'success' ? '#00683a' : '#6a5800';
+  return (
+    <View style={{ marginBottom: 10 }}>
+      <View style={{ backgroundColor: bg, borderRadius: 8, padding: 8, borderWidth: 1, borderColor: (toast.type === 'error' ? '#ffd6d6' : '#cdecd8') }}>
+        <Text style={{ color, fontSize: 13 }}>{toast.text}</Text>
+      </View>
+    </View>
+  );
+}
+
 function LoginScreen({ onLogin, onForgot }) {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
+  const [toast, setToast] = useState(null);
 
   async function submit() {
     if (!username || !password) {
-      Alert.alert('Missing fields', 'Please enter username and password');
+      setToast({ type: 'error', text: 'Please provide both username and password.' });
+      setTimeout(() => setToast(null), 3500);
       return;
     }
     setLoading(true);
@@ -32,12 +47,15 @@ function LoginScreen({ onLogin, onForgot }) {
         try { localStorage.setItem('brewski_jwt', json.token); } catch (e) { /* ignore */ }
         onLogin(json.token);
       } else if (resp.status === 401) {
-        Alert.alert('Login failed', 'Invalid username or password');
+        setToast({ type: 'error', text: 'Invalid username or password.' });
+        setTimeout(() => setToast(null), 3500);
       } else {
-        Alert.alert('Login failed', json && json.error ? json.error : 'Invalid credentials');
+        setToast({ type: 'error', text: json && json.error ? json.error : 'Login failed' });
+        setTimeout(() => setToast(null), 3500);
       }
     } catch (err) {
-      Alert.alert('Network error', err.message || String(err));
+      setToast({ type: 'error', text: err.message || String(err) });
+      setTimeout(() => setToast(null), 3500);
     } finally {
       setLoading(false);
     }
@@ -46,6 +64,7 @@ function LoginScreen({ onLogin, onForgot }) {
   return (
     <View style={{ padding: 20, alignItems: 'center' }}>
       <View style={{ width: '100%', maxWidth: 420, backgroundColor: '#fff', borderRadius: 12, padding: 20, shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 8, elevation: 3 }}>
+        <ToastBanner toast={toast} />
         <Text style={{ fontSize: 24, fontWeight: '700', marginBottom: 6, color: '#0b3d2e' }}>Login</Text>
         <Text style={{ color: '#666', marginBottom: 16 }}>Access the Brew Remote portal</Text>
 
@@ -79,24 +98,31 @@ function LoginScreen({ onLogin, onForgot }) {
 function ForgotPasswordScreen({ onBack }) {
   const [email, setEmail] = useState('');
   const [sending, setSending] = useState(false);
+  const [toast, setToast] = useState(null);
 
   async function submit() {
-    if (!email) return Alert.alert('Missing email', 'Please enter your account email');
+    if (!email) {
+      setToast({ type: 'error', text: 'Please enter the email associated with your account.' });
+      setTimeout(() => setToast(null), 3500);
+      return;
+    }
     setSending(true);
     try {
       const resp = await apiFetch('/admin/api/forgot', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email })
       });
       // always return 200 per server behavior
-      Alert.alert('If an account exists', 'If that email is registered, a password reset token has been emailed.');
-      onBack();
+      setToast({ type: 'success', text: 'If that email is registered, reset instructions have been sent.' });
+      setTimeout(() => { setToast(null); onBack(); }, 2500);
     } catch (e) {
-      Alert.alert('Network error', String(e));
+      setToast({ type: 'error', text: 'Network error: ' + String(e) });
+      setTimeout(() => setToast(null), 4000);
     } finally { setSending(false); }
   }
   return (
     <View style={{ padding: 20, alignItems: 'center' }}>
       <View style={{ width: '100%', maxWidth: 420, backgroundColor: '#fff', borderRadius: 12, padding: 20, shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 6, elevation: 2 }}>
+        <ToastBanner toast={toast} />
         <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>Reset your password</Text>
         <Text style={{ color: '#666', marginBottom: 12 }}>Enter the email associated with your account and we'll send reset instructions.</Text>
         <TextInput value={email} onChangeText={setEmail} placeholder="Email" autoCapitalize="none" style={{ borderWidth:1, borderColor:'#eef0ee', padding:12, borderRadius:8, marginBottom:12, backgroundColor:'#fbfdfb' }} />
@@ -115,21 +141,28 @@ function ResetPasswordScreen({ onBack }) {
   const [token, setToken] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [toast, setToast] = useState(null);
 
   async function submit() {
-    if (!token || !newPassword) return Alert.alert('Missing fields', 'Please provide the reset token and a new password');
+    if (!token || !newPassword) {
+      setToast({ type: 'error', text: 'Please provide the reset token and a new password.' });
+      setTimeout(() => setToast(null), 3500);
+      return;
+    }
     setSubmitting(true);
     try {
       const resp = await apiFetch('/admin/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, newPassword })});
       const json = await resp.json().catch(() => ({}));
       if (resp.ok) {
-        Alert.alert('Password reset', 'Your password has been updated. You can now login.');
-        onBack();
+        setToast({ type: 'success', text: 'Password updated successfully. You can now login.' });
+        setTimeout(() => { setToast(null); onBack(); }, 2000);
       } else {
-        Alert.alert('Reset failed', json && json.error ? json.error : 'Invalid or expired token');
+        setToast({ type: 'error', text: json && json.error ? json.error : 'Invalid or expired token' });
+        setTimeout(() => setToast(null), 4000);
       }
     } catch (e) {
-      Alert.alert('Network error', String(e));
+      setToast({ type: 'error', text: 'Network error: ' + String(e) });
+      setTimeout(() => setToast(null), 4000);
     } finally { setSubmitting(false); }
   }
   return (
@@ -284,11 +317,7 @@ export default function App() {
                 }
               }} />
             )}
-            {!token && screen !== 'login' && screen !== 'landing' && (
-              // Redirect unauthenticated users trying to access non-public screens
-              // to the login screen so they can't see protected UI.
-              setTimeout(() => setScreen('login'), 10) || null
-            )}
+            {!token && screen !== 'login' && screen !== 'landing' && null}
             {screen === 'login' && !token && <LoginScreen onLogin={(t) => { setToken(t); setScreen('dashboard'); }} onForgot={() => setScreen('forgot')} />}
             {screen === 'forgot' && !token && <ForgotPasswordScreen onBack={() => setScreen('login')} />}
             {screen === 'reset' && !token && <ResetPasswordScreen onBack={() => setScreen('login')} />}
