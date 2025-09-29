@@ -678,7 +678,11 @@ if (wsPort) {
             }
             if (!protoToken && sp.length > 0) protoToken = sp[0];
           }
-          const token = maybeBearer || protoToken || urlObj.searchParams.get('token');
+          // Prefer Authorization header, then explicit query param ?token, then protocol value (if it actually carries a token)
+          const qpToken = urlObj.searchParams ? urlObj.searchParams.get('token') : null;
+          // Treat a lone 'Bearer' subprotocol as empty (placeholder)
+          if (protoToken && /^Bearer$/i.test(protoToken)) protoToken = null;
+          const token = maybeBearer || qpToken || protoToken;
 
           let authed = false;
           let claims = null;
@@ -699,6 +703,7 @@ if (wsPort) {
           }
 
           if (!authed) {
+            try { console.warn('[ws][auth-fail] sources:', { hasAuthHeader: !!maybeBearer, hasQuery: !!qpToken, hasProto: !!protoToken, secProto }); } catch(e){}
             // Reject upgrade with 401 Unauthorized and a short JSON body
             try {
               const body = JSON.stringify({ error: 'missing_or_invalid_token' });
