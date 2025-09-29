@@ -145,10 +145,10 @@ export default function Dashboard({ token }) {
     if (!token) return false; // don't attempt without JWT
     const host = resolveHost();
     const base = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
-    // include token both as query and subprotocol for robust server parsing paths
+    // include token as query param (primary). We'll add a fallback retry with a single subprotocol only if needed.
     const url = `${base}?token=${encodeURIComponent(token)}`;
     try {
-      const ws = new WebSocket(url, ['Bearer', `Bearer ${token}`]);
+      const ws = new WebSocket(url);
       wsRef.current = ws;
       ws.onopen = () => {
         // reset attempts
@@ -317,6 +317,34 @@ export default function Dashboard({ token }) {
       return false;
     }
   };
+
+  // Fallback: if first connection attempt after mount/token doesn't reach OPEN state within 1.2s, try again once with a single Bearer subprotocol carrying token.
+  useEffect(() => {
+    if (!token) return;
+    // Only consider adding fallback on the very first attempt sequence
+    if (reconnectMeta.current.attempts !== 0) return;
+    const timer = setTimeout(() => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== 1) {
+        // abort any half-open socket
+        try { ws && ws.close(); } catch (e) {}
+        const host = resolveHost();
+        const base = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
+        const fallbackUrl = `${base}?token=${encodeURIComponent(token)}`;
+        try {
+          const alt = new WebSocket(fallbackUrl, `Bearer ${token}`);
+          wsRef.current = alt;
+          alt.onopen = () => {
+            reconnectMeta.current.attempts = 0;
+            try { setConnectionError(false); } catch (e) {}
+          };
+          alt.onclose = () => { wsRef.current = null; if (token) { reconnectMeta.current.attempts += 1; scheduleReconnect(); } };
+          alt.onerror = () => { wsRef.current = null; };
+        } catch (e) { /* ignore */ }
+      }
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [token, connectAttempt]);
 
   useEffect(() => {
     if (!token) return; // wait until token provided
