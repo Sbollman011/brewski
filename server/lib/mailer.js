@@ -67,9 +67,9 @@ async function sendSmtpMail(from, to, subject, body) {
 }
 
 async function sendResetEmail(to, token) {
-  const from = process.env.RESET_FROM || `no-reply@${process.env.PUBLIC_HOST || 'railbrewouse.com'}`;
+  const from = process.env.RESET_FROM || `no-reply@${process.env.PUBLIC_HOST || 'brewingremote.com'}`;
   const subject = 'Brew Remote password reset instructions';
-  const linkHost = process.env.PUBLIC_HOST || 'appli.railbrewouse.com';
+  const linkHost = process.env.PUBLIC_HOST || 'brewingremote.com';
   const link = `https://${linkHost}/portal/#/reset?token=${encodeURIComponent(token)}`;
   const body = `You have requested a password reset for your Brew Remote account.\n\n` +
     `Use the following link to reset your password (valid for 15 minutes):\n\n${link}\n\n` +

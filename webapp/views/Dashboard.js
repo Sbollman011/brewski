@@ -67,7 +67,7 @@ export default function Dashboard({ token }) {
   // If you want the app to connect to the public Cloudflare endpoint instead, set USE_PUBLIC_WS
   // to true and ensure PUBLIC_WS_HOST matches your hostname (wss://<PUBLIC_WS_HOST>/ws)
   const USE_PUBLIC_WS = true; // flip to `false` for local LAN development
-  const PUBLIC_WS_HOST = 'appli.railbrewouse.com';
+  const PUBLIC_WS_HOST = 'api.brewingremote.com';
   // Use an alternate public path to avoid edge redirects on `/ws`
   const PUBLIC_WS_PATH = '/_ws'; // try '/_ws' instead of '/ws'
 

@@ -4,7 +4,7 @@ Internal notes — brewski server
 This file documents runtime env vars, deployment notes, security defaults, and common App Store/Play Store review items.
 
 1) Key environment variables
-- APP_ORIGINS: comma-separated list of allowed CORS origins. Default: https://appli.railbrewouse.com,https://localhost:19006
+- APP_ORIGINS: comma-separated list of allowed CORS origins. Default: https://brewingremote.com,https://localhost:19006
 - BRIDGE_TOKEN: optional shared secret for admin-level HTTP and WebSocket actions. When set, `/info` and privileged WS state are only returned to callers presenting this token (Authorization: Bearer <token> or ?token=).
 - QUICK_MQTT_CERT / QUICK_MQTT_KEY: override paths to TLS cert/key for the origin HTTPS server (defaults to `server/cert.pem` and `server/key.pem`).
 - QUICK_MQTT_WS_PORT / QUICK_MQTT_WS_HOST: listen port and host (defaults: 8080, 0.0.0.0).
@@ -61,5 +61,5 @@ expo prebuild # (if needed by your Expo setup)
 expo build:web   # produces a `web-build/` directory
 ```
 
-- Copy the produced `web-build/` contents into `webapp/web-build/` on the server (or build directly on the server). The server exposes these files at `https://appli.railbrewouse.com/web/`.
+- Copy the produced `web-build/` contents into `webapp/web-build/` on the server (or build directly on the server). The server exposes these files at `https://brewingremote.com/web/`.
 - The server will serve `index.html` for `/web/` and fallback to it for SPA routes.

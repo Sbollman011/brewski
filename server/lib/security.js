@@ -1,7 +1,7 @@
 const path = require('path');
 
 // CORS whitelist
-const allowedOrigins = (process.env.APP_ORIGINS || 'https://appli.railbrewouse.com,https://localhost:19006')
+const allowedOrigins = (process.env.APP_ORIGINS || 'https://brewingremote.com,https://localhost:19006')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 // Rate limiter config

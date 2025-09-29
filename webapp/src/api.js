@@ -6,27 +6,26 @@ export async function apiFetch(path, opts = {}) {
     if (token) init.headers['Authorization'] = `Bearer ${token}`;
   } catch (e) { /* ignore missing localStorage */ }
 
-  // When running under native/Expo (non-web), the packager/dev-server makes
-  // relative fetch() calls go to the local dev server (which is not the
-  // real backend). Detect native runtime and rewrite to the public hostname
-  // so mobile builds target the origin at runtime.
-  let finalPath = path;
+  const API_HOST = 'api.brewingremote.com'; // Option C split host
+
+  // Normalize path -> always prefix with leading slash for join safety
+  let rel = typeof path === 'string' ? path : '';
+  if (!rel.startsWith('/')) rel = '/' + rel;
+
+  // When running under native/Expo (non-web) OR when caller mistakenly passes a relative path
+  // we construct an absolute URL to the API host.
+  let finalPath = rel;
   try {
     const isWeb = (typeof window !== 'undefined' && typeof window.document !== 'undefined');
-    const isNative = !isWeb;
-    if (isNative && typeof path === 'string' && path.startsWith('/')) {
-      // Use the public host for native clients. Keep HTTPS to ensure TLS to edge.
-      finalPath = `https://appli.railbrewouse.com${path}`;
-    }
+    // Always use the API host for absolute calls now (both web & native) to avoid any ambiguity
+    finalPath = `https://${API_HOST}${rel}`;
   } catch (e) {
-    // If any detection fails, fall back to original path
-    finalPath = path;
+    finalPath = `https://${API_HOST}${rel}`;
   }
 
   const res = await fetch(finalPath, init);
   if (res.status === 401) {
     try { localStorage.removeItem('brewski_jwt'); } catch (e) {}
-    // we'll still return the response so callers can decide how to redirect
     return res;
   }
   return res;

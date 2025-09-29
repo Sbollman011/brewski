@@ -151,7 +151,7 @@ if (wsPort) {
     const https = require('https');
     const hostBind = wsHost || '0.0.0.0';
     // security helpers (CORS, headers, rate-limiter)
-    const { checkRateLimit, setSecurityHeaders } = require('./lib/security');
+  const { checkRateLimit, setSecurityHeaders, allowedOrigins } = require('./lib/security');
 
     // Helper: honor DISABLE_BRIDGE_TOKEN=1 to temporarily bypass all token gating
     function effectiveBridgeToken() {
@@ -445,11 +445,25 @@ if (wsPort) {
         }
       }
 
+      // CORS: echo allowed origin and provide preflight response
+      try {
+        const originHeader = req && req.headers ? req.headers.origin : null;
+        if (originHeader && Array.isArray(allowedOrigins) && allowedOrigins.includes(originHeader)) {
+          // Always echo origin on allowed origins and allow credentials
+          res.setHeader('Access-Control-Allow-Origin', originHeader);
+          res.setHeader('Vary', 'Origin');
+          res.setHeader('Access-Control-Allow-Credentials', 'true');
+        }
+      } catch (e) { /* best-effort */ }
+
       // Allow preflight CORS requests
       if (req.method === 'OPTIONS') {
         setSecurityHeadersLocal();
+        // What methods and headers the server accepts
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+        // If origin was echoed above, include credentials and max-age
+        try { res.setHeader('Access-Control-Max-Age', '600'); } catch (e) {}
         res.writeHead(204);
         res.end();
         return;
