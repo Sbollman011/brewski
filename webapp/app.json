@@ -4,7 +4,7 @@
     "slug": "brew-remote",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+  "icon": "./assets/logo.svg",
     "scheme": "brewremote",
     "userInterfaceStyle": "automatic",
     "updates": {
@@ -26,7 +26,7 @@
     "android": {
       "package": "com.brew.remote",
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/logo.svg",
         "backgroundColor": "#FFFFFF"
       },
       "permissions": []
