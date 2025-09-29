@@ -32,23 +32,45 @@ metro-cache/
 .watchmanconfig
 
 # iOS / Android native build artifacts (if ejecting or using prebuild)
-android/app/build/
-android/build/
-android/.gradle/
-android/.idea/
-android/local.properties
-android/gradlew
-android/gradlew.bat
-android/gradle/
+# Root-level android or any nested android directories (managed by Expo prebuild)
+**/android/app/build/
+**/android/build/
+**/android/.gradle/
+**/android/.idea/
+**/android/local.properties
+**/android/gradlew
+**/android/gradlew.bat
+**/android/gradle/
+**/android/captures/
+**/android/.cxx/
+**/android/*.iml
 
-ios/build/
-ios/DerivedData/
-ios/*.xcodeproj/project.xcworkspace/
-ios/*.xcworkspace/
-ios/Pods/
-ios/Podfile.lock
+# Android outputs
+**/*.apk
+**/*.ap_ 
+**/*.aab
+**/outputs/
+**/release/
+**/debug/
 
-# Xcode user data
+# Expo prebuild generated android folder (if you don't want to commit native code)
+webapp/android/
+
+# iOS artifacts (if later prebuilt)
+**/ios/build/
+**/ios/DerivedData/
+**/ios/*.xcodeproj/project.xcworkspace/
+**/ios/*.xcworkspace/
+**/ios/Pods/
+**/ios/Podfile.lock
+**/ios/*.xcuserstate
+**/ios/*.xcuserdata/
+**/ios/*.pbxproj/*.mode1v3
+**/ios/*.pbxproj/*.pbxuser
+
+# Xcode user data (duplicate catch-all retained below)
+
+# (Xcode user data covered above + retained for redundancy)
 **/*.xcuserstate
 **/*.xcuserdata/
 
@@ -119,8 +141,24 @@ server/.latest-targets.json
 .AppleDouble
 .LSOverride
 
-# Archive bundles
+# Archive / packages / signing
 *.tgz
+*.keystore
+*.jks
+*.pem
+*.p12
+*.mobileprovision
+*.ipa
+*.aab
+
+# Local build artifacts (generic)
+**/build/
+**/dist/
+**/web-build/
+
+# Generated APKs or bundles inside webapp/builds (keep directory but ignore contents)
+webapp/builds/*
+!webapp/builds/.gitkeep
 
 # Optional: ignore Expo assets cache
 assets/.cache/
@@ -131,3 +169,10 @@ scripts/local/
 # End of .gitignore
 server/cert.pem
 server/key.pem
+
+# Ignore restored emulator scripts if recreated temporarily
+webapp/scripts/run-emulator.sh
+webapp/scripts/create-placeholder-assets.js
+
+# Allow sample placeholders
+!webapp/scripts/README.md
