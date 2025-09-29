@@ -624,18 +624,83 @@ if (wsPort) {
     }
     // make WS auth timeout configurable (ms)
     const AUTH_TIMEOUT_MS = Number(process.env.WS_AUTH_TIMEOUT_MS || 10000);
-    wss = new WebSocket.Server({ server });
+    // Use noServer mode and perform authentication during the HTTP upgrade
+    // so we can reject unauthenticated WebSocket upgrades before establishing
+    // a WS connection. This enforces JWT auth for all WS connections.
+    wss = new WebSocket.Server({ noServer: true });
     // surface server errors instead of letting them crash the process
     server.on('error', err => {
       console.error('HTTP(S) server error:', err && err.message ? err.message : err);
     });
-    // Log upgrade requests for WS troubleshooting
+
+    // Handle HTTP->WS upgrade and enforce JWT auth (or legacy BRIDGE_TOKEN when configured)
     server.on('upgrade', (req, socket, head) => {
+      // Log the upgrade attempt for diagnostics
       try {
         const remote = req && req.socket ? (req.socket.remoteAddress + ':' + (req.socket.remotePort||'')) : 'unknown';
         console.log('[http-upgrade] upgrade path=', req.url, 'from=', remote, 'sec-proto=', req.headers['sec-websocket-protocol'], 'auth=', req.headers['authorization']);
       } catch (e) {}
+
+      // Authentication: prefer JWT (Authorization: Bearer <jwt> or ?token=<jwt>),
+      // fall back to BRIDGE_TOKEN when configured (legacy). Reject otherwise.
+      (async () => {
+        try {
+          const BRIDGE_TOKEN = effectiveBridgeToken();
+          const urlObj = (() => { try { return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`); } catch (e) { return { searchParams: new URLSearchParams() }; } })();
+          const authHeader = (req.headers['authorization'] || '').toString();
+          const parts = authHeader.split(' ');
+          const maybeBearer = (parts.length === 2 && /^Bearer$/i.test(parts[0])) ? parts[1] : null;
+          const token = maybeBearer || urlObj.searchParams.get('token');
+
+          let authed = false;
+          let claims = null;
+
+          if (token) {
+            // Try JWT first
+            try {
+              const { verifyToken } = require('./lib/auth');
+              claims = verifyToken(token);
+              if (claims) authed = true;
+            } catch (e) { /* ignore verification errors */ }
+            // If no JWT but a configured BRIDGE_TOKEN matches, accept legacy token
+            if (!authed && BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
+              authed = true;
+              claims = { sub: 'bridge', username: 'bridge-token', legacy: true };
+              console.log('[ws] upgrade auth via legacy BRIDGE_TOKEN from', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown');
+            }
+          }
+
+          if (!authed) {
+            // Reject upgrade with 401 Unauthorized and a short JSON body
+            try {
+              const body = JSON.stringify({ error: 'missing_or_invalid_token' });
+              const resHeaders = [
+                'HTTP/1.1 401 Unauthorized',
+                'Content-Type: application/json; charset=utf-8',
+                'Content-Length: ' + Buffer.byteLength(body),
+                'WWW-Authenticate: Bearer realm="brewski"',
+                '\r\n'
+              ].join('\r\n');
+              socket.write(resHeaders);
+              socket.write(body);
+            } catch (e) { /* ignore write errors */ }
+            try { socket.destroy(); } catch (e) {}
+            return;
+          }
+
+          // Attach user claims to req so the connection handler sees the authenticated user
+          req.user = { id: claims.sub, username: claims.username, legacy: !!claims.legacy };
+
+          // Accept the upgrade and emit the connection as usual
+          wss.handleUpgrade(req, socket, head, ws => {
+            try { wss.emit('connection', ws, req); } catch (e) { try { ws.close(); } catch (e) {} }
+          });
+        } catch (e) {
+          try { socket.destroy(); } catch (err) {}
+        }
+      })();
     });
+
     wss.on('error', err => {
       console.error('WebSocket server error:', err && err.message ? err.message : err);
     });
@@ -643,66 +708,14 @@ if (wsPort) {
     server.listen(wsPort, hostBind, () => console.log('WebSocket bridge listening on', hostBind + ':' + wsPort, server._isHttps ? '(HTTPS)' : '(HTTP)'));
     // Accept the optional `req` parameter to inspect the upgrade request (query params / headers)
     wss.on('connection', (ws, req) => {
-      // optional simple token auth for WebSocket
-  const BRIDGE_TOKEN = effectiveBridgeToken();
-  const urlObjForWs = (() => { try { return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`); } catch (e) { return { pathname: '/' }; } })();
-  const isPublicWsPath = urlObjForWs.pathname === '/_ws' || urlObjForWs.pathname === '/ws';
-  // If public path or no token configured, treat as authed
-  let authed = isPublicWsPath || !BRIDGE_TOKEN;
+      // At this point the HTTP upgrade already required a valid JWT or the
+      // legacy BRIDGE_TOKEN (handled during server.on('upgrade')). We treat
+      // all accepted connections as authenticated and associate the user
+      // claims from req.user with the WS connection.
+      const user = (req && req.user) ? req.user : { id: 'unknown', username: 'unknown' };
 
-      // If a BRIDGE_TOKEN is configured, try several implicit auth methods from the upgrade request
-      if (BRIDGE_TOKEN) {
-        try {
-          const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
-          const urlToken = urlObj.searchParams.get('token');
-          if (urlToken === BRIDGE_TOKEN) {
-            authed = true;
-            console.log('[ws] auth via url param', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown');
-          }
-          // Sec-WebSocket-Protocol (some clients/proxies can use this)
-          if (!authed && req.headers['sec-websocket-protocol']) {
-            const proto = String(req.headers['sec-websocket-protocol']).split(',')[0].trim();
-            if (proto === BRIDGE_TOKEN) {
-              authed = true;
-              console.log('[ws] auth via sec-websocket-protocol', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown');
-            }
-          }
-          // Authorization header during upgrade
-          if (!authed && req.headers['authorization']) {
-            const header = String(req.headers['authorization'] || '');
-            const parts = header.split(' ');
-            if (parts.length === 2 && /^Bearer$/i.test(parts[0]) && parts[1] === BRIDGE_TOKEN) {
-              authed = true;
-              console.log('[ws] auth via Authorization header', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown');
-            }
-          }
-        } catch (e) { /* ignore parse errors */ }
-      }
-
-      // If not authed yet, expect a first-message auth payload within AUTH_TIMEOUT_MS
-      if (BRIDGE_TOKEN && !authed) {
-        // Don't close unauthenticated clients — keep connections open but with limited info.
-        // Start a non-fatal warning timer for diagnostics so we can log clients that never auth.
-        const warnTimer = setTimeout(() => { if (!authed) console.log('[ws] auth not received within', AUTH_TIMEOUT_MS, 'ms from', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown'); }, AUTH_TIMEOUT_MS);
-        const authHandler = raw => {
-          try {
-            const obj = JSON.parse(raw);
-            if (obj && obj.type === 'auth' && obj.token === BRIDGE_TOKEN) {
-              authed = true;
-              clearTimeout(warnTimer);
-              ws.removeListener('message', authHandler);
-              try { ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username }, ts: Date.now() })); } catch (e) {}
-            }
-          } catch (e) { /* ignore */ }
-        };
-        ws.on('message', authHandler);
-      } else if (authed) {
-        // send privileged status immediately when already authed
-        try { ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username }, ts: Date.now() })); } catch (e) {}
-      }
-
-      // send minimal initial state to all clients (do not leak brokerUrl/username to unauthenticated)
-      try { ws.send(JSON.stringify({ type: 'status', data: { server: 'brewski', connectionName }, ts: Date.now() })); } catch (e) {}
+      // send privileged status immediately (safe because upgrade enforced auth)
+      try { ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username, user }, ts: Date.now() })); } catch (e) {}
 
       // send topics as array of strings: merge configured topics and seen topics
       const configured = Array.isArray(topics) ? topics.slice() : [];
