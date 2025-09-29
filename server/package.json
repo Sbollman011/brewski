@@ -1,15 +1,18 @@
 {
-  "name": "brewski",
+  "name": "brewski-server",
   "version": "1.0.0",
-  "description": "",
-  "main": "server/quick-mqtt-connect.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
+  "private": true,
+  "description": "MQTT -> WebSocket bridge with optional auth and admin APIs",
+  "main": "mttq-connector.js",
   "license": "ISC",
+  "scripts": {
+    "start": "node mttq-connector.js",
+    "test": "echo 'No tests yet' && exit 0"
+  },
   "dependencies": {
+    "better-sqlite3": "^8.4.0",
+    "bcrypt": "^5.1.0",
+    "jsonwebtoken": "^9.0.0",
     "mqtt": "^5.14.1",
     "ws": "^8.18.3"
   }

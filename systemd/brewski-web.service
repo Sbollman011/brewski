@@ -1,0 +1,14 @@
+[Unit]
+Description=Brewski Expo Web (serves `npx expo start --web`)
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/home/projects/brewski/webapp
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env npx expo start --web --port 8081
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

@@ -297,7 +297,15 @@ export default function Dashboard() {
     // fetch thresholds once on mount
     (async () => {
       try {
-        const res = await fetch(`http://${FORCED_HOST}:8080/thresholds`);
+        // Use a same-origin request so the browser's CSP 'connect-src "self"' policy allows it.
+        // apiFetch will attach Authorization when present; fall back to fetch on the same origin.
+        const path = '/thresholds';
+        const res = await (typeof window !== 'undefined' && window.apiFetch ? window.apiFetch(path) : fetch(path));
+        if (res.status === 401) {
+          // notify app to clear stored token and show login
+          try { window.dispatchEvent(new CustomEvent('brewski-unauthorized')); } catch (e) {}
+          return;
+        }
         const js = await res.json();
         if (js && js.overrides) setThresholds(js.overrides);
       } catch(e) {}

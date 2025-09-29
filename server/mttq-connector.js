@@ -12,6 +12,14 @@ const mqtt = require('mqtt');
 const fs = require('fs');
 const path = require('path');
 
+// Global handlers to avoid process exit during development/edits.
+process.on('uncaughtException', (err) => {
+  try { console.error('uncaughtException:', err && err.stack ? err.stack : String(err)); } catch (e) {}
+});
+process.on('unhandledRejection', (reason) => {
+  try { console.error('unhandledRejection:', reason && reason.stack ? reason.stack : String(reason)); } catch (e) {}
+});
+
 // Toggle detailed logging (set env DEBUG_BRIDGE=1 to enable)
 const DEBUG = process.env.DEBUG_BRIDGE === '1';
 // Safe debug logger (was previously a no-op due to missing console.log call)
@@ -145,58 +153,203 @@ if (wsPort) {
     // security helpers (CORS, headers, rate-limiter)
     const { checkRateLimit, setSecurityHeaders } = require('./lib/security');
 
+    // Helper: honor DISABLE_BRIDGE_TOKEN=1 to temporarily bypass all token gating
+    function effectiveBridgeToken() {
+      if (process.env.DISABLE_BRIDGE_TOKEN === '1') return null;
+      return process.env.BRIDGE_TOKEN || null;
+    }
+
     const requestHandler = (req, res) => {
-      const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-      const setSecurityHeadersLocal = () => setSecurityHeaders(req, res, server);
+      try {
+        const url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || 'localhost'}`);
+        // Global HTTP auth enforcement: require a valid JWT (BREWSKI_JWT_SECRET)
+        // or the legacy BRIDGE_TOKEN for any HTTP endpoint except:
+        // - the websocket public upgrade path (handled by ws server) '/_ws'
+        // - OPTIONS preflight requests
+        // - the admin login endpoint '/admin/api/login' (so clients can obtain JWT)
+        // If you want to permit registration, remove the restriction for '/admin/api/register'.
+        try {
+          const pathIsWsPublic = url.pathname === '/_ws';
+          const allowLogin = url.pathname === '/admin/api/login' && req.method === 'POST';
+          const allowRegister = url.pathname === '/admin/api/register' && req.method === 'POST';
+          // Only enforce this global token gate for admin API routes. Keep
+          // public pages (/, static assets, /portal) reachable without auth.
+          if (url.pathname.startsWith('/admin/api/') && req.method !== 'OPTIONS' && !allowLogin && !allowRegister) {
+            const BRIDGE_TOKEN = effectiveBridgeToken();
+            const authHeader = (req.headers['authorization'] || '').toString();
+            const parts = authHeader.split(' ');
+            const maybeBearer = (parts.length === 2 && /^Bearer$/i.test(parts[0])) ? parts[1] : null;
+            const token = maybeBearer || url.searchParams.get('token');
+            if (!token) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'missing_token' }));
+              return;
+            }
+            if (BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
+              req.user = { id: 'bridge', username: 'bridge-token' };
+            } else {
+              const { verifyToken } = require('./lib/auth');
+              const claims = verifyToken(token);
+              if (!claims) {
+                res.writeHead(401, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'invalid_token' }));
+                return;
+              }
+              req.user = { id: claims.sub, username: claims.username };
+            }
+          }
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'server_error' }));
+          return;
+        }
+        // ...existing request handling...
+        const setSecurityHeadersLocal = () => setSecurityHeaders(req, res, server);
+
+      // Proxy /portal requests to local dev server (Expo) on 8081 if present,
+      // so we can expose the portal via the main HTTPS server without needing
+      // a static build. This is best-effort: if the dev server is not up the
+      // proxy will fail and we'll fall through to static-serving or 404.
+      if (url.pathname.startsWith('/portal')) {
+          // If this is an exact request for the portal index (/portal or /portal/)
+          // prefer serving a static build (if present) rather than proxying to
+          // the dev server. For all other /portal/* paths (assets, bundles) we
+          // proxy to the local dev server.
+          const proxiedPath = url.pathname.replace(/^\/portal/, '') || '/';
+          if (proxiedPath === '/' || proxiedPath === '') {
+            // fall through to static-serving code later in the handler
+          } else {
+          const httpProxy = require('http');
+          const proxyOpts = {
+            hostname: '127.0.0.1',
+            port: 8081,
+            path: proxiedPath + (url.search || ''),
+            method: req.method,
+            headers: Object.assign({}, req.headers, { host: '127.0.0.1:8081' }),
+            timeout: 5000
+          };
+
+          const proxyReq = httpProxy.request(proxyOpts, proxyRes => {
+            // forward response headers/status
+            try {
+              // Remove hop-by-hop headers that should not be proxied
+              const headers = Object.assign({}, proxyRes.headers);
+              ['connection','keep-alive','proxy-authenticate','proxy-authorization','te','trailers','transfer-encoding','upgrade'].forEach(h => delete headers[h]);
+              res.writeHead(proxyRes.statusCode || 502, headers);
+            } catch (e) {}
+            proxyRes.pipe(res, { end: true });
+          });
+
+          proxyReq.on('timeout', () => {
+            console.error('[portal proxy] timeout contacting dev server');
+            try { proxyReq.abort(); } catch (e) {}
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'text/plain' });
+              res.end('Bad Gateway: dev server did not respond');
+            }
+          });
+
+          proxyReq.on('error', err => {
+            console.error('[portal proxy] error contacting dev server:', err && err.message ? err.message : err);
+            if (!res.headersSent) {
+              res.writeHead(502, { 'Content-Type': 'text/plain' });
+              res.end('Bad Gateway: cannot reach dev server');
+            }
+          });
+
+          // Pipe request body to proxied server
+          req.pipe(proxyReq);
+          return;
+          }
+        }
 
       // Static web files handler (serves built web app from webapp/web-build)
       try {
         const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
-        if (url.pathname === '/web' || url.pathname === '/web/') {
-          // serve index
-          const indexPath = path.join(webBuildDir, 'index.html');
-          if (fs.existsSync(indexPath)) {
-            setSecurityHeadersLocal();
-            res.setHeader('Content-Type', 'text/html; charset=utf-8');
-            res.setHeader('Cache-Control', 'no-cache');
-            fs.createReadStream(indexPath).pipe(res);
-            return;
-          }
-        }
-        if (url.pathname.startsWith('/web/')) {
-          const rel = decodeURIComponent(url.pathname.replace(/^\/web\//, ''));
-          const filePath = path.join(webBuildDir, rel);
+        // Serve static assets located in webapp/assets under /assets/
+        if (url.pathname.startsWith('/assets/')) {
+          const rel = decodeURIComponent(url.pathname.replace(/^\/assets\//, ''));
+          const filePath = path.join(path.join(__dirname, '..', 'webapp', 'assets'), rel);
           const resolved = path.resolve(filePath);
-          if (!resolved.startsWith(path.resolve(webBuildDir))) {
-            res.writeHead(403); res.end('forbidden'); return;
+          if (!resolved.startsWith(path.resolve(path.join(__dirname, '..', 'webapp', 'assets')))) {
+            res.writeHead(403); res.end('forbidden'); return true;
           }
           if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
             setSecurityHeadersLocal();
             const ext = path.extname(resolved).toLowerCase();
-            const mime = ext === '.html' ? 'text/html; charset=utf-8' :
-              ext === '.js' ? 'application/javascript; charset=utf-8' :
-              ext === '.css' ? 'text/css; charset=utf-8' :
-              ext === '.json' ? 'application/json; charset=utf-8' :
-              ext === '.svg' ? 'image/svg+xml' :
-              ext === '.png' ? 'image/png' :
-              ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' :
-              ext === '.ico' ? 'image/x-icon' : 'application/octet-stream';
+            const mime = ext === '.svg' ? 'image/svg+xml' : ext === '.png' ? 'image/png' : ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' : 'application/octet-stream';
             res.setHeader('Content-Type', mime);
             res.setHeader('Cache-Control', 'public, max-age=3600');
             fs.createReadStream(resolved).pipe(res);
-            return;
-          }
-          // fallback to index.html for SPA routing
-          const fallback = path.join(webBuildDir, 'index.html');
-          if (fs.existsSync(fallback)) {
-            setSecurityHeadersLocal();
-            res.setHeader('Content-Type', 'text/html; charset=utf-8');
-            res.setHeader('Cache-Control', 'no-cache');
-            fs.createReadStream(fallback).pipe(res);
-            return;
+            return true;
           }
         }
+        // support both legacy /web route and the requested /portal route
+        // Serve web-build at root as the canonical SPA location. This allows
+        // the portal to be accessible at `/` (no /portal prefix).
+        const serveWebBuildRoot = () => {
+          const indexPath = path.join(webBuildDir, 'index.html');
+          // Serve index for exact root
+          if (url.pathname === '/' || url.pathname === '/index.html') {
+            if (fs.existsSync(indexPath)) {
+              setSecurityHeadersLocal();
+              res.setHeader('Content-Type', 'text/html; charset=utf-8');
+              res.setHeader('Cache-Control', 'no-cache');
+              fs.createReadStream(indexPath).pipe(res);
+              return true;
+            }
+          }
+          // Try to serve a static file from web-build matching the request path
+          if (url.pathname && url.pathname !== '/') {
+            const rel = decodeURIComponent(url.pathname.replace(/^\//, ''));
+            const filePath = path.join(webBuildDir, rel);
+            const resolved = path.resolve(filePath);
+            if (resolved.startsWith(path.resolve(webBuildDir)) && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+              setSecurityHeadersLocal();
+              const ext = path.extname(resolved).toLowerCase();
+              const mime = ext === '.html' ? 'text/html; charset=utf-8' :
+                ext === '.js' ? 'application/javascript; charset=utf-8' :
+                ext === '.css' ? 'text/css; charset=utf-8' :
+                ext === '.json' ? 'application/json; charset=utf-8' :
+                ext === '.svg' ? 'image/svg+xml' :
+                ext === '.png' ? 'image/png' :
+                ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' :
+                ext === '.ico' ? 'image/x-icon' : 'application/octet-stream';
+              res.setHeader('Content-Type', mime);
+              res.setHeader('Cache-Control', 'public, max-age=3600');
+              fs.createReadStream(resolved).pipe(res);
+              return true;
+            }
+            // fallback to index.html for SPA routing
+            if (fs.existsSync(indexPath)) {
+              setSecurityHeadersLocal();
+              res.setHeader('Content-Type', 'text/html; charset=utf-8');
+              res.setHeader('Cache-Control', 'no-cache');
+              fs.createReadStream(indexPath).pipe(res);
+              return true;
+            }
+          }
+          return false;
+        };
+
+        if (serveWebBuildRoot()) return;
+        // Continue to support dev proxy for /portal/* paths (keeps dev workflow intact)
+        if (url.pathname.startsWith('/portal')) {
+          // existing dev proxy logic falls through above
+        }
       } catch (e) { /* ignore static serving errors and fall through to other handlers */ }
+
+      // Redirect root requests to the Portal SPA so the Portal is the canonical
+      // entry point. This avoids maintaining two different landing pages.
+      if (url.pathname === '/' || url.pathname === '/index.html') {
+        try {
+          setSecurityHeadersLocal();
+          // 302 redirect to the portal; the client will then load the SPA.
+          res.writeHead(302, { Location: '/portal/#/login' });
+          res.end();
+          return;
+        } catch (e) { /* if anything goes wrong, fall through */ }
+      }
 
       // Apply rate limiting for writey or sensitive endpoints
       const sensitivePaths = ['/publish', '/push/direct', '/thresholds/update', '/register-push', '/push/test'];
@@ -208,6 +361,42 @@ if (wsPort) {
           return;
         }
         res.setHeader('X-RateLimit-Remaining', String(rl.remaining));
+      }
+
+      // Enforce authentication for sensitive endpoints: require a valid JWT
+      // (signed with BREWSKI_JWT_SECRET) or allow the legacy BRIDGE_TOKEN env var.
+      if (sensitivePaths.includes(url.pathname)) {
+        try {
+          const BRIDGE_TOKEN = effectiveBridgeToken();
+          const header = (req.headers['authorization'] || '').toString();
+          const parts = header.split(' ');
+          const maybeBearer = (parts.length === 2 && /^Bearer$/i.test(parts[0])) ? parts[1] : null;
+          const token = maybeBearer || url.searchParams.get('token');
+          if (!token) {
+            // Respond with bare 401 and no JSON body so browser shows a standard 401
+            res.writeHead(401);
+            res.end();
+            return;
+          }
+          // Accept BRIDGE_TOKEN as a legacy privilege token
+          if (BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
+            req.user = { id: 'bridge', username: 'bridge-token' };
+          } else {
+            const { verifyToken } = require('./lib/auth');
+            const claims = verifyToken(token);
+            if (!claims) {
+              // invalid token -> bare 401
+              res.writeHead(401);
+              res.end();
+              return;
+            }
+            req.user = { id: claims.sub, username: claims.username };
+          }
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'server_error' }));
+          return;
+        }
       }
 
       // Allow preflight CORS requests
@@ -225,10 +414,10 @@ if (wsPort) {
         res.end(JSON.stringify({ ok: true }));
         return;
       }
-      if (url.pathname === '/info') {
+  if (url.pathname === '/info') {
         // Do not expose internal broker connection details to unauthenticated callers.
         // Only reveal sensitive fields when a BRIDGE_TOKEN is configured and provided by the caller.
-        const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
+    const BRIDGE_TOKEN = effectiveBridgeToken();
         const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');
         setSecurityHeadersLocal();
         if (BRIDGE_TOKEN && auth === BRIDGE_TOKEN) {
@@ -241,6 +430,12 @@ if (wsPort) {
         }
         return;
       }
+        // Delegate admin API to a smaller module
+        if (url.pathname.startsWith('/admin/api')) {
+          const { handleAdminApi } = require('./lib/adminApi');
+          const handled = handleAdminApi(req, res, url);
+          if (handled) return;
+        }
       // list current threshold overrides (dynamic) and static patterns
       if (url.pathname === '/thresholds' && req.method === 'GET') {
         setSecurityHeadersLocal();
@@ -310,8 +505,9 @@ if (wsPort) {
             const retain = !!obj.retain;
             if (!topic) return res.writeHead(400) && res.end('topic required');
             // optional token auth for HTTP publish
-            const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
-            if (BRIDGE_TOKEN) {
+            const BRIDGE_TOKEN = effectiveBridgeToken();
+            // If a global JWT already authenticated the request (req.user), allow it.
+            if (BRIDGE_TOKEN && !req.user) {
               const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');
               if (auth !== BRIDGE_TOKEN) { res.writeHead(401); res.end('unauthorized'); return; }
             }
@@ -328,8 +524,9 @@ if (wsPort) {
         const topic = url.searchParams.get('topic');
         if (!topic) { res.writeHead(400); res.end('topic required'); return; }
         // optional token auth for HTTP get
-        const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
-        if (BRIDGE_TOKEN) {
+        const BRIDGE_TOKEN = effectiveBridgeToken();
+        // Allow JWT-authenticated requests (req.user) even when BRIDGE_TOKEN is set.
+        if (BRIDGE_TOKEN && !req.user) {
           const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');
           if (auth !== BRIDGE_TOKEN) { res.writeHead(401); res.end('unauthorized'); return; }
         }
@@ -365,9 +562,14 @@ if (wsPort) {
         });
         return;
       }
-      setSecurityHeaders();
+      // 404 fallback
+      setSecurityHeaders(req, res, server);
       res.writeHead(404);
       res.end();
+      } catch (err) {
+        try { console.error('requestHandler error', err && err.stack ? err.stack : err); } catch (e) {}
+        try { if (res && !res.headersSent) { res.writeHead(500, { 'Content-Type': 'text/plain' }); res.end('server error'); } } catch (e) {}
+      }
     };
 
     // Decide between HTTP and HTTPS based on availability of cert/key files or env vars
@@ -389,104 +591,157 @@ if (wsPort) {
       server = http.createServer(requestHandler);
       server._isHttps = false;
     }
+    // make WS auth timeout configurable (ms)
+    const AUTH_TIMEOUT_MS = Number(process.env.WS_AUTH_TIMEOUT_MS || 10000);
     wss = new WebSocket.Server({ server });
+    // surface server errors instead of letting them crash the process
+    server.on('error', err => {
+      console.error('HTTP(S) server error:', err && err.message ? err.message : err);
+    });
+    wss.on('error', err => {
+      console.error('WebSocket server error:', err && err.message ? err.message : err);
+    });
+
     server.listen(wsPort, hostBind, () => console.log('WebSocket bridge listening on', hostBind + ':' + wsPort, server._isHttps ? '(HTTPS)' : '(HTTP)'));
-    wss.on('connection', ws => {
+    // Accept the optional `req` parameter to inspect the upgrade request (query params / headers)
+    wss.on('connection', (ws, req) => {
       // optional simple token auth for WebSocket
-      const BRIDGE_TOKEN = process.env.BRIDGE_TOKEN;
-      // authed=false if BRIDGE_TOKEN set (we require auth), otherwise authed=true
-      let authed = !BRIDGE_TOKEN;
+  const BRIDGE_TOKEN = effectiveBridgeToken();
+  const urlObjForWs = (() => { try { return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`); } catch (e) { return { pathname: '/' }; } })();
+  const isPublicWsPath = urlObjForWs.pathname === '/_ws';
+  // If public path or no token configured, treat as authed
+  let authed = isPublicWsPath || !BRIDGE_TOKEN;
+
+      // If a BRIDGE_TOKEN is configured, try several implicit auth methods from the upgrade request
       if (BRIDGE_TOKEN) {
-        // expect a first message { type: 'auth', token: '...' } within 3s
-        const authTimer = setTimeout(() => { if (!authed) ws.close(4001, 'auth required'); }, 3000);
+        try {
+          const urlObj = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+          const urlToken = urlObj.searchParams.get('token');
+          if (urlToken === BRIDGE_TOKEN) {
+            authed = true;
+            console.log('[ws] auth via url param', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown');
+          }
+          // Sec-WebSocket-Protocol (some clients/proxies can use this)
+          if (!authed && req.headers['sec-websocket-protocol']) {
+            const proto = String(req.headers['sec-websocket-protocol']).split(',')[0].trim();
+            if (proto === BRIDGE_TOKEN) {
+              authed = true;
+              console.log('[ws] auth via sec-websocket-protocol', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown');
+            }
+          }
+          // Authorization header during upgrade
+          if (!authed && req.headers['authorization']) {
+            const header = String(req.headers['authorization'] || '');
+            const parts = header.split(' ');
+            if (parts.length === 2 && /^Bearer$/i.test(parts[0]) && parts[1] === BRIDGE_TOKEN) {
+              authed = true;
+              console.log('[ws] auth via Authorization header', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown');
+            }
+          }
+        } catch (e) { /* ignore parse errors */ }
+      }
+
+      // If not authed yet, expect a first-message auth payload within AUTH_TIMEOUT_MS
+      if (BRIDGE_TOKEN && !authed) {
+        // Don't close unauthenticated clients — keep connections open but with limited info.
+        // Start a non-fatal warning timer for diagnostics so we can log clients that never auth.
+        const warnTimer = setTimeout(() => { if (!authed) console.log('[ws] auth not received within', AUTH_TIMEOUT_MS, 'ms from', (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown'); }, AUTH_TIMEOUT_MS);
         const authHandler = raw => {
           try {
             const obj = JSON.parse(raw);
             if (obj && obj.type === 'auth' && obj.token === BRIDGE_TOKEN) {
               authed = true;
-              clearTimeout(authTimer);
+              clearTimeout(warnTimer);
               ws.removeListener('message', authHandler);
-              // After successful auth send privileged status containing broker info
-              try {
-                ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username }, ts: Date.now() }));
-              } catch (e) { /* ignore */ }
+              try { ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username }, ts: Date.now() })); } catch (e) {}
             }
           } catch (e) { /* ignore */ }
         };
         ws.on('message', authHandler);
+      } else if (authed) {
+        // send privileged status immediately when already authed
+        try { ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username }, ts: Date.now() })); } catch (e) {}
       }
-      // send minimal initial state to unauthenticated clients (do not leak brokerUrl/username)
-        ws.send(JSON.stringify({ type: 'status', data: { server: 'brewski', connectionName }, ts: Date.now() }));
+
+      // send minimal initial state to all clients (do not leak brokerUrl/username to unauthenticated)
+      try { ws.send(JSON.stringify({ type: 'status', data: { server: 'brewski', connectionName }, ts: Date.now() })); } catch (e) {}
+
       // send topics as array of strings: merge configured topics and seen topics
       const configured = Array.isArray(topics) ? topics.slice() : [];
       const seen = Array.from(seenTopics.keys());
       const merged = Array.from(new Set([...configured, ...seen]));
-        ws.send(JSON.stringify({ type: 'topics', data: merged, ts: Date.now() }));
+      try { ws.send(JSON.stringify({ type: 'topics', data: merged, ts: Date.now() })); } catch (e) {}
+
       // broadcast cached latest Target/Sensor values first so clients receive any persisted state
-      // before the recent-messages history. This prevents older cached values from overwriting
-      // fresher recent messages that clients may render after connecting.
       try {
         for (const [topic, payload] of latestValue.entries()) {
           if (/\/(Target|Sensor)$/.test(topic)) {
-              ws.send(JSON.stringify({ type: 'current', topic, payload, cached: true, retained: !!latestRetain.get(topic), ts: Date.now() }));
+            try { ws.send(JSON.stringify({ type: 'current', topic, payload, cached: true, retained: !!latestRetain.get(topic), ts: Date.now() })); } catch (e) {}
           }
         }
       } catch (e) {}
-      // send recent messages buffer (include retained=false by default for history entries)
-        ws.send(JSON.stringify({ type: 'recent-messages', data: recentMessages.map(m => ({ ...m, retained: latestRetain.get(m.topic) || false })), ts: Date.now() }));
-        // listen for commands from clients (publish and get)
-        ws.on('message', raw => {
-          try {
-            const obj = JSON.parse(raw);
-            if (!obj || !obj.type) return;
-              if (obj.type === 'publish') {
-              const topic = obj.topic || 'DUMMYtest/Sensor';
-              const payload = (typeof obj.payload === 'string' || typeof obj.payload === 'number') ? String(obj.payload) : JSON.stringify(obj.payload || '');
-              // Retain Target values so future subscribers receive immediate state
-              const retain = /\/(Target)$/.test(topic);
-              client.publish(topic, payload, { qos: 0, retain }, err => {
-                if (err) {
-                  ws.send(JSON.stringify({ type: 'publish-result', success: false, error: String(err), id: obj.id, ts: Date.now() }));
-                } else {
-                  // update local caches on successful publish
-                  latestValue.set(topic, payload);
-                  latestRetain.set(topic, !!retain);
-                  ws.send(JSON.stringify({ type: 'publish-result', success: true, topic, payload, id: obj.id, retained: !!retain, ts: Date.now() }));
-                }
-              });
-              return;
-            }
-            if (obj.type === 'inventory') {
-              const inv = {};
-              for (const [k,v] of latestValue.entries()) {
-                if (/\/(Target|Sensor)$/i.test(k)) inv[k] = v;
-              }
-              // include retained flags per-topic
-              const invMeta = {};
-              for (const k of Object.keys(inv)) invMeta[k] = { value: inv[k], retained: !!latestRetain.get(k) };
-              ws.send(JSON.stringify({ type: 'inventory', data: invMeta, id: obj.id, ts: Date.now() }));
-              return;
-            }
-            if (obj.type === 'get') {
-              const topic = obj.topic;
-              if (!topic) return; // ignore invalid
-              // Prefer O(1) latestValue cache fallback to recentMessages search
-              let payload = null;
-              if (latestValue.has(topic)) payload = latestValue.get(topic);
-              else {
-                const found = recentMessages.find(m => m.topic === topic);
-                payload = found ? found.payload : null;
-              }
-              if (payload === null) {
-                dlog('[GET MISS]', topic, 'no cached value');
+
+      // send recent messages buffer
+      try { ws.send(JSON.stringify({ type: 'recent-messages', data: recentMessages.map(m => ({ ...m, retained: latestRetain.get(m.topic) || false })), ts: Date.now() })); } catch (e) {}
+
+      // listen for commands from clients (publish and get)
+      ws.on('message', raw => {
+        try {
+          const obj = JSON.parse(raw);
+          if (!obj || !obj.type) return;
+          if (obj.type === 'publish') {
+            const topic = obj.topic || 'DUMMYtest/Sensor';
+            const payload = (typeof obj.payload === 'string' || typeof obj.payload === 'number') ? String(obj.payload) : JSON.stringify(obj.payload || '');
+            const retain = /\/(Target)$/.test(topic);
+            client.publish(topic, payload, { qos: 0, retain }, err => {
+              if (err) {
+                try { ws.send(JSON.stringify({ type: 'publish-result', success: false, error: String(err), id: obj.id, ts: Date.now() })); } catch (e) {}
               } else {
-                dlog('[GET HIT]', topic, '->', payload);
+                latestValue.set(topic, payload);
+                latestRetain.set(topic, !!retain);
+                try { ws.send(JSON.stringify({ type: 'publish-result', success: true, topic, payload, id: obj.id, retained: !!retain, ts: Date.now() })); } catch (e) {}
               }
-              ws.send(JSON.stringify({ type: 'current', topic, payload, id: obj.id, retained: !!latestRetain.get(topic), ts: Date.now() }));
-              return;
+            });
+            return;
+          }
+          if (obj.type === 'inventory') {
+            const inv = {};
+            for (const [k, v] of latestValue.entries()) {
+              if (/\/(Target|Sensor)$/i.test(k)) inv[k] = v;
             }
-          } catch (e) { /* ignore invalid messages */ }
+            const invMeta = {};
+            for (const k of Object.keys(inv)) invMeta[k] = { value: inv[k], retained: !!latestRetain.get(k) };
+            try { ws.send(JSON.stringify({ type: 'inventory', data: invMeta, id: obj.id, ts: Date.now() })); } catch (e) {}
+            return;
+          }
+          if (obj.type === 'get') {
+            const topic = obj.topic;
+            if (!topic) return;
+            let payload = null;
+            if (latestValue.has(topic)) payload = latestValue.get(topic);
+            else {
+              const found = recentMessages.find(m => m.topic === topic);
+              payload = found ? found.payload : null;
+            }
+            if (payload === null) dlog('[GET MISS]', topic, 'no cached value'); else dlog('[GET HIT]', topic, '->', payload);
+            try { ws.send(JSON.stringify({ type: 'current', topic, payload, id: obj.id, retained: !!latestRetain.get(topic), ts: Date.now() })); } catch (e) {}
+            return;
+          }
+        } catch (e) { /* ignore invalid messages */ }
+      });
+
+      // log close and error events and keepalive pings
+      try {
+        ws.on('close', (code, reason) => {
+          const addr = (req && req.socket && req.socket.remoteAddress) ? req.socket.remoteAddress : 'unknown';
+          let r = '';
+          try { r = reason && reason.length ? reason.toString() : ''; } catch (e) {}
+          console.log('[ws] connection closed', { addr, code, reason: r });
         });
+        ws.on('error', err => { console.error('[ws] connection error', err && err.message ? err.message : err); });
+        const pingInterval = setInterval(() => { try { if (ws.readyState === WebSocket.OPEN) ws.ping(); } catch (e) {} }, Number(process.env.WS_PING_INTERVAL_MS || 25000));
+        ws.on('close', () => { try { clearInterval(pingInterval); } catch (e) {} });
+      } catch (e) { /* best-effort logging */ }
     });
     broadcast = obj => {
       // attach debug timestamp to all broadcasted messages so ordering can be verified client-side
