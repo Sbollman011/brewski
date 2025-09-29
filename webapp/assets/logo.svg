@@ -1,21 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 80" width="240" height="80">
-  <!-- Simple brew-themed logo: kettle + paddle + hop leaf -->
-  <defs>
-    <linearGradient id="g" x1="0" x2="1">
-      <stop offset="0" stop-color="#2e7d32" />
-      <stop offset="1" stop-color="#1b5e20" />
-    </linearGradient>
-  </defs>
-  <!-- Kettle -->
-  <rect x="8" y="16" width="72" height="48" rx="8" ry="8" fill="#fff" stroke="url(#g)" stroke-width="4" />
-  <circle cx="44" cy="40" r="10" fill="#e8f5e9" stroke="#1b5e20" stroke-width="2" />
-  <rect x="30" y="6" width="28" height="6" rx="3" fill="#1b5e20" />
-  <!-- Paddle -->
-  <rect x="92" y="14" width="8" height="44" rx="4" fill="#8d6e63" transform="rotate(-18 96 36)" />
-  <rect x="108" y="18" width="28" height="8" rx="4" fill="#8d6e63" transform="rotate(-18 122 22)" />
-  <!-- Hop leaf -->
-  <path d="M168 24c-8 2-16 10-16 18s8 16 16 18c8-2 16-10 16-18s-8-16-16-18z" fill="url(#g)" stroke="#144d19" stroke-width="1" />
-  <path d="M180 26c-6 4-10 12-10 18s4 14 10 18" fill="none" stroke="#133f15" stroke-width="1" />
-  <!-- Text -->
-  <text x="200" y="48" font-family="Helvetica, Arial, sans-serif" font-size="18" fill="#1b5e20" font-weight="700">Brew Remote</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 80" width="160" height="48" aria-hidden="true">
+  <!-- White, simplified logo so it shows on dark backgrounds -->
+  <g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Kettle outline -->
+    <rect x="6" y="18" width="56" height="44" rx="8" ry="8" fill="#ffffff" />
+    <circle cx="34" cy="40" r="8" fill="#eaf6ea" stroke="#ffffff" />
+    <rect x="28" y="6" width="24" height="5" rx="2" fill="#ffffff" />
+    <!-- Paddle simplified -->
+    <rect x="86" y="16" width="6" height="36" rx="3" fill="#ffffff" transform="rotate(-18 89 34)" />
+    <!-- Hop leaf simplified -->
+    <path d="M150 30c-6 1-12 7-12 13s6 12 12 13c6-1 12-7 12-13s-6-12-12-13z" fill="#ffffff" />
+  </g>
+  <text x="172" y="46" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#ffffff" font-weight="700">Brew Remote</text>
 </svg>

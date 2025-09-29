@@ -161,15 +161,22 @@ if (wsPort) {
 
     const requestHandler = (req, res) => {
       try {
+        // Debug: log incoming requests for connectivity troubleshooting
+        try {
+          const remote = req && req.socket ? (req.socket.remoteAddress + ':' + (req.socket.remotePort||'')) : 'unknown';
+          const ua = (req.headers && (req.headers['user-agent'] || '-'));
+          const origin = (req.headers && (req.headers['origin'] || '-'));
+          console.log('[http] incoming', req.method, req.url, 'from', remote, 'origin=', origin, 'ua=', ua);
+        } catch (e) {}
         const url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || 'localhost'}`);
-        // Global HTTP auth enforcement: require a valid JWT (BREWSKI_JWT_SECRET)
+  // Global HTTP auth enforcement: require a valid JWT (BREWSKI_JWT_SECRET)
         // or the legacy BRIDGE_TOKEN for any HTTP endpoint except:
         // - the websocket public upgrade path (handled by ws server) '/_ws'
         // - OPTIONS preflight requests
         // - the admin login endpoint '/admin/api/login' (so clients can obtain JWT)
         // If you want to permit registration, remove the restriction for '/admin/api/register'.
         try {
-          const pathIsWsPublic = url.pathname === '/_ws';
+          const pathIsWsPublic = url.pathname === '/_ws' || url.pathname === '/ws';
           const allowLogin = url.pathname === '/admin/api/login' && req.method === 'POST';
           const allowRegister = url.pathname === '/admin/api/register' && req.method === 'POST';
           // Only enforce this global token gate for admin API routes. Keep
@@ -205,6 +212,21 @@ if (wsPort) {
         }
         // ...existing request handling...
         const setSecurityHeadersLocal = () => setSecurityHeaders(req, res, server);
+
+      // Quick debug endpoint to inspect request headers and remote info. This
+      // is useful when testing from phones or external clients to confirm
+      // whether the request reached the origin and what Cloudflare/edge sent.
+      if (url.pathname === '/debug/headers') {
+        try {
+          const remote = req && req.socket ? { ip: req.socket.remoteAddress, port: req.socket.remotePort } : null;
+          setSecurityHeadersLocal();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ method: req.method, url: req.url, headers: req.headers, remote, tls: !!(req.socket && req.socket.encrypted) }));
+          return;
+        } catch (e) {
+          // fall through to error handling below
+        }
+      }
 
       // Proxy /portal requests to local dev server (Expo) on 8081 if present,
       // so we can expose the portal via the main HTTPS server without needing
@@ -320,7 +342,16 @@ if (wsPort) {
               fs.createReadStream(resolved).pipe(res);
               return true;
             }
-            // fallback to index.html for SPA routing
+            // Do not fallback to index.html for server/API routes. This
+            // prevents the SPA from swallowing endpoints like /admin/api,
+            // /publish, /get, /push, /thresholds, etc. Return false so the
+            // request can be handled by server-side handlers below.
+            const serverPrefixes = ['/admin', '/admin/api', '/publish', '/get', '/push', '/thresholds', '/register-push', '/health', '/info'];
+            if (serverPrefixes.some(p => url.pathname.startsWith(p))) {
+              // allow later handlers to process these paths
+              return false;
+            }
+            // fallback to index.html for SPA routing (non-server paths)
             if (fs.existsSync(indexPath)) {
               setSecurityHeadersLocal();
               res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -598,6 +629,13 @@ if (wsPort) {
     server.on('error', err => {
       console.error('HTTP(S) server error:', err && err.message ? err.message : err);
     });
+    // Log upgrade requests for WS troubleshooting
+    server.on('upgrade', (req, socket, head) => {
+      try {
+        const remote = req && req.socket ? (req.socket.remoteAddress + ':' + (req.socket.remotePort||'')) : 'unknown';
+        console.log('[http-upgrade] upgrade path=', req.url, 'from=', remote, 'sec-proto=', req.headers['sec-websocket-protocol'], 'auth=', req.headers['authorization']);
+      } catch (e) {}
+    });
     wss.on('error', err => {
       console.error('WebSocket server error:', err && err.message ? err.message : err);
     });
@@ -608,7 +646,7 @@ if (wsPort) {
       // optional simple token auth for WebSocket
   const BRIDGE_TOKEN = effectiveBridgeToken();
   const urlObjForWs = (() => { try { return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`); } catch (e) { return { pathname: '/' }; } })();
-  const isPublicWsPath = urlObjForWs.pathname === '/_ws';
+  const isPublicWsPath = urlObjForWs.pathname === '/_ws' || urlObjForWs.pathname === '/ws';
   // If public path or no token configured, treat as authed
   let authed = isPublicWsPath || !BRIDGE_TOKEN;
 

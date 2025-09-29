@@ -61,7 +61,8 @@ const styles = StyleSheet.create({
   brand: { fontSize: 34, fontWeight: '800', color: '#ffffff', marginBottom: 6 },
   tagline: { fontSize: 16, color: '#dff3df', marginBottom: 12, textAlign: 'center' },
   lead: { maxWidth: 920, color: '#e6f5e7', textAlign: 'center', marginBottom: 18 },
-  logo: { width: 120, height: 120, marginBottom: 10 },
+  // Smaller logo so it fits the hero nicely on desktop and mobile
+  logo: { width: 80, height: 80, marginBottom: 12, alignSelf: 'center' },
   ctaRow: { flexDirection: 'row', gap: 12 },
   // On the dark hero we invert the primary CTA to white so it stands out
   ctaPrimary: { backgroundColor: '#ffffff', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 8, marginHorizontal: 6 },

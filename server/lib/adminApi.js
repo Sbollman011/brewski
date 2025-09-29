@@ -51,6 +51,44 @@ function handleAdminApi(req, res, url) {
       return true;
     }
 
+    // Forgot password: POST { email }
+    if (url.pathname === '/admin/api/forgot' && req.method === 'POST') {
+      parseBodyJson(req, res, (err, obj) => {
+        if (err) { res.writeHead(400); res.end('bad json'); return; }
+        const email = (obj && obj.email) ? String(obj.email).trim() : '';
+        if (!email) { res.writeHead(400); res.end('email required'); return; }
+        const { findUserByEmail, signToken } = require('./auth');
+        const user = findUserByEmail(email);
+        // For privacy, always return 200 even if email not found. If found,
+        // issue a short-lived reset token (15m) and log it (replace with
+        // email delivery in production).
+        if (user) {
+          const token = signToken({ sub: user.id, username: user.username, purpose: 'reset' }, { expiresIn: '15m' });
+          console.log('[password-reset] token for', email, '->', token);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
+      return true;
+    }
+
+    // Reset password: POST { token, newPassword }
+    if (url.pathname === '/admin/api/reset' && req.method === 'POST') {
+      parseBodyJson(req, res, (err, obj) => {
+        if (err) { res.writeHead(400); res.end('bad json'); return; }
+        const token = (obj && obj.token) ? String(obj.token) : '';
+        const newPassword = (obj && obj.newPassword) ? String(obj.newPassword) : '';
+        if (!token || !newPassword) { res.writeHead(400); res.end('token and newPassword required'); return; }
+        const { verifyToken, updateUserPasswordById } = require('./auth');
+        const claims = verifyToken(token);
+        if (!claims || claims.purpose !== 'reset') { res.writeHead(400); res.end('invalid or expired token'); return; }
+        const ok = updateUserPasswordById(claims.sub, newPassword);
+        if (!ok) { res.writeHead(500); res.end('could not update password'); return; }
+        res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true }));
+      });
+      return true;
+    }
+
     // For other /admin/api/* endpoints, enforce JWT auth for sensitive operations.
     // Register and login endpoints above remain public.
     const sensitivePaths = ['/admin/api/thresholds/update', '/admin/api/push/direct', '/admin/api/publish', '/admin/api/register-push', '/admin/api/push/test'];

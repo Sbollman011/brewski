@@ -185,7 +185,7 @@ export default function App() {
                 </Pressable>
               ) : (
                 <Pressable onPress={() => { setMenuOpen(false); setScreen('login'); }} style={{paddingVertical:8}}>
-                  <Text style={styles.menuItem}>Admin login</Text>
+                  <Text style={styles.menuItem}>Login</Text>
                 </Pressable>
               )}
             </View>
@@ -202,9 +202,9 @@ export default function App() {
               }} />
             )}
             {!token && screen !== 'login' && screen !== 'landing' && (
-              <View style={{ padding: 20 }}>
-                <Text style={{ color: '#666' }}>You are not logged in. Use the menu to open Admin login.</Text>
-              </View>
+              // Redirect unauthenticated users trying to access non-public screens
+              // to the login screen so they can't see protected UI.
+              setTimeout(() => setScreen('login'), 10) || null
             )}
             {screen === 'login' && !token && <LoginScreen onLogin={(t) => { setToken(t); setScreen('dashboard'); }} />}
             {screen === 'dashboard' && <Dashboard />}
@@ -219,14 +219,14 @@ export default function App() {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: '#fff' },
-  topInset: { backgroundColor: '#263238' },
-  appBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 10, backgroundColor: '#263238' },
+  topInset: { backgroundColor: '#1b5e20' },
+  appBar: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 10, backgroundColor: '#1b5e20' },
   appTitle: { color: '#fff', fontSize: 18, fontWeight: '600', marginLeft: 8 },
   hamburger: { padding: 4 },
   bar: { width: 22, height: 3, backgroundColor: '#fff', marginVertical: 2, borderRadius: 2 },
   body: { flex: 1, flexDirection: 'row' },
-  sideMenu: { width: 200, backgroundColor: '#37474f', paddingTop: 16, paddingHorizontal: 12 },
+  sideMenu: { width: 200, backgroundColor: '#1b5e20', paddingTop: 16, paddingHorizontal: 12 },
   menuHeader: { color: '#fff', fontWeight: '700', marginBottom: 12, fontSize: 16 },
-  menuItem: { color: '#eceff1', paddingVertical: 6, fontSize: 14 },
+  menuItem: { color: '#f1f8f1', paddingVertical: 6, fontSize: 14 },
   content: { flex: 1 },
 });
