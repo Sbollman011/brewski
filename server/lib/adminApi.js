@@ -64,7 +64,15 @@ function handleAdminApi(req, res, url) {
         // email delivery in production).
         if (user) {
           const token = signToken({ sub: user.id, username: user.username, purpose: 'reset' }, { expiresIn: '15m' });
-          console.log('[password-reset] token for', email, '->', token);
+          // Attempt to send email; in environments without sendmail this will
+          // log the token to the server logs for operators to copy to the user.
+          try {
+            const { sendResetEmail } = require('./mailer');
+            const ok = sendResetEmail(user.email || email, token);
+            if (!ok) console.log('[password-reset] token for', email, '->', token);
+          } catch (e) {
+            console.log('[password-reset] token for', email, '->', token);
+          }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
