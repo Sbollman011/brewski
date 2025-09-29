@@ -4,6 +4,7 @@
     "slug": "brew-remote",
     "version": "1.0.0",
     "orientation": "portrait",
+    "icon": "./assets/icon.png",
     "scheme": "brewremote",
     "userInterfaceStyle": "automatic",
     "updates": {
@@ -22,9 +23,12 @@
         ]
       }
     },
-    
     "android": {
       "package": "com.brew.remote",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#FFFFFF"
+      },
       "permissions": []
     },
     "web": {
@@ -45,7 +49,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "17d3812e-7d39-4256-93bb-b01d45010807"
+        "projectId": ""
       }
     }
   }
