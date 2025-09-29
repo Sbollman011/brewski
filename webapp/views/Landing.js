@@ -7,7 +7,7 @@ export default function Landing({ onLoginPress, onPortalPress }) {
       <View style={styles.hero}>
         {/* Logo + headline row */}
         <View style={styles.heroTopRow}>
-          <Image source={{ uri: '/assets/logo.svg' }} style={styles.logo} resizeMode="contain" />
+          <Image source={require('../assets/logo.svg')} style={styles.logo} resizeMode="contain" />
           <View style={styles.heroTitleBlock}>
             <Text style={styles.brand}>Brew Remote</Text>
             <Text style={styles.tagline}>Real-time monitoring • Smart control • Automation</Text>
@@ -32,7 +32,7 @@ export default function Landing({ onLoginPress, onPortalPress }) {
 
       <View style={styles.sectionShell}>
         <Text style={styles.sectionTitle}>Why breweries choose us</Text>
-        <View style={styles.bullets}> 
+        <View style={styles.bullets}>
           <Text style={styles.bullet}>• Consistent batches via repeatable automated targets.</Text>
           <Text style={styles.bullet}>• Remote visibility reduces downtime & guesswork.</Text>
           <Text style={styles.bullet}>• Secure: on‑prem core with a hardened bridge.</Text>
