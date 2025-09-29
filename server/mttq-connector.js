@@ -168,7 +168,20 @@ if (wsPort) {
           const origin = (req.headers && (req.headers['origin'] || '-'));
           console.log('[http] incoming', req.method, req.url, 'from', remote, 'origin=', origin, 'ua=', ua);
         } catch (e) {}
-        const url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || 'localhost'}`);
+        let url;
+        try {
+          url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || 'localhost'}`);
+        } catch (err) {
+          // Defensive: malformed request URL (for example req.url === '//') can
+          // throw ERR_INVALID_URL from the URL constructor. Don't allow this to
+          // crash the process; return a 400 Bad Request and log the occurrence.
+          try { console.error('[requestHandler] Invalid request URL:', req.url, err && err.message); } catch (e) {}
+          try {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'invalid_url', detail: String(err && err.message) }));
+          } catch (e) {}
+          return;
+        }
   // Global HTTP auth enforcement: require a valid JWT (BREWSKI_JWT_SECRET)
         // or the legacy BRIDGE_TOKEN for any HTTP endpoint except:
         // - the websocket public upgrade path (handled by ws server) '/_ws'
@@ -179,9 +192,11 @@ if (wsPort) {
           const pathIsWsPublic = url.pathname === '/_ws' || url.pathname === '/ws';
           const allowLogin = url.pathname === '/admin/api/login' && req.method === 'POST';
           const allowRegister = url.pathname === '/admin/api/register' && req.method === 'POST';
+          const allowForgot = url.pathname === '/admin/api/forgot' && req.method === 'POST';
+          const allowReset = url.pathname === '/admin/api/reset' && req.method === 'POST';
           // Only enforce this global token gate for admin API routes. Keep
           // public pages (/, static assets, /portal) reachable without auth.
-          if (url.pathname.startsWith('/admin/api/') && req.method !== 'OPTIONS' && !allowLogin && !allowRegister) {
+          if (url.pathname.startsWith('/admin/api/') && req.method !== 'OPTIONS' && !allowLogin && !allowRegister && !allowForgot && !allowReset) {
             const BRIDGE_TOKEN = effectiveBridgeToken();
             const authHeader = (req.headers['authorization'] || '').toString();
             const parts = authHeader.split(' ');
@@ -650,7 +665,20 @@ if (wsPort) {
           const authHeader = (req.headers['authorization'] || '').toString();
           const parts = authHeader.split(' ');
           const maybeBearer = (parts.length === 2 && /^Bearer$/i.test(parts[0])) ? parts[1] : null;
-          const token = maybeBearer || urlObj.searchParams.get('token');
+          // Accept token via query param, Authorization header, or the
+          // Sec-WebSocket-Protocol header (commonly used to pass subprotocols).
+          const secProto = (req.headers['sec-websocket-protocol'] || '').toString();
+          // If secProto looks like 'Bearer <token>' or just contains a token,
+          // prefer it when Authorization header is not present.
+          let protoToken = null;
+          if (secProto) {
+            const sp = secProto.split(',').map(s => s.trim());
+            for (const p of sp) {
+              if (/^Bearer\s+/i.test(p)) { protoToken = p.replace(/^Bearer\s+/i, '').trim(); break; }
+            }
+            if (!protoToken && sp.length > 0) protoToken = sp[0];
+          }
+          const token = maybeBearer || protoToken || urlObj.searchParams.get('token');
 
           let authed = false;
           let claims = null;
@@ -713,31 +741,41 @@ if (wsPort) {
       // all accepted connections as authenticated and associate the user
       // claims from req.user with the WS connection.
       const user = (req && req.user) ? req.user : { id: 'unknown', username: 'unknown' };
+      const LOG_WS = process.env.LOG_WS_MESSAGES === '1';
+      if (LOG_WS) {
+        try {
+          console.log('[ws][conn] user=', user.username, 'id=', user.id, 'remote=', req && req.socket && req.socket.remoteAddress);
+        } catch (e) {}
+      }
 
       // send privileged status immediately (safe because upgrade enforced auth)
       try { ws.send(JSON.stringify({ type: 'status', data: { connectionName, brokerUrl, username: cfg.username, user }, ts: Date.now() })); } catch (e) {}
+  if (LOG_WS) { try { console.log('[ws][send] status'); } catch(e){} }
 
       // send topics as array of strings: merge configured topics and seen topics
       const configured = Array.isArray(topics) ? topics.slice() : [];
       const seen = Array.from(seenTopics.keys());
       const merged = Array.from(new Set([...configured, ...seen]));
       try { ws.send(JSON.stringify({ type: 'topics', data: merged, ts: Date.now() })); } catch (e) {}
+  if (LOG_WS) { try { console.log('[ws][send] topics count=', merged.length); } catch(e){} }
 
       // broadcast cached latest Target/Sensor values first so clients receive any persisted state
       try {
         for (const [topic, payload] of latestValue.entries()) {
           if (/\/(Target|Sensor)$/.test(topic)) {
-            try { ws.send(JSON.stringify({ type: 'current', topic, payload, cached: true, retained: !!latestRetain.get(topic), ts: Date.now() })); } catch (e) {}
+            try { ws.send(JSON.stringify({ type: 'current', topic, payload, cached: true, retained: !!latestRetain.get(topic), ts: Date.now() })); if (LOG_WS) console.log('[ws][send] current cached', topic, 'payload=', String(payload).slice(0,80)); } catch (e) {}
           }
         }
       } catch (e) {}
 
       // send recent messages buffer
       try { ws.send(JSON.stringify({ type: 'recent-messages', data: recentMessages.map(m => ({ ...m, retained: latestRetain.get(m.topic) || false })), ts: Date.now() })); } catch (e) {}
+  if (LOG_WS) { try { console.log('[ws][send] recent-messages count=', recentMessages.length); } catch(e){} }
 
       // listen for commands from clients (publish and get)
       ws.on('message', raw => {
         try {
+          if (LOG_WS) { try { console.log('[ws][recv]', String(raw).slice(0,200)); } catch(e){} }
           const obj = JSON.parse(raw);
           if (!obj || !obj.type) return;
           if (obj.type === 'publish') {
@@ -751,6 +789,7 @@ if (wsPort) {
                 latestValue.set(topic, payload);
                 latestRetain.set(topic, !!retain);
                 try { ws.send(JSON.stringify({ type: 'publish-result', success: true, topic, payload, id: obj.id, retained: !!retain, ts: Date.now() })); } catch (e) {}
+                if (LOG_WS) { try { console.log('[ws][send] publish-result', topic, payload); } catch(e){} }
               }
             });
             return;
@@ -776,6 +815,7 @@ if (wsPort) {
             }
             if (payload === null) dlog('[GET MISS]', topic, 'no cached value'); else dlog('[GET HIT]', topic, '->', payload);
             try { ws.send(JSON.stringify({ type: 'current', topic, payload, id: obj.id, retained: !!latestRetain.get(topic), ts: Date.now() })); } catch (e) {}
+            if (LOG_WS) { try { console.log('[ws][send] current', topic, String(payload).slice(0,80)); } catch(e){} }
             return;
           }
         } catch (e) { /* ignore invalid messages */ }
@@ -788,6 +828,7 @@ if (wsPort) {
           let r = '';
           try { r = reason && reason.length ? reason.toString() : ''; } catch (e) {}
           console.log('[ws] connection closed', { addr, code, reason: r });
+          if (LOG_WS) { try { console.log('[ws][conn] closed user=', user.username, 'code=', code, 'reason=', r); } catch(e){} }
         });
         ws.on('error', err => { console.error('[ws] connection error', err && err.message ? err.message : err); });
         const pingInterval = setInterval(() => { try { if (ws.readyState === WebSocket.OPEN) ws.ping(); } catch (e) {} }, Number(process.env.WS_PING_INTERVAL_MS || 25000));

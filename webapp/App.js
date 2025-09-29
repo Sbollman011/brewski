@@ -73,14 +73,14 @@ function LoginScreen({ onLogin, onForgot }) {
           onChangeText={setUsername}
           placeholder="Username or email"
           autoCapitalize="none"
-          style={{ borderWidth: 1, borderColor: '#eef0ee', padding: 12, marginBottom: 10, borderRadius: 8, backgroundColor: '#fbfdfb' }}
+          style={{ borderWidth: 1, borderColor: '#e0e6e0', padding: 12, marginBottom: 10, borderRadius: 8, backgroundColor: '#fbfdfb' }}
         />
         <TextInput
           value={password}
           onChangeText={setPassword}
           placeholder="Password"
           secureTextEntry
-          style={{ borderWidth: 1, borderColor: '#eef0ee', padding: 12, marginBottom: 12, borderRadius: 8, backgroundColor: '#fbfdfb' }}
+          style={{ borderWidth: 1, borderColor: '#e0e6e0', padding: 12, marginBottom: 12, borderRadius: 8, backgroundColor: '#fbfdfb' }}
         />
 
         <Pressable onPress={submit} style={{ backgroundColor: '#0b3d2e', paddingVertical: 14, borderRadius: 8, alignItems: 'center', marginBottom: 10 }}>
@@ -125,7 +125,7 @@ function ForgotPasswordScreen({ onBack }) {
         <ToastBanner toast={toast} />
         <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>Reset your password</Text>
         <Text style={{ color: '#666', marginBottom: 12 }}>Enter the email associated with your account and we'll send reset instructions.</Text>
-        <TextInput value={email} onChangeText={setEmail} placeholder="Email" autoCapitalize="none" style={{ borderWidth:1, borderColor:'#eef0ee', padding:12, borderRadius:8, marginBottom:12, backgroundColor:'#fbfdfb' }} />
+  <TextInput value={email} onChangeText={setEmail} placeholder="Email" autoCapitalize="none" style={{ borderWidth:1, borderColor:'#e0e6e0', padding:12, borderRadius:8, marginBottom:12, backgroundColor:'#fbfdfb' }} />
         <Pressable onPress={submit} style={{ backgroundColor: '#0b3d2e', paddingVertical: 12, borderRadius:8, alignItems:'center' }}>
           <Text style={{ color:'#fff', fontWeight:'600' }}>{sending ? 'Sending...' : 'Send reset email'}</Text>
         </Pressable>
@@ -170,8 +170,8 @@ function ResetPasswordScreen({ onBack }) {
       <View style={{ width: '100%', maxWidth: 420, backgroundColor: '#fff', borderRadius: 12, padding: 20, shadowColor: '#000', shadowOpacity: 0.06, shadowRadius: 6, elevation: 2 }}>
         <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>Reset password</Text>
         <Text style={{ color: '#666', marginBottom: 12 }}>Paste the token you received in email and choose a new password.</Text>
-        <TextInput value={token} onChangeText={setToken} placeholder="Reset token" autoCapitalize="none" style={{ borderWidth:1, borderColor:'#eef0ee', padding:12, borderRadius:8, marginBottom:10, backgroundColor:'#fbfdfb' }} />
-        <TextInput value={newPassword} onChangeText={setNewPassword} placeholder="New password" secureTextEntry style={{ borderWidth:1, borderColor:'#eef0ee', padding:12, borderRadius:8, marginBottom:12, backgroundColor:'#fbfdfb' }} />
+  <TextInput value={token} onChangeText={setToken} placeholder="Reset token" autoCapitalize="none" style={{ borderWidth:1, borderColor:'#e0e6e0', padding:12, borderRadius:8, marginBottom:10, backgroundColor:'#fbfdfb' }} />
+  <TextInput value={newPassword} onChangeText={setNewPassword} placeholder="New password" secureTextEntry style={{ borderWidth:1, borderColor:'#e0e6e0', padding:12, borderRadius:8, marginBottom:12, backgroundColor:'#fbfdfb' }} />
         <Pressable onPress={submit} style={{ backgroundColor: '#0b3d2e', paddingVertical: 12, borderRadius:8, alignItems:'center' }}>
           <Text style={{ color:'#fff', fontWeight:'600' }}>{submitting ? 'Submitting...' : 'Reset password'}</Text>
         </Pressable>
@@ -226,6 +226,15 @@ export default function App() {
   useEffect(() => {
     if (token) setScreen('dashboard');
   }, [token]);
+
+  // Redirect unauthenticated users away from protected screens into login.
+  useEffect(() => {
+    if (!token && screen && !['login', 'landing'].includes(screen)) {
+      const t = setTimeout(() => setScreen('login'), 10);
+      return () => clearTimeout(t);
+    }
+    return undefined;
+  }, [screen, token]);
 
   const openScreen = (name) => {
     setScreen(name);
@@ -321,7 +330,7 @@ export default function App() {
             {screen === 'login' && !token && <LoginScreen onLogin={(t) => { setToken(t); setScreen('dashboard'); }} onForgot={() => setScreen('forgot')} />}
             {screen === 'forgot' && !token && <ForgotPasswordScreen onBack={() => setScreen('login')} />}
             {screen === 'reset' && !token && <ResetPasswordScreen onBack={() => setScreen('login')} />}
-            {screen === 'dashboard' && <Dashboard />}
+            {screen === 'dashboard' && <Dashboard token={token} />}
             {screen === 'settings' && <SettingsScreen onBack={() => setScreen('dashboard')} />}
             {screen === 'about' && <AboutScreen onBack={() => setScreen('dashboard')} />}
           </View>

@@ -3,14 +3,17 @@ import { View, Text, Pressable, StyleSheet, ScrollView, Image } from 'react-nati
 
 export default function Landing({ onLoginPress, onPortalPress }) {
   return (
-    <ScrollView style={styles.container} contentContainerStyle={{ flexGrow: 1 }}>
+    <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
       <View style={styles.hero}>
-  {/* Use root-mounted assets path so the image is served from /assets/logo.svg */}
-  <Image source={{ uri: '/assets/logo.svg' }} style={styles.logo} resizeMode="contain" />
-        <Text style={styles.brand}>Brew Remote</Text>
-        <Text style={styles.tagline}>Remote control and automation for brewery systems</Text>
-        <Text style={styles.lead}>We install equipment, sensors and an onsite control computer inside your brewery. Control temperatures and pumps from the Portal or the in-house device — or run automated recipes. We provide a subscription and ongoing support; you get secure remote access via our app and the browser Portal.</Text>
-
+        {/* Logo + headline row */}
+        <View style={styles.heroTopRow}>
+          <Image source={{ uri: '/assets/logo.svg' }} style={styles.logo} resizeMode="contain" />
+          <View style={styles.heroTitleBlock}>
+            <Text style={styles.brand}>Brew Remote</Text>
+            <Text style={styles.tagline}>Real-time monitoring • Smart control • Automation</Text>
+          </View>
+        </View>
+        <Text style={styles.lead}>A local controller + secure remote portal for fermentation, mash, boil & cellar operations. Stay in control from anywhere without exposing your whole network.</Text>
         <View style={styles.ctaRow}>
           <Pressable style={styles.ctaPrimary} onPress={onPortalPress} accessibilityLabel="Open Portal">
             <Text style={styles.ctaPrimaryText}>Open Portal</Text>
@@ -19,68 +22,54 @@ export default function Landing({ onLoginPress, onPortalPress }) {
             <Text style={styles.ctaSecondaryText}>Login</Text>
           </Pressable>
         </View>
-      </View>
-
-      <View style={styles.featuresWrap}>
-        <Text style={styles.sectionTitle}>What it does</Text>
-        <View style={styles.featuresRow}>
-          <View style={styles.featureCard}>
-            <Text style={styles.featureTitle}>Monitoring</Text>
-            <Text style={styles.featureText}>Live telemetry from sensors and controllers gives you a real-time view of brew status and environment.</Text>
-          </View>
-          <View style={styles.featureCard}>
-            <Text style={styles.featureTitle}>Control</Text>
-            <Text style={styles.featureText}>Start/stop pumps, set temperatures, and trigger automated steps from the Portal or scheduled recipes.</Text>
-          </View>
-          <View style={styles.featureCard}>
-            <Text style={styles.featureTitle}>Automation</Text>
-            <Text style={styles.featureText}>Define recipe steps and triggers; the system will execute them reliably — manual override when needed.</Text>
-          </View>
+        <View style={styles.miniFeaturesRow}>
+          <View style={styles.miniFeature}><Text style={styles.miniFeatureTitle}>Telemetry</Text><Text style={styles.miniFeatureText}>Temps & states live</Text></View>
+          <View style={styles.miniFeature}><Text style={styles.miniFeatureTitle}>Control</Text><Text style={styles.miniFeatureText}>Targets & pumps</Text></View>
+          <View style={styles.miniFeature}><Text style={styles.miniFeatureTitle}>Automation</Text><Text style={styles.miniFeatureText}>Recipe steps</Text></View>
+          <View style={styles.miniFeature}><Text style={styles.miniFeatureTitle}>Alerts</Text><Text style={styles.miniFeatureText}>Thresholds</Text></View>
         </View>
       </View>
 
-      <View style={styles.benefitsWrap}>
-        <Text style={styles.sectionTitle}>Why breweries choose Brew Remote</Text>
-        <Text style={styles.benefitItem}>• Improve consistency across batches with automated recipes and scheduled controls.</Text>
-        <Text style={styles.benefitItem}>• Reduce downtime with remote alerts and real-time diagnostics.</Text>
-        <Text style={styles.benefitItem}>• Secure access with local install and optional cloud tunneling to your origin.</Text>
+      <View style={styles.sectionShell}>
+        <Text style={styles.sectionTitle}>Why breweries choose us</Text>
+        <View style={styles.bullets}> 
+          <Text style={styles.bullet}>• Consistent batches via repeatable automated targets.</Text>
+          <Text style={styles.bullet}>• Remote visibility reduces downtime & guesswork.</Text>
+          <Text style={styles.bullet}>• Secure: on‑prem core with a hardened bridge.</Text>
+          <Text style={styles.bullet}>• Extensible: MQTT topics integrate with what you already have.</Text>
+        </View>
       </View>
 
       <View style={styles.footerWrap}>
-        <Text style={styles.footerText}>Installed inside your brewery. Designed for production — not a consumer toy.</Text>
+        <Text style={styles.footerText}>Built for production breweries — lightweight, observable, secure.</Text>
       </View>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f6fbf6' },
-  // Match the header/navigation color so the hero/banner and nav look unified
-  hero: { padding: 28, paddingTop: 36, alignItems: 'center', backgroundColor: '#1b5e20' },
-  // Light text on the dark green banner for good contrast
-  brand: { fontSize: 34, fontWeight: '800', color: '#ffffff', marginBottom: 6 },
-  tagline: { fontSize: 16, color: '#dff3df', marginBottom: 12, textAlign: 'center' },
-  lead: { maxWidth: 920, color: '#e6f5e7', textAlign: 'center', marginBottom: 18 },
-  // Smaller logo so it fits the hero nicely on desktop and mobile
-  logo: { width: 80, height: 80, marginBottom: 12, alignSelf: 'center' },
-  ctaRow: { flexDirection: 'row', gap: 12 },
-  // On the dark hero we invert the primary CTA to white so it stands out
-  ctaPrimary: { backgroundColor: '#ffffff', paddingVertical: 12, paddingHorizontal: 20, borderRadius: 8, marginHorizontal: 6 },
-  ctaPrimaryText: { color: '#1b5e20', fontWeight: '700' },
-  // Secondary CTA is a subtle white-outline button on the dark hero
-  ctaSecondary: { borderColor: '#ffffff', borderWidth: 1, paddingVertical: 10, paddingHorizontal: 16, borderRadius: 8, marginHorizontal: 6, backgroundColor: 'transparent' },
+  container: { flex: 1, backgroundColor: '#f5faf6' },
+  scrollContent: { flexGrow: 1 },
+  hero: { paddingVertical: 32, paddingHorizontal: 24, backgroundColor: '#134a17', alignItems: 'stretch', borderBottomLeftRadius: 18, borderBottomRightRadius: 18 },
+  heroTopRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', flexWrap: 'wrap', marginBottom: 12 },
+  heroTitleBlock: { alignItems: 'center', marginLeft: 8 },
+  logo: { width: 72, height: 72 },
+  brand: { fontSize: 36, fontWeight: '800', color: '#ffffff', letterSpacing: 0.5 },
+  tagline: { fontSize: 14, color: '#cfead2', marginTop: 4 },
+  lead: { color: '#e2f6e5', textAlign: 'center', marginTop: 10, marginBottom: 18, maxWidth: 880, alignSelf: 'center', lineHeight: 20 },
+  ctaRow: { flexDirection: 'row', justifyContent: 'center', marginBottom: 10 },
+  ctaPrimary: { backgroundColor: '#ffffff', paddingVertical: 11, paddingHorizontal: 20, borderRadius: 8, marginHorizontal: 6, minWidth: 140, alignItems: 'center' },
+  ctaPrimaryText: { color: '#134a17', fontWeight: '700' },
+  ctaSecondary: { borderColor: '#ffffff', borderWidth: 1, paddingVertical: 10, paddingHorizontal: 18, borderRadius: 8, marginHorizontal: 6, backgroundColor: 'rgba(255,255,255,0.05)', minWidth: 120, alignItems: 'center' },
   ctaSecondaryText: { color: '#ffffff', fontWeight: '700' },
-
-  featuresWrap: { padding: 20 },
-  sectionTitle: { fontSize: 20, fontWeight: '700', color: '#234e24', marginBottom: 10, textAlign: 'center' },
-  featuresRow: { flexDirection: 'row', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' },
-  featureCard: { flex: 1, minWidth: 220, backgroundColor: '#fff', padding: 14, borderRadius: 8, margin: 6, shadowColor: '#000', shadowOpacity: 0.04, shadowRadius: 6 },
-  featureTitle: { fontSize: 16, fontWeight: '700', color: '#1b5e20', marginBottom: 6 },
-  featureText: { color: '#345b3a' },
-
-  benefitsWrap: { padding: 20 },
-  benefitItem: { color: '#2b5e31', marginBottom: 8 },
-
-  footerWrap: { padding: 20, alignItems: 'center' },
-  footerText: { color: '#4a6a4a' },
+  miniFeaturesRow: { flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', marginTop: 6 },
+  miniFeature: { backgroundColor: 'rgba(255,255,255,0.07)', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 8, margin: 4, minWidth: 116 },
+  miniFeatureTitle: { color: '#fff', fontWeight: '700', fontSize: 13 },
+  miniFeatureText: { color: '#d6efda', fontSize: 11, marginTop: 2 },
+  sectionShell: { paddingHorizontal: 20, paddingVertical: 28 },
+  sectionTitle: { fontSize: 20, fontWeight: '700', color: '#244f27', marginBottom: 14, textAlign: 'center' },
+  bullets: { maxWidth: 840, alignSelf: 'center' },
+  bullet: { color: '#2d5d32', marginBottom: 8, lineHeight: 18 },
+  footerWrap: { padding: 18, alignItems: 'center', borderTopWidth: 1, borderTopColor: '#e0efe3' },
+  footerText: { color: '#4a6a4a', fontSize: 12, textAlign: 'center' }
 });

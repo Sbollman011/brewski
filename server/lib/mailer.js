@@ -1,4 +1,11 @@
 const { spawnSync } = require('child_process');
+const nodemailer = (() => {
+  try {
+    return require('nodemailer');
+  } catch (e) {
+    return null;
+  }
+})();
 
 function sendmailAvailable() {
   try {
@@ -35,7 +42,31 @@ function sendRawMail(from, to, subject, body) {
   }
 }
 
-function sendResetEmail(to, token) {
+async function sendSmtpMail(from, to, subject, body) {
+  // Prefer nodemailer SMTP when configured via env vars
+  if (!nodemailer) {
+    console.error('[mailer] nodemailer not installed, cannot send via SMTP');
+    return false;
+  }
+  const host = process.env.SMTP_HOST;
+  if (!host) return false;
+  const port = process.env.SMTP_PORT ? parseInt(process.env.SMTP_PORT, 10) : 587;
+  const secure = process.env.SMTP_SECURE === '1' || process.env.SMTP_SECURE === 'true';
+  const user = process.env.SMTP_USER || null;
+  const pass = process.env.SMTP_PASS || null;
+
+  try {
+    const transporter = nodemailer.createTransport({ host, port, secure, auth: user ? { user, pass } : undefined });
+    const info = await transporter.sendMail({ from, to, subject, text: body });
+    console.log('[mailer] smtp send result', info && info.messageId ? info.messageId : info);
+    return true;
+  } catch (e) {
+    console.error('[mailer] smtp send error', e && e.stack ? e.stack : e);
+    return false;
+  }
+}
+
+async function sendResetEmail(to, token) {
   const from = process.env.RESET_FROM || `no-reply@${process.env.PUBLIC_HOST || 'railbrewouse.com'}`;
   const subject = 'Brew Remote password reset instructions';
   const linkHost = process.env.PUBLIC_HOST || 'appli.railbrewouse.com';
@@ -45,11 +76,21 @@ function sendResetEmail(to, token) {
     `Or paste this token into the app:\n\n${token}\n\n` +
     `If you did not request this, you can ignore this message.`;
 
-  if (sendmailAvailable()) {
-    return sendRawMail(from, to, subject, body);
+  // Try SMTP first if configured
+  if (process.env.SMTP_HOST && nodemailer) {
+    const ok = await sendSmtpMail(from, to, subject, body);
+    if (ok) return true;
+    // Fall through to sendmail if SMTP failed
   }
-  // Fallback: just log the token so operators can retrieve it. Don't fail.
-  console.log('[mailer] sendmail not available, fallback logging token for', to, 'token=', token);
+
+  // Try sendmail if available
+  if (sendmailAvailable()) {
+    const ok = sendRawMail(from, to, subject, body);
+    if (ok) return true;
+  }
+
+  // Final fallback: log the token for operators to retrieve
+  console.log('[mailer] sendmail not available or smtp failed, fallback logging token for', to, 'token=', token);
   return false;
 }
 

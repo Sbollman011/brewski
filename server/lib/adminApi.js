@@ -1,3 +1,4 @@
+const fs = require('fs');
 const { createUser, findUserByUsername, verifyPassword, signToken, verifyToken } = require('./auth');
 
 function parseBodyJson(req, res, cb) {
@@ -72,6 +73,17 @@ function handleAdminApi(req, res, url) {
             if (!ok) console.log('[password-reset] token for', email, '->', token);
           } catch (e) {
             console.log('[password-reset] token for', email, '->', token);
+          }
+
+          // Also append the token to a local debug log so operators can reliably
+          // retrieve issued tokens even if stdout/stderr aren't captured.
+          try {
+            const logPath = process.env.RESET_LOG_PATH || '/tmp/brewski-reset.log';
+            const line = `${new Date().toISOString()} ${String(email)} ${String(token)}\n`;
+            fs.appendFileSync(logPath, line, { encoding: 'utf8' });
+            console.log('[password-reset] appended token to', logPath);
+          } catch (e) {
+            console.error('[password-reset] failed to write token log', e && e.stack ? e.stack : e);
           }
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });

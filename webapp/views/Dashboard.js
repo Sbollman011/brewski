@@ -35,7 +35,7 @@ function deriveThreshold(key){
   return { min: 0, max: 220 };
 }
 
-export default function Dashboard() {
+export default function Dashboard({ token }) {
   const wsRef = useRef(null);
   const [sensorValue, setSensorValue] = useState(null);
   const [displayedSensorValue, setDisplayedSensorValue] = useState(null);
@@ -127,13 +127,32 @@ export default function Dashboard() {
     return '127.0.0.1';
   };
 
+  const reconnectMeta = useRef({ attempts: 0, timer: null });
+
+  const scheduleReconnect = () => {
+    if (!token) return; // no reconnect without auth
+    const meta = reconnectMeta.current;
+    // exponential-ish backoff with a cap ( 0:0.5s,1:1s,2:2s,3:3s,4+:5s )
+    const a = meta.attempts;
+    const delay = a === 0 ? 500 : a === 1 ? 1000 : a === 2 ? 2000 : a === 3 ? 3000 : 5000;
+    if (meta.timer) clearTimeout(meta.timer);
+    meta.timer = setTimeout(() => {
+      connectWebSocket();
+    }, delay);
+  };
+
   const connectWebSocket = async () => {
+    if (!token) return false; // don't attempt without JWT
     const host = resolveHost();
-  const url = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
+    const base = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
+    // include token both as query and subprotocol for robust server parsing paths
+    const url = `${base}?token=${encodeURIComponent(token)}`;
     try {
-      const ws = new WebSocket(url);
+      const ws = new WebSocket(url, ['Bearer', `Bearer ${token}`]);
       wsRef.current = ws;
       ws.onopen = () => {
+        // reset attempts
+        reconnectMeta.current.attempts = 0;
         // clear any connection error state on open
         try { setConnectionError(false); } catch (e) {}
   debug('WS open -> requesting initial gets for default devices');
@@ -282,8 +301,17 @@ export default function Dashboard() {
           // ignore per-message parse errors
         }
       };
-      ws.onclose = () => { wsRef.current = null; };
-      ws.onerror = () => { wsRef.current = null; };
+      ws.onclose = () => {
+        wsRef.current = null;
+        // attempt reconnect if token still valid and user hasn't logged out
+        if (token) {
+          reconnectMeta.current.attempts += 1;
+          scheduleReconnect();
+        }
+      };
+      ws.onerror = () => {
+        wsRef.current = null;
+      };
       return true;
     } catch (e) {
       return false;
@@ -291,8 +319,13 @@ export default function Dashboard() {
   };
 
   useEffect(() => {
+    if (!token) return; // wait until token provided
     setConnectionError(false);
     setLoading(true);
+    // close any existing socket tied to old token
+  try { wsRef.current && wsRef.current.close(); } catch (e) {}
+  // clear any pending reconnects when token changes
+  if (reconnectMeta.current.timer) { clearTimeout(reconnectMeta.current.timer); reconnectMeta.current.timer = null; }
     connectWebSocket();
     // fetch thresholds once on mount
     (async () => {
@@ -321,8 +354,9 @@ export default function Dashboard() {
       try { wsRef.current && wsRef.current.close(); } catch (e) {}
       try { if (wsRef.current && wsRef.current._retryTimer) clearInterval(wsRef.current._retryTimer); } catch (e) {}
       if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+      if (reconnectMeta.current.timer) { clearTimeout(reconnectMeta.current.timer); reconnectMeta.current.timer = null; }
     };
-  }, []);
+  }, [token]);
 
   // animate displayedSensorValue toward sensorValue
   useEffect(() => {
@@ -399,6 +433,15 @@ export default function Dashboard() {
     setConnectAttempt(a => a + 1);
     connectWebSocket();
   };
+
+  if (!token) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={[styles.headerSpacer, { height: (Constants.statusBarHeight || 0) + 12 }]} />
+        <View style={styles.loadingWrap}><Text style={styles.loadingText}>Waiting for authentication...</Text></View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
