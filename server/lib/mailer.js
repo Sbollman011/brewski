@@ -1,3 +1,4 @@
+
 const { spawnSync } = require('child_process');
 const nodemailer = (() => {
   try {
@@ -6,6 +7,34 @@ const nodemailer = (() => {
     return null;
   }
 })();
+const sendgridMail = (() => {
+  try {
+    return require('@sendgrid/mail');
+  } catch (e) {
+    return null;
+  }
+})();
+async function sendSendgridMail(from, to, subject, body) {
+  if (!sendgridMail || !process.env.SENDGRID_API_KEY) {
+    console.error('[mailer] SendGrid not configured or not installed');
+    return false;
+  }
+  try {
+    sendgridMail.setApiKey(process.env.SENDGRID_API_KEY);
+    const msg = {
+      to,
+      from,
+      subject,
+      text: body,
+    };
+    await sendgridMail.send(msg);
+    console.log('[mailer] SendGrid mail sent to', to);
+    return true;
+  } catch (e) {
+    console.error('[mailer] SendGrid send error', e && e.response ? e.response.body : e);
+    return false;
+  }
+}
 
 function sendmailAvailable() {
   try {
@@ -76,7 +105,14 @@ async function sendResetEmail(to, token) {
     `Or paste this token into the app:\n\n${token}\n\n` +
     `If you did not request this, you can ignore this message.`;
 
-  // Try SMTP first if configured
+  // Try SendGrid first if configured
+  if (process.env.SENDGRID_API_KEY && sendgridMail) {
+    const ok = await sendSendgridMail(from, to, subject, body);
+    if (ok) return true;
+    // Fall through to SMTP if SendGrid failed
+  }
+
+  // Try SMTP if configured
   if (process.env.SMTP_HOST && nodemailer) {
     const ok = await sendSmtpMail(from, to, subject, body);
     if (ok) return true;
@@ -90,7 +126,7 @@ async function sendResetEmail(to, token) {
   }
 
   // Final fallback: log the token for operators to retrieve
-  console.log('[mailer] sendmail not available or smtp failed, fallback logging token for', to, 'token=', token);
+  console.log('[mailer] sendmail/smtp/sendgrid not available or all failed, fallback logging token for', to, 'token=', token);
   return false;
 }
 

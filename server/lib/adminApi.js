@@ -1,5 +1,5 @@
 const fs = require('fs');
-const { createUser, findUserByUsername, verifyPassword, signToken, verifyToken } = require('./auth');
+const { createUser, findUserByUsername, verifyPassword, signToken, verifyToken, findUserById, updateUserById, updateUserFieldsByUsername } = require('./auth');
 
 function parseBodyJson(req, res, cb) {
   let body = '';
@@ -52,39 +52,58 @@ function handleAdminApi(req, res, url) {
       return true;
     }
 
-    // Forgot password: POST { email }
+    // Forgot password: POST { email } (accepts email OR username if username is an email address)
     if (url.pathname === '/admin/api/forgot' && req.method === 'POST') {
-      parseBodyJson(req, res, (err, obj) => {
+      parseBodyJson(req, res, async (err, obj) => {
         if (err) { res.writeHead(400); res.end('bad json'); return; }
-        const email = (obj && obj.email) ? String(obj.email).trim() : '';
-        if (!email) { res.writeHead(400); res.end('email required'); return; }
-        const { findUserByEmail, signToken } = require('./auth');
-        const user = findUserByEmail(email);
-        // For privacy, always return 200 even if email not found. If found,
-        // issue a short-lived reset token (15m) and log it (replace with
-        // email delivery in production).
-        if (user) {
-          const token = signToken({ sub: user.id, username: user.username, purpose: 'reset' }, { expiresIn: '15m' });
-          // Attempt to send email; in environments without sendmail this will
-          // log the token to the server logs for operators to copy to the user.
-          try {
-            const { sendResetEmail } = require('./mailer');
-            const ok = sendResetEmail(user.email || email, token);
-            if (!ok) console.log('[password-reset] token for', email, '->', token);
-          } catch (e) {
-            console.log('[password-reset] token for', email, '->', token);
-          }
+        const raw = (obj && (obj.email || obj.username)) ? String(obj.email || obj.username).trim() : '';
+        if (!raw) { res.writeHead(400); res.end('email required'); return; }
+        console.log('[password-reset] forgot requested for identifier=', raw);
 
-          // Also append the token to a local debug log so operators can reliably
-          // retrieve issued tokens even if stdout/stderr aren't captured.
+        const { findUserByEmail, findUserByUsername, updateUserEmailByUsername, signToken } = require('./auth');
+        let user = findUserByEmail(raw);
+        let targetEmail = raw;
+
+        // If no user by email, try interpreting the value as a username.
+        if (!user) {
+          const u2 = findUserByUsername(raw);
+            if (u2) {
+              user = u2;
+              // If the provided identifier looks like an email and the user record lacks an email, persist it for future resets.
+              if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) {
+                try { updateUserEmailByUsername(u2.username, raw); console.log('[password-reset] persisted email for user', u2.username); } catch (e) {}
+              }
+            }
+        }
+
+        if (user) {
           try {
-            const logPath = process.env.RESET_LOG_PATH || '/tmp/brewski-reset.log';
-            const line = `${new Date().toISOString()} ${String(email)} ${String(token)}\n`;
-            fs.appendFileSync(logPath, line, { encoding: 'utf8' });
-            console.log('[password-reset] appended token to', logPath);
+            const token = signToken({ sub: user.id, username: user.username, purpose: 'reset' }, { expiresIn: '15m' });
+            const { sendResetEmail } = require('./mailer');
+            let ok = false;
+            try {
+              ok = await sendResetEmail(user.email || targetEmail, token);
+            } catch (e) {
+              console.error('[password-reset] sendResetEmail threw', e && e.stack ? e.stack : e);
+            }
+            if (!ok) {
+              console.log('[password-reset] (fallback) token for', targetEmail, '->', token);
+            }
+            // Append to local log for auditing / manual resend
+            try {
+              const logPath = process.env.RESET_LOG_PATH || '/tmp/brewski-reset.log';
+              const line = `${new Date().toISOString()} ${String(targetEmail)} ${String(token)}\n`;
+              fs.appendFileSync(logPath, line, { encoding: 'utf8' });
+              console.log('[password-reset] appended token to', logPath);
+            } catch (e) {
+              console.error('[password-reset] failed to write token log', e && e.stack ? e.stack : e);
+            }
           } catch (e) {
-            console.error('[password-reset] failed to write token log', e && e.stack ? e.stack : e);
+            console.error('[password-reset] unexpected error building token', e && e.stack ? e.stack : e);
           }
+        } else {
+          // Still log that a non-matching identifier attempted a reset (without revealing existence to client)
+          console.log('[password-reset] no matching user for identifier');
         }
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: true }));
@@ -135,10 +154,421 @@ function handleAdminApi(req, res, url) {
         res.end(JSON.stringify({ error: 'invalid_token' }));
         return true;
       }
-      req.user = { id: claims.sub, username: claims.username };
-    }
+        req.user = { id: claims.sub, username: claims.username };
+      }
 
-    return false; // not handled here
+      // If the route is /admin/api/me return current user info
+      if (url.pathname === '/admin/api/me' && req.method === 'GET') {
+        try {
+          const { findUserById } = require('./auth');
+          const u = findUserById(req.user.id);
+          if (!u) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, user: { id: u.id, username: u.username, email: u.email, customer_id: u.customer_id, role: u.role, is_admin: u.is_admin } }));
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); }
+        return true;
+      }
+
+      // Admin-only: create customer
+      if (url.pathname === '/admin/api/customers' && req.method === 'POST') {
+        parseBodyJson(req, res, (err, obj) => {
+          if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+          // require admin
+          try {
+            const { findUserById } = require('./auth');
+            const me = findUserById(req.user.id);
+            if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
+          } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return; }
+
+          const slug = (obj && obj.slug) ? String(obj.slug).trim() : '';
+          const name = (obj && obj.name) ? String(obj.name).trim() : '';
+          // support new host fields while preserving backward compatibility
+          const controller_host1 = (obj && (obj.controller_host1 || obj.host1)) ? String(obj.controller_host1 || obj.host1).trim() : null;
+          const controller_host2 = (obj && (obj.controller_host2 || obj.host2)) ? String(obj.controller_host2 || obj.host2).trim() : null;
+          const controller_ip = (obj && obj.controller_ip) ? String(obj.controller_ip).trim() : null;
+          const controller_port = (obj && obj.controller_port) ? Number(obj.controller_port) : null;
+          let metadata = (obj && obj.metadata) ? String(obj.metadata) : null;
+          if (!slug || !name) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+          // slug must be alphanumeric, dashes only
+          if (!/^[a-z0-9-]+$/i.test(slug)) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_slug' })); return; }
+          // validate metadata if present
+          if (metadata) {
+            try { JSON.parse(metadata); } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_metadata', detail: String(e && e.message) })); return; }
+          }
+          try {
+            const Database = require('better-sqlite3');
+            const path = require('path');
+            const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+            const db = new Database(DB_PATH);
+            const now = Date.now();
+            // Determine if the customers table has host1/host2 columns; prefer storing host1/host2
+            const colInfo = db.prepare("PRAGMA table_info(customers)").all();
+            const hasHost1 = colInfo.some(c => c && c.name === 'controller_host1');
+            const hasHost2 = colInfo.some(c => c && c.name === 'controller_host2');
+            let info;
+            if (hasHost1) {
+              // include host2 if present in schema
+              if (hasHost2) {
+                const stmt = db.prepare('INSERT INTO customers (slug, name, controller_host1, controller_host2, controller_ip, controller_port, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+                info = stmt.run(slug, name, controller_host1, controller_host2, controller_ip, controller_port, metadata, now, now);
+              } else {
+                const stmt = db.prepare('INSERT INTO customers (slug, name, controller_host1, controller_ip, controller_port, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+                info = stmt.run(slug, name, controller_host1, controller_ip, controller_port, metadata, now, now);
+              }
+            } else {
+              // fallback to legacy controller_ip-only schema
+              const stmt = db.prepare('INSERT INTO customers (slug, name, controller_ip, controller_port, metadata, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)');
+              info = stmt.run(slug, name, controller_ip, controller_port, metadata, now, now);
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, customer: { id: info.lastInsertRowid, slug, name } }));
+          } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+        });
+        return true;
+      }
+
+        // Admin-only: list or create users for a customer
+        // GET /admin/api/customers/:id/users  -> list users for customer
+        // POST /admin/api/customers/:id/users -> create user under customer
+        if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/users$/) && (req.method === 'GET' || req.method === 'POST')) {
+          const parts = url.pathname.split('/').filter(Boolean);
+          const cid = Number(parts[parts.length - 2]);
+          if (!cid) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_customer_id' })); return true; }
+          try {
+            const me = findUserById(req.user.id);
+            if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return true; }
+
+          if (req.method === 'GET') {
+            try {
+              const Database = require('better-sqlite3');
+              const path = require('path');
+              const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+              const db = new Database(DB_PATH);
+              const rows = db.prepare('SELECT id, username, email, name, role, is_admin, customer_id, created_at, updated_at FROM users WHERE customer_id = ? ORDER BY id').all(cid);
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, users: rows }));
+            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+            return true;
+          }
+
+          // POST -> create user under this customer
+          parseBodyJson(req, res, (err, obj) => {
+            if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+            const username = obj && obj.username ? String(obj.username).trim() : '';
+            const password = obj && obj.password ? String(obj.password) : '';
+            const email = obj && obj.email ? String(obj.email).trim() : null;
+            const name = obj && obj.name ? String(obj.name).trim() : null;
+            const role = obj && obj.role ? String(obj.role).trim() : null;
+            const is_admin = obj && (obj.is_admin === true || obj.is_admin === 1) ? 1 : 0;
+            if (!username || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+            try {
+              const existing = findUserByUsername(username);
+              if (existing) { res.writeHead(409); res.end(JSON.stringify({ error: 'username_exists' })); return; }
+              const u = createUser(username, password, { email, name, role, is_admin, customer_id: cid });
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ ok: true, user: { id: u.id, username: u.username } }));
+            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+          });
+          return true;
+        }
+
+      // Admin-only: list customers (supports ?limit=&offset=)
+      if (url.pathname === '/admin/api/customers' && req.method === 'GET') {
+        try {
+          const { findUserById } = require('./auth');
+          const me = findUserById(req.user.id);
+          if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          const Database = require('better-sqlite3');
+          const path = require('path');
+          const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+          const db = new Database(DB_PATH);
+          const limit = Number(url.searchParams.get('limit')) || 0;
+          const offset = Number(url.searchParams.get('offset')) || 0;
+          const totalRow = db.prepare('SELECT COUNT(1) as c FROM customers').get();
+          const total = totalRow ? Number(totalRow.c) : 0;
+          let rows = [];
+          // Include controller_host1/controller_host2 when present; otherwise return legacy controller_ip
+          const colInfo = db.prepare("PRAGMA table_info(customers)").all();
+          const hasHost1 = colInfo.some(c => c && c.name === 'controller_host1');
+          const hasHost2 = colInfo.some(c => c && c.name === 'controller_host2');
+          if (limit > 0) {
+            if (hasHost1) {
+              if (hasHost2) rows = db.prepare('SELECT id, slug, name, controller_host1, controller_host2, controller_ip, controller_port, metadata, created_at, updated_at FROM customers ORDER BY id LIMIT ? OFFSET ?').all(limit, offset);
+              else rows = db.prepare('SELECT id, slug, name, controller_host1, controller_ip, controller_port, metadata, created_at, updated_at FROM customers ORDER BY id LIMIT ? OFFSET ?').all(limit, offset);
+            } else {
+              rows = db.prepare('SELECT id, slug, name, controller_ip, controller_port, metadata, created_at, updated_at FROM customers ORDER BY id LIMIT ? OFFSET ?').all(limit, offset);
+            }
+          } else {
+            if (hasHost1) {
+              if (hasHost2) rows = db.prepare('SELECT id, slug, name, controller_host1, controller_host2, controller_ip, controller_port, metadata, created_at, updated_at FROM customers ORDER BY id').all();
+              else rows = db.prepare('SELECT id, slug, name, controller_host1, controller_ip, controller_port, metadata, created_at, updated_at FROM customers ORDER BY id').all();
+            } else {
+              rows = db.prepare('SELECT id, slug, name, controller_ip, controller_port, metadata, created_at, updated_at FROM customers ORDER BY id').all();
+            }
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, customers: rows, total }));
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+        return true;
+      }
+
+      // Admin-only: update customer
+      if (url.pathname.startsWith('/admin/api/customers/') && (req.method === 'PUT' || req.method === 'POST')) {
+        // path /admin/api/customers/<id>
+        const parts = url.pathname.split('/').filter(Boolean);
+        const id = Number(parts[parts.length - 1]);
+        if (!id) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_id' })); return true; }
+        parseBodyJson(req, res, (err, obj) => {
+          if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+          try {
+            const { findUserById } = require('./auth');
+            const me = findUserById(req.user.id);
+            if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
+          } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return; }
+          try {
+            const Database = require('better-sqlite3');
+            const path = require('path');
+            const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+            const db = new Database(DB_PATH);
+            const updates = [];
+            const params = [];
+            // accept host1/host2 fields in addition to legacy controller_ip
+            ['slug','name','controller_host1','controller_host2','controller_ip','controller_port','metadata'].forEach(k => {
+              if (obj && Object.prototype.hasOwnProperty.call(obj, k)) { updates.push(`${k} = ?`); params.push(obj[k]); }
+            });
+            // additional validation: slug and metadata if present
+            if (obj && Object.prototype.hasOwnProperty.call(obj, 'slug')) {
+              if (!/^[a-z0-9-]+$/i.test(String(obj.slug))) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_slug' })); return; }
+            }
+            if (obj && Object.prototype.hasOwnProperty.call(obj, 'metadata') && obj.metadata) {
+              try { JSON.parse(String(obj.metadata)); } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_metadata', detail: String(e && e.message) })); return; }
+            }
+            if (!updates.length) { res.writeHead(400); res.end(JSON.stringify({ error: 'nothing_to_update' })); return; }
+            params.push(id);
+            const sql = `UPDATE customers SET ${updates.join(', ')}, updated_at = ? WHERE id = ?`;
+            // ensure updated_at param
+            params.splice(params.length-1, 0, Date.now());
+            const stmt = db.prepare(sql);
+            const info = stmt.run(...params);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true, changes: info.changes }));
+          } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+        });
+        return true;
+      }
+
+      // Admin-only: delete customer (and cascade related rows)
+      if (url.pathname.match(/^\/admin\/api\/customers\/\d+$/) && req.method === 'DELETE') {
+        const parts = url.pathname.split('/').filter(Boolean);
+        const cid = Number(parts[parts.length - 1]);
+        if (!cid) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_id' })); return true; }
+        try {
+          const { findUserById } = require('./auth');
+          const me = findUserById(req.user.id);
+          if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return true; }
+        // Prevent an admin from deleting the customer they are currently signed into,
+        // which would remove their own user record and cause an immediate 401 on
+        // subsequent requests. Require logging in as a different admin to delete.
+        try {
+          const reqUser = require('./auth').findUserById(req.user.id);
+          if (reqUser && Number(reqUser.customer_id) === cid) {
+            res.writeHead(400, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'cannot_delete_own_customer', detail: 'Cannot delete the customer you are signed into. Log in with a different admin before deleting.' }));
+            return true;
+          }
+        } catch (e) { /* ignore and proceed defensively */ }
+
+        try {
+          const Database = require('better-sqlite3');
+          const path = require('path');
+          const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+          const db = new Database(DB_PATH);
+          // Try to perform deletes defensively in case foreign keys are not enabled
+          const delUsers = db.prepare('DELETE FROM users WHERE customer_id = ?').run(cid);
+          const delSensors = db.prepare('DELETE FROM sensors WHERE customer_id = ?').run(cid);
+          const delCust = db.prepare('DELETE FROM customers WHERE id = ?').run(cid);
+          if (delCust.changes === 0) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return true; }
+          res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); return true;
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'delete_failed', message: String(e && e.message) })); return true; }
+      }
+
+        // Admin-only: user CRUD
+        if (url.pathname.startsWith('/admin/api/users') && (req.method === 'GET' || req.method === 'PUT' || req.method === 'POST' || req.method === 'DELETE')) {
+          // /admin/api/users/:id  or /admin/api/users (POST -> create global user)
+          const parts = url.pathname.split('/').filter(Boolean);
+          const last = parts[parts.length - 1];
+          // require admin
+          try {
+            const me = findUserById(req.user.id);
+            if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return true; }
+
+          // GET /admin/api/users/:id -> get user
+          if (url.pathname.match(/^\/admin\/api\/users\/\d+$/) && req.method === 'GET') {
+            const uid = Number(url.pathname.split('/').pop());
+            try {
+              const Database = require('better-sqlite3');
+              const path = require('path');
+              const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+              const db = new Database(DB_PATH);
+              const userRow = db.prepare('SELECT id, username, email, name, role, is_admin, customer_id, created_at, updated_at FROM users WHERE id = ?').get(uid);
+              if (!userRow) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return true; }
+              res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, user: userRow }));
+              return true;
+            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); return true; }
+          }
+
+          // PUT /admin/api/users/:id -> update user fields
+          if (url.pathname.match(/^\/admin\/api\/users\/\d+$/) && req.method === 'PUT') {
+            return parseBodyJson(req, res, (err, body) => {
+              if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'invalid_json' })); return; }
+              const uid = Number(url.pathname.split('/').pop());
+              try {
+                const ok = updateUserById(uid, body || {});
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true }));
+                return;
+              } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'update_failed', message: e && e.message })); return; }
+            });
+          }
+
+          // DELETE /admin/api/users/:id -> delete user
+          if (url.pathname.match(/^\/admin\/api\/users\/\d+$/) && req.method === 'DELETE') {
+            try {
+              const uid = Number(url.pathname.split('/').pop());
+              const Database = require('better-sqlite3');
+              const path = require('path');
+              const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+              const db = new Database(DB_PATH);
+              const stmt = db.prepare('DELETE FROM users WHERE id = ?');
+              const info = stmt.run(uid);
+              if (info.changes === 0) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return true; }
+              res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); return true;
+            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'delete_failed', message: e && e.message })); return true; }
+          }
+
+          // POST -> create global user (admin only)
+          if (req.method === 'POST' && (!last || isNaN(Number(last)))) {
+            parseBodyJson(req, res, (err, obj) => {
+              if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+              const username = obj && obj.username ? String(obj.username).trim() : '';
+              const password = obj && obj.password ? String(obj.password) : '';
+              const email = obj && obj.email ? String(obj.email).trim() : null;
+              const name = obj && obj.name ? String(obj.name).trim() : null;
+              const role = obj && obj.role ? String(obj.role).trim() : null;
+              const is_admin = obj && (obj.is_admin === true || obj.is_admin === 1) ? 1 : 0;
+              const customer_id = obj && obj.customer_id ? Number(obj.customer_id) : null;
+              if (!username || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+              try {
+                const existing = findUserByUsername(username);
+                if (existing) { res.writeHead(409); res.end(JSON.stringify({ error: 'username_exists' })); return; }
+                const u = createUser(username, password, { email, name, role, is_admin, customer_id });
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, user: { id: u.id, username: u.username } }));
+              } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+            });
+            return true;
+          }
+        }
+
+        // Admin-only: sensors under customer
+        if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/sensors/)) {
+          const parts = url.pathname.split('/').filter(Boolean);
+          const cid = Number(parts[parts.length - 2]);
+          if (!cid) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_customer_id' })); return true; }
+          try {
+            const me = findUserById(req.user.id);
+            if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return true; }
+
+          // GET list sensors
+          if (req.method === 'GET') {
+            try {
+              const Database = require('better-sqlite3');
+              const path = require('path');
+              const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+              const db = new Database(DB_PATH);
+              // Some DBs may use `sensor_key` column while older ones used `key`.
+              // Inspect table schema and select the appropriate column to avoid
+              // referencing a non-existent column which causes SQLite errors.
+              const colInfo = db.prepare("PRAGMA table_info(sensors)").all();
+              const hasSensorKey = colInfo.some(c => c && c.name === 'sensor_key');
+              const hasKey = colInfo.some(c => c && c.name === 'key');
+              const hasMetadata = colInfo.some(c => c && c.name === 'metadata');
+              let rows = [];
+              if (hasSensorKey) {
+                if (hasMetadata) rows = db.prepare('SELECT id, customer_id, sensor_key, metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+                else rows = db.prepare('SELECT id, customer_id, sensor_key, NULL AS metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+              } else if (hasKey) {
+                if (hasMetadata) rows = db.prepare('SELECT id, customer_id, `key` AS sensor_key, metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+                else rows = db.prepare('SELECT id, customer_id, `key` AS sensor_key, NULL AS metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+              } else {
+                // No suitable column found; respond with explicit error
+                res.writeHead(500);
+                res.end(JSON.stringify({ error: 'server_error', detail: 'sensors table missing sensor_key/key column' }));
+                return true;
+              }
+              // Normalize shape to include sensor_key
+              const out = rows.map(r => ({ id: r.id, customer_id: r.customer_id, sensor_key: r.sensor_key, metadata: r.metadata, created_at: r.created_at }));
+              res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, sensors: out }));
+            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+            return true;
+          }
+
+          // POST create sensor
+          if (req.method === 'POST') {
+            parseBodyJson(req, res, (err, obj) => {
+              if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+              const sensor_key = obj && (obj.sensor_key || obj.key) ? String(obj.sensor_key || obj.key).trim() : '';
+              const metadata = obj && obj.metadata ? String(obj.metadata) : null;
+              if (!sensor_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+              try {
+                const Database = require('better-sqlite3');
+                const path = require('path');
+                const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+                const db = new Database(DB_PATH);
+                const now = Date.now();
+                // Insert into either `sensor_key` or `key` depending on which column exists.
+                // Prefer `sensor_key` if present; otherwise fallback to `key`.
+                const colInfo = db.prepare("PRAGMA table_info(sensors)").all();
+                const hasSensorKey = colInfo.some(c => c && c.name === 'sensor_key');
+                const hasKey = colInfo.some(c => c && c.name === 'key');
+                const hasMetadata = colInfo.some(c => c && c.name === 'metadata');
+                let info;
+                if (hasSensorKey) {
+                  if (hasMetadata) info = db.prepare('INSERT INTO sensors (customer_id, sensor_key, metadata, created_at) VALUES (?, ?, ?, ?)').run(cid, sensor_key, metadata, now);
+                  else info = db.prepare('INSERT INTO sensors (customer_id, sensor_key, created_at) VALUES (?, ?, ?)').run(cid, sensor_key, now);
+                } else if (hasKey) {
+                  if (hasMetadata) info = db.prepare('INSERT INTO sensors (customer_id, `key`, metadata, created_at) VALUES (?, ?, ?, ?)').run(cid, sensor_key, metadata, now);
+                  else info = db.prepare('INSERT INTO sensors (customer_id, `key`, created_at) VALUES (?, ?, ?)').run(cid, sensor_key, now);
+                } else {
+                  // No suitable column found; return an explicit error
+                  res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: 'sensors table missing sensor_key/key column' })); return;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, sensor: { id: info.lastInsertRowid, sensor_key } }));
+              } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+            });
+            return true;
+          }
+
+          // DELETE /admin/api/customers/:id/sensors/:sid -> delete sensor
+          if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/sensors\/\d+$/) && req.method === 'DELETE') {
+            try {
+              const parts = url.pathname.split('/').filter(Boolean);
+              const cid2 = Number(parts[parts.length - 3]); // customers/<id>/sensors/<sid>
+              const sid = Number(parts[parts.length - 1]);
+              const Database = require('better-sqlite3');
+              const path = require('path');
+              const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+              const db = new Database(DB_PATH);
+              const info = db.prepare('DELETE FROM sensors WHERE id = ? AND customer_id = ?').run(sid, cid2);
+              if (info.changes === 0) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return true; }
+              res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); return true;
+            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'delete_failed', message: e && e.message })); return true; }
+          }
+        }
+
+      return false; // not handled here
   } catch (e) {
     res.writeHead(500); res.end('server error'); return true;
   }

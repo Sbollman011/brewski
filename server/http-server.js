@@ -29,8 +29,10 @@ function startHttpServer(opts = {}) {
 
       // Quick health and info endpoints
       if (req.method === 'OPTIONS') {
+        // Ensure preflight allows the methods the admin SPA will use (PUT/DELETE)
         setSecurityHeadersLocal();
-        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+        // Allow common headers used by the SPA (JSON body + Authorization header)
         res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
         res.setHeader('Access-Control-Max-Age', '600');
         res.writeHead(204);
@@ -71,6 +73,85 @@ function startHttpServer(opts = {}) {
 
       // Simple static serving for built webapp
       try {
+        // admin UI: prefer serving the SPA web-build index if present so the
+        // React app can handle the /admin route. If no web build exists,
+        // fall back to the small server-side admin page in server/web-admin.
+        if (url.pathname === '/admin' || url.pathname === '/admin/') {
+          const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
+          const indexPath = path.join(webBuildDir, 'index.html');
+          // If a built SPA exists, require a valid token to serve the admin UI.
+          // This prevents unauthenticated users from loading the admin SPA; instead
+          // we return a 401 HTML page so the browser shows an unauthorized response.
+          if (fs.existsSync(indexPath)) {
+            try {
+              // Look for Bearer token in Authorization header or ?token= query param
+              const authHeader = (req.headers && (req.headers['authorization'] || '')) || '';
+              const parts = authHeader.split(' ');
+              let token = null;
+              if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
+              if (!token) token = url.searchParams && url.searchParams.get('token');
+
+              // Allow a legacy bridge token via env
+              const BRIDGE = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
+              let ok = false;
+              if (BRIDGE && token === BRIDGE) ok = true;
+              if (!ok && token) {
+                try {
+                  const { verifyToken } = require('./lib/auth');
+                  const claims = verifyToken(token);
+                  if (claims) ok = true;
+                } catch (e) { /* invalid token */ }
+              }
+
+              if (!ok) {
+                setSecurityHeadersLocal();
+                res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+                res.end('<!doctype html><html><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1><p>Authentication required to access this resource.</p></body></html>');
+                return;
+              }
+
+              // token valid — serve the SPA index
+              // Further ensure the token corresponds to an admin user in the DB.
+              try {
+                const { findUserById } = require('./lib/auth');
+                const claims = require('./lib/auth').verifyToken(token);
+                let uid = claims && claims.sub;
+                const u = uid ? findUserById(uid) : null;
+                if (!u || Number(u.is_admin) !== 1) {
+                  setSecurityHeadersLocal();
+                  res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+                  res.end('<!doctype html><html><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1><p>Admin access required.</p></body></html>');
+                  return;
+                }
+              } catch (e) {
+                setSecurityHeadersLocal();
+                res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+                res.end('<!doctype html><html><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1></body></html>');
+                return;
+              }
+
+              setSecurityHeadersLocal();
+              res.setHeader('Content-Type', 'text/html; charset=utf-8');
+              res.setHeader('Cache-Control', 'no-cache');
+              fs.createReadStream(indexPath).pipe(res);
+              return;
+            } catch (e) {
+              // if anything goes wrong, fail closed with 401
+              setSecurityHeadersLocal();
+              res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+              res.end('<!doctype html><html><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1></body></html>');
+              return;
+            }
+          }
+          const adminPath = path.join(__dirname, 'web-admin', 'index.html');
+          if (fs.existsSync(adminPath)) {
+            setSecurityHeadersLocal();
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            fs.createReadStream(adminPath).pipe(res);
+            return;
+          }
+        }
         const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
         // assets
         if (url.pathname.startsWith('/assets/')) {

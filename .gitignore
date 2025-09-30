@@ -1,4 +1,9 @@
-# ---- Node / Expo / React Native base ----
+node_modules/
+server/brewski.sqlite3
+server/backups/
+server/web-admin/
+dist/
+.env# ---- Node / Expo / React Native base ----
 node_modules/
 **/node_modules/
 

@@ -3,12 +3,14 @@ import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { View, Text, StyleSheet, Pressable, TextInput, Alert } from 'react-native';
 import Dashboard from './views/Dashboard';
+import AdminPortal from './views/AdminPortal';
 import Landing from './views/Landing';
 import Header from './components/Header';
 import LoginScreen from './components/LoginScreen';
 import ForgotPasswordScreen from './components/ForgotPasswordScreen';
 import ResetPasswordScreen from './components/ResetPasswordScreen';
 import { Linking, Platform } from 'react-native';
+
 // Removed push notification registration logic per request
 
 function SettingsScreen({ onBack }) {
@@ -51,6 +53,35 @@ export default function App() {
     }
   }, []);
 
+  // If the URL contains a token query parameter (used when redirecting into /admin),
+  // consume it, persist it to localStorage, and remove it from the address bar.
+  useEffect(() => {
+    try {
+      if (typeof window === 'undefined') return;
+      const qp = new URLSearchParams(window.location.search || '');
+      const t = qp.get('token');
+      if (t) {
+        try { localStorage.setItem('brewski_jwt', t); } catch (e) {}
+        setToken(t);
+        // remove token from URL for cleanliness
+        qp.delete('token');
+        const url = new URL(window.location.href);
+        url.search = qp.toString();
+        try { window.history.replaceState({}, document.title, url.toString()); } catch (e) {}
+      }
+    } catch (e) { }
+  }, []);
+
+  // Keep localStorage in sync with token state so other parts of the app (and manual fetches)
+  // that read localStorage will include the current token.
+  useEffect(() => {
+    try {
+      if (typeof window === 'undefined') return;
+      if (token) localStorage.setItem('brewski_jwt', token);
+      else localStorage.removeItem('brewski_jwt');
+    } catch (e) { }
+  }, [token]);
+
   // On web, detect reset token in the URL (either ?token= or in the hash) and open the reset screen
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -89,10 +120,34 @@ export default function App() {
     }
   }, []);
 
-  // If a token is present, switch to the dashboard automatically
+  // If a token is present, switch to the dashboard automatically unless the current
+  // browser path explicitly requests /admin. This prevents logging in from /admin and
+  // being immediately redirected away.
   useEffect(() => {
-    if (token) setScreen('dashboard');
-  }, [token]);
+    try {
+      const isAdminPath = (typeof window !== 'undefined' && window.location && String(window.location.pathname).startsWith('/admin'));
+      if (token) {
+        // If the browser path is /admin, keep the admin screen; otherwise, move to dashboard
+        if (isAdminPath) {
+          setScreen('admin');
+        } else if (screen !== 'admin') {
+          setScreen('dashboard');
+        }
+      }
+    } catch (e) {
+      if (token && screen !== 'admin') setScreen('dashboard');
+    }
+  }, [token, screen]);
+
+  // On web, if the path is /admin open the admin screen by default
+  useEffect(() => {
+    try {
+      if (typeof window !== 'undefined' && window.location && String(window.location.pathname).startsWith('/admin')) {
+        setScreen('admin');
+        try { window.history.replaceState({}, document.title, '/admin'); } catch (e) { }
+      }
+    } catch (e) { }
+  }, []);
 
   // Redirect unauthenticated users away from protected screens into login.
   useEffect(() => {
@@ -122,7 +177,7 @@ export default function App() {
 
     // Fallback: use React Native Linking for native runtimes
     try {
-      const url = 'https://'+(typeof window !== 'undefined' ? window.location.host : '');
+      const url = 'https://' + (typeof window !== 'undefined' ? window.location.host : '');
       Linking.openURL(url + '/dashboard/');
     } catch (e) {
       // best-effort; nothing else to do
@@ -130,7 +185,7 @@ export default function App() {
   }
 
   function handleLogout() {
-    try { localStorage.removeItem('brewski_jwt'); } catch (e) {}
+    try { localStorage.removeItem('brewski_jwt'); } catch (e) { }
     setToken(null);
     setScreen('dashboard');
   }
@@ -146,14 +201,14 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-  <StatusBar style="light" backgroundColor="#1b5e20" />
-  <SafeAreaView edges={["top"]} style={[styles.topInset, { backgroundColor: '#1b5e20' }]} />
-      <SafeAreaView style={styles.root} edges={["left","right","bottom"]}>
+      <StatusBar style="light" backgroundColor="#1b5e20" />
+      <SafeAreaView edges={["top"]} style={[styles.topInset, { backgroundColor: '#1b5e20' }]} />
+      <SafeAreaView style={styles.root} edges={["left", "right", "bottom"]}>
         {/* Push notification warning banner removed */}
         <Header
           title={titleMap[screen] || 'Brew Remote'}
           token={token}
-          hideControls={['login','forgot','reset','landing'].includes(screen)}
+          hideControls={['login', 'forgot', 'reset', 'landing'].includes(screen)}
           onMenuPress={() => setMenuOpen(m => !m)}
           onDashboardPress={() => {
             setMenuOpen(false);
@@ -167,18 +222,18 @@ export default function App() {
           {menuOpen && (
             <View style={styles.sideMenu}>
               <Text style={styles.menuHeader}>Menu</Text>
-              <Pressable onPress={() => openScreen('dashboard')} style={{paddingVertical:8}}>
+              <Pressable onPress={() => openScreen('dashboard')} style={{ paddingVertical: 8 }}>
                 <Text style={styles.menuItem}>Dashboard</Text>
               </Pressable>
-              <Pressable onPress={() => openScreen('settings')} style={{paddingVertical:8}}>
+              <Pressable onPress={() => openScreen('settings')} style={{ paddingVertical: 8 }}>
                 <Text style={styles.menuItem}>Settings</Text>
               </Pressable>
               {token ? (
-                <Pressable onPress={() => { handleLogout(); setMenuOpen(false); }} style={{paddingVertical:8}}>
+                <Pressable onPress={() => { handleLogout(); setMenuOpen(false); }} style={{ paddingVertical: 8 }}>
                   <Text style={[styles.menuItem, { color: '#ffcccb' }]}>Logout</Text>
                 </Pressable>
               ) : (
-                <Pressable onPress={() => { setMenuOpen(false); setScreen('login'); }} style={{paddingVertical:8}}>
+                <Pressable onPress={() => { setMenuOpen(false); setScreen('login'); }} style={{ paddingVertical: 8 }}>
                   <Text style={styles.menuItem}>Login</Text>
                 </Pressable>
               )}
@@ -196,10 +251,29 @@ export default function App() {
               }} />
             )}
             {!token && screen !== 'login' && screen !== 'landing' && null}
-            {screen === 'login' && !token && <LoginScreen onLogin={(t) => { setToken(t); setScreen('dashboard'); }} onForgot={() => setScreen('forgot')} />}
+            {screen === 'login' && !token && <LoginScreen onLogin={(t) => {
+              // Avoid a full-page redirect when logging in from /admin to prevent reload loops.
+              // Instead, set the token in SPA state/localStorage and update the history to the
+              // /admin path so the server-side gating isn't required for the SPA to render.
+              try {
+                if (typeof window !== 'undefined' && window.location && String(window.location.pathname).startsWith('/admin')) {
+                  // Set token locally and update the URL without reloading the page.
+                  try { localStorage.setItem('brewski_jwt', t); } catch (e) {}
+                  setToken(t);
+                  try { window.history.replaceState({}, document.title, '/admin'); } catch (e) {}
+                  setScreen('admin');
+                  return;
+                }
+              } catch (e) { /* fall back to default behavior below */ }
+
+              // Default: set token and navigate within SPA
+              setToken(t);
+              try { if (typeof window !== 'undefined' && window.location && String(window.location.pathname).startsWith('/admin')) setScreen('admin'); else setScreen('dashboard'); } catch (e) { setScreen('dashboard'); }
+            }} onForgot={() => setScreen('forgot')} />}
             {screen === 'forgot' && !token && <ForgotPasswordScreen onBack={() => setScreen('login')} />}
             {screen === 'reset' && !token && <ResetPasswordScreen initialToken={initialResetToken} onBack={() => setScreen('login')} />}
             {screen === 'dashboard' && token && <Dashboard token={token} />}
+            {screen === 'admin' && token && <AdminPortal />}
             {screen === 'settings' && token && <SettingsScreen onBack={() => setScreen('dashboard')} />}
             {screen === 'about' && token && <AboutScreen onBack={() => setScreen('dashboard')} />}
           </View>

@@ -29,22 +29,59 @@ try {
   }
 } catch (e) { /* ignore */ }
 
-function createUser(username, password) {
+// Ensure additional columns exist for multi-tenant schema
+try {
+  const cols = _db_.prepare("PRAGMA table_info(users)").all();
+  const names = cols.map(c => c && c.name).filter(Boolean);
+  if (!names.includes('customer_id')) {
+    try { _db_.prepare('ALTER TABLE users ADD COLUMN customer_id INTEGER').run(); } catch (e) {}
+  }
+  if (!names.includes('name')) {
+    try { _db_.prepare("ALTER TABLE users ADD COLUMN name TEXT").run(); } catch (e) {}
+  }
+  if (!names.includes('role')) {
+    try { _db_.prepare("ALTER TABLE users ADD COLUMN role TEXT").run(); } catch (e) {}
+  }
+  if (!names.includes('is_admin')) {
+    try { _db_.prepare("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0").run(); } catch (e) {}
+  }
+  if (!names.includes('updated_at')) {
+    try { _db_.prepare('ALTER TABLE users ADD COLUMN updated_at INTEGER').run(); } catch (e) {}
+  }
+} catch (e) { /* ignore */ }
+
+function createUser(username, password, opts = {}) {
   const hash = bcrypt.hashSync(String(password), 10);
-  const stmt = _db_.prepare('INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)');
-  const info = stmt.run(username, hash, Date.now());
+  const stmt = _db_.prepare('INSERT INTO users (username, password_hash, email, name, customer_id, role, is_admin, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+  const info = stmt.run(
+    username,
+    hash,
+    opts.email || null,
+    opts.name || null,
+    opts.customer_id || null,
+    opts.role || null,
+    opts.is_admin ? 1 : 0,
+    Date.now(),
+    Date.now()
+  );
   return { id: info.lastInsertRowid, username };
 }
 
 function findUserByUsername(username) {
-  const stmt = _db_.prepare('SELECT id, username, password_hash FROM users WHERE username = ?');
+  const stmt = _db_.prepare('SELECT id, username, password_hash, email, customer_id, role, is_admin FROM users WHERE username = ?');
   return stmt.get(username);
 }
 
 function findUserByEmail(email) {
   if (!email) return null;
-  const stmt = _db_.prepare('SELECT id, username, password_hash, email FROM users WHERE email = ?');
+  const stmt = _db_.prepare('SELECT id, username, password_hash, email, customer_id, role, is_admin FROM users WHERE email = ?');
   return stmt.get(email);
+}
+
+function findUserById(id) {
+  if (!id) return null;
+  const stmt = _db_.prepare('SELECT id, username, password_hash, email, customer_id, role, is_admin FROM users WHERE id = ?');
+  return stmt.get(id);
 }
 
 function verifyPassword(userOrUsername, password) {
@@ -64,6 +101,32 @@ function updateUserPasswordById(id, newPassword) {
   return info.changes === 1;
 }
 
+function updateUserById(id, fields = {}) {
+  if (!id || !fields || typeof fields !== 'object') return false;
+  const allowed = ['email', 'name', 'role', 'customer_id', 'is_admin', 'password_hash'];
+  const sets = [];
+  const vals = [];
+  for (const k of Object.keys(fields)) {
+    if (!allowed.includes(k)) continue;
+    sets.push(`${k} = ?`);
+    vals.push(fields[k]);
+  }
+  if (!sets.length) return false;
+  vals.push(Date.now());
+  const sql = `UPDATE users SET ${sets.join(', ')}, updated_at = ? WHERE id = ?`;
+  vals.push(id);
+  const stmt = _db_.prepare(sql);
+  const info = stmt.run(...vals);
+  return info.changes >= 1;
+}
+
+function updateUserFieldsByUsername(username, fields = {}) {
+  if (!username) return false;
+  const user = findUserByUsername(username);
+  if (!user) return false;
+  return updateUserById(user.id, fields);
+}
+
 function updateUserEmailByUsername(username, email) {
   if (!username || !email) return false;
   const stmt = _db_.prepare('UPDATE users SET email = ? WHERE username = ?');
@@ -79,4 +142,4 @@ function verifyToken(token) {
   try { return jwt.verify(token, _JWT_SECRET_); } catch (e) { return null; }
 }
 
-module.exports = { createUser, findUserByUsername, findUserByEmail, verifyPassword, updateUserPasswordById, updateUserEmailByUsername, signToken, verifyToken, DB_FILE: _DB_FILE_ };
+module.exports = { createUser, findUserByUsername, findUserByEmail, findUserById, verifyPassword, updateUserPasswordById, updateUserEmailByUsername, signToken, verifyToken, DB_FILE: _DB_FILE_ };

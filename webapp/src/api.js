@@ -6,7 +6,7 @@ export async function apiFetch(path, opts = {}) {
     if (token) init.headers['Authorization'] = `Bearer ${token}`;
   } catch (e) { /* ignore missing localStorage */ }
 
-  const API_HOST = 'api.brewingremote.com'; // Option C split host
+  const API_HOST = 'api.brewingremote.com'; // use central API host for web/native
 
   // Normalize path -> always prefix with leading slash for join safety
   let rel = typeof path === 'string' ? path : '';
@@ -25,7 +25,7 @@ export async function apiFetch(path, opts = {}) {
 
   const res = await fetch(finalPath, init);
   if (res.status === 401) {
-    try { localStorage.removeItem('brewski_jwt'); } catch (e) {}
+    try { if (typeof localStorage !== 'undefined') localStorage.removeItem('brewski_jwt'); } catch (e) {}
     return res;
   }
   return res;
