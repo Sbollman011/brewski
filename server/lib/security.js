@@ -35,6 +35,8 @@ function setSecurityHeaders(req, res, server) {
     if (origin && allowedOrigins.includes(origin)) {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Vary', 'Origin');
+      // Allow cookies / Authorization headers when needed (JWT / legacy tokens)
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
     }
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');

@@ -1,24 +1,28 @@
 import React from 'react';
 import { View, Text, Pressable, StyleSheet } from 'react-native';
 
-export default function Header({ title, token, onMenuPress, onPortalPress, onLoginPress, onLogoutPress }) {
+export default function Header({ title, token, onMenuPress, onDashboardPress, onLoginPress, onLogoutPress, hideControls = false }) {
   return (
     <View style={styles.appBar}>
-      <Pressable accessibilityLabel="Menu" onPress={onMenuPress} style={styles.hamburger}>
-        <View style={styles.bar} />
-        <View style={styles.bar} />
-        <View style={styles.bar} />
-      </Pressable>
+      {!hideControls && (
+        <Pressable accessibilityLabel="Menu" onPress={onMenuPress} style={styles.hamburger}>
+          <View style={styles.bar} />
+          <View style={styles.bar} />
+          <View style={styles.bar} />
+        </Pressable>
+      )}
       <Text style={styles.appTitle}>{title || 'Brew Remote'}</Text>
       <View style={styles.rightArea}>
-        {token ? (
-          <Pressable onPress={onLogoutPress} style={styles.loginBtn} accessibilityLabel="Logout">
-            <Text style={styles.loginText}>Logout</Text>
-          </Pressable>
-        ) : (
-          <Pressable onPress={onLoginPress} style={styles.loginBtn} accessibilityLabel="Login">
-            <Text style={styles.loginText}>Login</Text>
-          </Pressable>
+        {hideControls ? null : (
+          token ? (
+            <Pressable onPress={onLogoutPress} style={styles.loginBtn} accessibilityLabel="Logout">
+              <Text style={styles.loginText}>Logout</Text>
+            </Pressable>
+          ) : (
+            <Pressable onPress={onLoginPress} style={styles.loginBtn} accessibilityLabel="Login">
+              <Text style={styles.loginText}>Login</Text>
+            </Pressable>
+          )
         )}
       </View>
     </View>

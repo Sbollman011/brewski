@@ -46,7 +46,7 @@ export default function LoginScreen({ onLogin, onForgot }) {
       <View style={{ width: '100%', maxWidth: 420, backgroundColor: '#fff', borderRadius: 12, padding: 20, shadowColor: '#000', shadowOpacity: 0.08, shadowRadius: 8, elevation: 3 }}>
         <ToastBanner toast={toast} />
         <Text style={{ fontSize: 24, fontWeight: '700', marginBottom: 6, color: '#0b3d2e' }}>Login</Text>
-        <Text style={{ color: '#666', marginBottom: 16 }}>Access the Brew Remote portal</Text>
+  <Text style={{ color: '#666', marginBottom: 16 }}>Access the Brew Remote dashboard</Text>
 
         <TextInput
           value={username}

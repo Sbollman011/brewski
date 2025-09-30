@@ -1,7 +1,7 @@
 import React from 'react';
 import { View, Text, Pressable, StyleSheet, ScrollView, Image } from 'react-native';
 
-export default function Landing({ onLoginPress, onPortalPress }) {
+export default function Landing({ onLoginPress, onDashboardPress }) {
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
       <View style={styles.hero}>
@@ -15,8 +15,8 @@ export default function Landing({ onLoginPress, onPortalPress }) {
         </View>
         <Text style={styles.lead}>A local controller + secure remote portal for fermentation, mash, boil & cellar operations. Stay in control from anywhere without exposing your whole network.</Text>
         <View style={styles.ctaRow}>
-          <Pressable style={styles.ctaPrimary} onPress={onPortalPress} accessibilityLabel="Open Portal">
-            <Text style={styles.ctaPrimaryText}>Open Portal</Text>
+          <Pressable style={styles.ctaPrimary} onPress={onDashboardPress} accessibilityLabel="Open Dashboard">
+            <Text style={styles.ctaPrimaryText}>Open Dashboard</Text>
           </Pressable>
           <Pressable style={styles.ctaSecondary} onPress={onLoginPress} accessibilityLabel="Login">
             <Text style={styles.ctaSecondaryText}>Login</Text>

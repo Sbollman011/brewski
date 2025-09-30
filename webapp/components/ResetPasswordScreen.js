@@ -3,8 +3,8 @@ import { View, Text, TextInput, Pressable } from 'react-native';
 import { apiFetch } from '../src/api';
 import ToastBanner from './ToastBanner';
 
-export default function ResetPasswordScreen({ onBack }) {
-  const [token, setToken] = useState('');
+export default function ResetPasswordScreen({ onBack, initialToken = '' }) {
+  const [token, setToken] = useState(initialToken || '');
   const [newPassword, setNewPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [toast, setToast] = useState(null);

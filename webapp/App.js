@@ -40,6 +40,7 @@ export default function App() {
   // Default to landing on web, but show login first on native (mobile) devices
   const [screen, setScreen] = useState(Platform.OS === 'web' ? 'landing' : 'login'); // 'landing' | 'dashboard' | 'settings' | 'about' | 'login' | 'forgot' | 'reset'
   const [token, setToken] = useState(null);
+  const [initialResetToken, setInitialResetToken] = useState('');
 
   useEffect(() => {
     try {
@@ -50,6 +51,44 @@ export default function App() {
     }
   }, []);
 
+  // On web, detect reset token in the URL (either ?token= or in the hash) and open the reset screen
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    try {
+      const search = window.location.search || '';
+      const hash = window.location.hash || '';
+      const qp = new URLSearchParams(search);
+      let t = qp.get('token');
+      if (!t && hash) {
+        // match ?token= or &token= inside the hash portion (e.g. #/reset?token=...)
+        const m = hash.match(/[?&]token=([^&]+)/);
+        if (m) t = decodeURIComponent(m[1]);
+        else {
+          // also allow simple #token=... forms
+          const m2 = hash.match(/token=([^&]+)/);
+          if (m2) t = decodeURIComponent(m2[1]);
+        }
+      }
+      if (t) {
+        setInitialResetToken(t);
+        setScreen('reset');
+        // Remove token from URL for cleanliness/security
+        try {
+          const url = new URL(window.location.href);
+          url.searchParams.delete('token');
+          if (url.hash) {
+            url.hash = url.hash.replace(/([?&])token=[^&]+(&?)/, (m, p1, p2) => (p2 ? p1 : '')).replace(/[?&]$/, '');
+          }
+          window.history.replaceState({}, document.title, url.toString());
+        } catch (e) {
+          // ignore replace failures
+        }
+      }
+    } catch (e) {
+      // ignore URL parsing errors
+    }
+  }, []);
+
   // If a token is present, switch to the dashboard automatically
   useEffect(() => {
     if (token) setScreen('dashboard');
@@ -57,7 +96,8 @@ export default function App() {
 
   // Redirect unauthenticated users away from protected screens into login.
   useEffect(() => {
-    if (!token && screen && !['login', 'landing'].includes(screen)) {
+    // allow unauthenticated users to visit login, landing, forgot, and reset screens
+    if (!token && screen && !['login', 'landing', 'forgot', 'reset'].includes(screen)) {
       const t = setTimeout(() => setScreen('login'), 10);
       return () => clearTimeout(t);
     }
@@ -69,11 +109,11 @@ export default function App() {
     setMenuOpen(false);
   };
 
-  function openPortal() {
-    // On web, navigate same-tab to the server portal path
+  function openDashboard() {
+    // On web, navigate same-tab to the server dashboard path
     try {
       if (typeof window !== 'undefined' && window.location) {
-        window.location.href = '/portal/';
+        window.location.href = '/dashboard/';
         return;
       }
     } catch (e) {
@@ -83,7 +123,7 @@ export default function App() {
     // Fallback: use React Native Linking for native runtimes
     try {
       const url = 'https://'+(typeof window !== 'undefined' ? window.location.host : '');
-      Linking.openURL(url + '/portal/');
+      Linking.openURL(url + '/dashboard/');
     } catch (e) {
       // best-effort; nothing else to do
     }
@@ -113,10 +153,11 @@ export default function App() {
         <Header
           title={titleMap[screen] || 'Brew Remote'}
           token={token}
+          hideControls={['login','forgot','reset','landing'].includes(screen)}
           onMenuPress={() => setMenuOpen(m => !m)}
-          onPortalPress={() => {
+          onDashboardPress={() => {
             setMenuOpen(false);
-            openPortal();
+            openDashboard();
           }}
           onLoginPress={() => { setMenuOpen(false); setScreen('login'); }}
           onLogoutPress={() => { handleLogout(); setMenuOpen(false); }}
@@ -145,22 +186,22 @@ export default function App() {
           )}
           <View style={styles.content}>
             {screen === 'landing' && !token && (
-              <Landing onLoginPress={() => setScreen('login')} onPortalPress={() => {
+              <Landing onLoginPress={() => setScreen('login')} onDashboardPress={() => {
                 if (!token) {
                   setScreen('login');
                 } else {
                   setMenuOpen(false);
-                  openPortal();
+                  openDashboard();
                 }
               }} />
             )}
             {!token && screen !== 'login' && screen !== 'landing' && null}
             {screen === 'login' && !token && <LoginScreen onLogin={(t) => { setToken(t); setScreen('dashboard'); }} onForgot={() => setScreen('forgot')} />}
             {screen === 'forgot' && !token && <ForgotPasswordScreen onBack={() => setScreen('login')} />}
-            {screen === 'reset' && !token && <ResetPasswordScreen onBack={() => setScreen('login')} />}
-            {screen === 'dashboard' && <Dashboard token={token} />}
-            {screen === 'settings' && <SettingsScreen onBack={() => setScreen('dashboard')} />}
-            {screen === 'about' && <AboutScreen onBack={() => setScreen('dashboard')} />}
+            {screen === 'reset' && !token && <ResetPasswordScreen initialToken={initialResetToken} onBack={() => setScreen('login')} />}
+            {screen === 'dashboard' && token && <Dashboard token={token} />}
+            {screen === 'settings' && token && <SettingsScreen onBack={() => setScreen('dashboard')} />}
+            {screen === 'about' && token && <AboutScreen onBack={() => setScreen('dashboard')} />}
           </View>
         </View>
       </SafeAreaView>
