@@ -64,6 +64,14 @@ export default function AdminPortal({ currentUser, loadingUser, token }) {
   const [loading, setLoading] = useState(false);
   const [editing, setEditing] = useState(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [permissionNotice, setPermissionNotice] = useState(null); // { message, ts }
+
+  // Auto-dismiss permission notice after 5s
+  useEffect(() => {
+    if (!permissionNotice) return;
+    const h = setTimeout(() => setPermissionNotice(null), 5000);
+    return () => clearTimeout(h);
+  }, [permissionNotice]);
 
   // Sync prop currentUser into local state when it changes
   useEffect(() => { if (currentUser && (!user || user.id !== currentUser.id)) setUser(currentUser); }, [currentUser]);
@@ -171,7 +179,14 @@ export default function AdminPortal({ currentUser, loadingUser, token }) {
           <View style={{ marginBottom: 8 }}>
             <Text>Signed in as: {user.username} ({user.email || 'no email'}){user.role ? ` — ${user.role}` : ''}</Text>
           </View>
-          <ManagerPanel user={user} doFetch={doFetch} />
+          {permissionNotice && (
+            <PermissionNotice message={permissionNotice.message} onClose={() => setPermissionNotice(null)} />
+          )}
+          <ManagerPanel
+            user={user}
+            doFetch={doFetch}
+            onPermissionDenied={(msg) => setPermissionNotice({ message: msg || 'You do not have permission to perform that action.', ts: Date.now() })}
+          />
         </View>
       )}
       {user && Number(user.is_admin) !== 1 && user.role !== 'manager' && (
@@ -423,7 +438,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch }) {
   );
 }
 
-function ManagerPanel({ user, doFetch }) {
+function ManagerPanel({ user, doFetch, onPermissionDenied }) {
   const [users, setUsers] = useState([]);
   const [customer, setCustomer] = useState(null);
   const [newUser, setNewUser] = useState({ username: '', password: '', email: '', name: '' });
@@ -459,7 +474,13 @@ function ManagerPanel({ user, doFetch }) {
     try {
       await doFetch(`/admin/api/users/${id}`, { method: 'DELETE' });
       load();
-    } catch (e) { Alert.alert('Delete failed', String(e && e.message)); }
+    } catch (e) {
+      if (e && e.status === 401) {
+        if (onPermissionDenied) onPermissionDenied('You do not have permission to delete this user.');
+      } else {
+        Alert.alert('Delete failed', String(e && e.message));
+      }
+    }
   }
 
   return (
@@ -497,5 +518,23 @@ const styles = StyleSheet.create({
   rowMeta: { color: '#666', fontSize: 12 },
   rowButton: { padding: 8 },
   input: { borderWidth: 1, borderColor: '#ddd', padding: 8, marginTop: 8, borderRadius: 4, backgroundColor: '#fff' },
-  metadataInput: { height: 160, minHeight: 120, borderWidth: 1, borderColor: '#ddd', padding: 8, marginTop: 8, borderRadius: 4, backgroundColor: '#fff' }
+  metadataInput: { height: 160, minHeight: 120, borderWidth: 1, borderColor: '#ddd', padding: 8, marginTop: 8, borderRadius: 4, backgroundColor: '#fff' },
+  noticeWrap: { marginBottom: 10 },
+  noticeBox: { backgroundColor: '#fdecea', borderColor: '#f5c2c0', borderWidth: 1, padding: 10, borderRadius: 6, flexDirection: 'row', alignItems: 'center' },
+  noticeText: { flex: 1, color: '#8a1c13', fontSize: 13 },
+  noticeClose: { marginLeft: 12, paddingHorizontal: 6, paddingVertical: 2 },
+  noticeCloseText: { color: '#8a1c13', fontWeight: '700', fontSize: 12 }
 });
+
+function PermissionNotice({ message, onClose }) {
+  return (
+    <View style={styles.noticeWrap}>
+      <View style={styles.noticeBox}>
+        <Text style={styles.noticeText}>{message || 'Permission denied.'}</Text>
+        <TouchableOpacity onPress={onClose} accessibilityLabel="Dismiss permission notice" style={styles.noticeClose}>
+          <Text style={styles.noticeCloseText}>×</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  );
+}

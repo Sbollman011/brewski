@@ -444,12 +444,13 @@ export default function App() {
             {screen === 'admin' && token && (
               hasManageAccess ? (
                 <AdminPortal currentUser={cachedUser} loadingUser={userLoading} token={token} />
-              ) : (userLoading ? (
+              ) : ((userLoading || !cachedUser) ? (
+                // Grace period: while user role is still resolving, avoid redirect flicker to dashboard.
                 <View style={{ padding: 20 }}>
                   <Text style={{ fontSize: 16, color: '#444' }}>Loading access…</Text>
                 </View>
               ) : (
-                // If not loading and still no access, fall back to dashboard automatically (prevents stale unauthorized screen)
+                // User resolved and has no manage access; redirect to dashboard.
                 (() => { setTimeout(() => { if (!hasManageAccess) openScreen('dashboard'); }, 50); return (
                   <View style={{ padding: 20 }}>
                     <Text style={{ fontSize: 16, color: '#a33' }}>You do not have access to Manage.</Text>
