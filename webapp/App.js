@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { View, Text, StyleSheet, Pressable, TextInput, Alert } from 'react-native';
@@ -10,6 +10,7 @@ import LoginScreen from './components/LoginScreen';
 import ForgotPasswordScreen from './components/ForgotPasswordScreen';
 import ResetPasswordScreen from './components/ResetPasswordScreen';
 import { Linking, Platform } from 'react-native';
+import { apiFetch } from './src/api';
 
 // Removed push notification registration logic per request
 
@@ -43,11 +44,38 @@ export default function App() {
   const [screen, setScreen] = useState(Platform.OS === 'web' ? 'landing' : 'login'); // 'landing' | 'dashboard' | 'settings' | 'about' | 'login' | 'forgot' | 'reset'
   const [token, setToken] = useState(null);
   const [initialResetToken, setInitialResetToken] = useState('');
+  const [cachedUser, setCachedUser] = useState(null); // minimal user info for role-based nav
+  const [userLoading, setUserLoading] = useState(false);
+
+  async function ensureUserLoaded(force = false) {
+    if (!token) return;
+    if (!force && (cachedUser || userLoading)) return;
+    try {
+      setUserLoading(true);
+      const res = await apiFetch('/admin/api/me');
+      if (!res || !res.ok) return;
+      let js = null;
+      try { js = await res.json(); } catch (e) { js = null; }
+      if (js && js.user) {
+        setCachedUser(js.user);
+        try { localStorage.setItem('brewski_me', JSON.stringify(js.user)); } catch (e) {}
+      }
+    } catch (e) {
+      // swallow
+    } finally {
+      setUserLoading(false);
+    }
+  }
 
   useEffect(() => {
     try {
       const t = localStorage.getItem('brewski_jwt');
       if (t) setToken(t);
+      // attempt to hydrate cached user
+      const meRaw = localStorage.getItem('brewski_me');
+      if (meRaw) {
+        try { setCachedUser(JSON.parse(meRaw)); } catch (e) {}
+      }
     } catch (e) {
       // localStorage might not be available in some runtimes (native), ignore
     }
@@ -120,26 +148,34 @@ export default function App() {
     }
   }, []);
 
-  // If a token is present, switch to the dashboard automatically unless the current
-  // browser path explicitly requests /admin. This prevents logging in from /admin and
-  // being immediately redirected away.
+  // Initial routing decision only once after token becomes available.
+  const initialRoutedRef = useRef(false);
   useEffect(() => {
+    if (!token || initialRoutedRef.current) return;
     try {
       const pathname = (typeof window !== 'undefined' && window.location) ? String(window.location.pathname) : '';
       const isAdminPath = pathname.startsWith('/admin');
       const isManagePath = pathname.startsWith('/manage');
-      if (token) {
-        // If the browser path is /admin or /manage, keep the admin screen; otherwise, move to dashboard
-        if (isAdminPath || isManagePath) {
-          setScreen('admin');
-        } else if (screen !== 'admin') {
-          setScreen('dashboard');
-        }
+      if (isAdminPath || isManagePath) {
+        setScreen('admin');
+      } else if (pathname === '/' || pathname === '') {
+        // Stay on landing when root path and user just authenticated (let them choose)
+        setScreen('landing');
+      } else {
+        setScreen('dashboard');
       }
     } catch (e) {
-      if (token && screen !== 'admin') setScreen('dashboard');
+      setScreen('dashboard');
+    } finally {
+      initialRoutedRef.current = true;
     }
-  }, [token, screen]);
+  }, [token]);
+
+  // Whenever token changes, ensure we have user info (unless already cached from localStorage)
+  useEffect(() => {
+    if (!token) { setCachedUser(null); return; }
+    if (!cachedUser) ensureUserLoaded(false);
+  }, [token]);
 
   // On web, if the path is /admin open the admin screen by default
   useEffect(() => {
@@ -200,6 +236,21 @@ export default function App() {
   const openScreen = (name) => {
     setScreen(name);
     setMenuOpen(false);
+    // Update browser URL on web to reflect leaving or entering admin context so effects don't fight navigation.
+    try {
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        if (name === 'admin') {
+          window.history.pushState({}, '', '/admin');
+        } else if (name === 'dashboard') {
+          window.history.pushState({}, '', '/dashboard');
+        } else if (name === 'landing') {
+          window.history.pushState({}, '', '/');
+        } else {
+          // keep a lightweight hash for other internal pseudo-screens to avoid server 404s
+          window.history.pushState({}, '', '/#' + name);
+        }
+      }
+    } catch (e) { /* ignore */ }
   };
 
   function openDashboard() {
@@ -247,7 +298,11 @@ export default function App() {
           title={titleMap[screen] || 'Brew Remote'}
           token={token}
           hideControls={['login', 'forgot', 'reset', 'landing'].includes(screen)}
-          onMenuPress={() => setMenuOpen(m => !m)}
+          onMenuPress={() => {
+            const next = !menuOpen;
+            setMenuOpen(next);
+            if (next) ensureUserLoaded(false);
+          }}
           onDashboardPress={() => {
             setMenuOpen(false);
             openDashboard();
@@ -259,10 +314,20 @@ export default function App() {
           {/* Side menu */}
           {menuOpen && (
             <View style={styles.sideMenu}>
-              <Text style={styles.menuHeader}>Menu</Text>
               <Pressable onPress={() => openScreen('dashboard')} style={{ paddingVertical: 8 }}>
                 <Text style={styles.menuItem}>Dashboard</Text>
               </Pressable>
+              {/* Manage portal (admin or manager) */}
+              {token && cachedUser && (Number(cachedUser.is_admin) === 1 || cachedUser.role === 'manager') && (
+                <Pressable onPress={() => { openScreen('admin'); }} style={{ paddingVertical: 8 }}>
+                  <Text style={styles.menuItem}>Manage</Text>
+                </Pressable>
+              )}
+              {token && !cachedUser && userLoading && (
+                <View style={{ paddingVertical: 8 }}>
+                  <Text style={[styles.menuItem, { opacity: 0.6 }]}>Loading role...</Text>
+                </View>
+              )}
               <Pressable onPress={() => openScreen('settings')} style={{ paddingVertical: 8 }}>
                 <Text style={styles.menuItem}>Settings</Text>
               </Pressable>

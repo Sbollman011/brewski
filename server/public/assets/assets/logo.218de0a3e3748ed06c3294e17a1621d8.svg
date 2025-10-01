@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 80" width="160" height="48" aria-hidden="true">
+  <!-- White, simplified logo so it shows on dark backgrounds -->
+  <g fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Kettle outline -->
+    <rect x="6" y="18" width="56" height="44" rx="8" ry="8" fill="#ffffff" />
+    <circle cx="34" cy="40" r="8" fill="#eaf6ea" stroke="#ffffff" />
+    <rect x="28" y="6" width="24" height="5" rx="2" fill="#ffffff" />
+    <!-- Paddle simplified -->
+    <rect x="86" y="16" width="6" height="36" rx="3" fill="#ffffff" transform="rotate(-18 89 34)" />
+    <!-- Hop leaf simplified -->
+    <path d="M150 30c-6 1-12 7-12 13s6 12 12 13c6-1 12-7 12-13s-6-12-12-13z" fill="#ffffff" />
+  </g>
+  <text x="172" y="46" font-family="Helvetica, Arial, sans-serif" font-size="14" fill="#ffffff" font-weight="700">Brew Remote</text>
+</svg>

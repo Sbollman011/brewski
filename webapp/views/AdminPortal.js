@@ -102,9 +102,15 @@ export default function AdminPortal() {
     })();
   }, []);
 
-  useEffect(() => { loadPage(page); }, [page]);
+  // Load paginated customers ONLY for admins (managers shouldn't call the admin-only endpoint and trigger 401s)
+  useEffect(() => {
+    if (user && Number(user.is_admin) === 1) {
+      loadPage(page);
+    }
+  }, [page, user]);
 
   async function loadPage(p = 0) {
+    if (!user || Number(user.is_admin) !== 1) return; // managers skip
     setLoading(true);
     try {
       const off = p * limit;
@@ -115,15 +121,14 @@ export default function AdminPortal() {
       }
     } catch (e) {
       console.error('loadPage error', e && e.message);
-      try {
-        if (e && e.status === 401) {
-          try { localStorage.removeItem('brewski_jwt'); } catch (err) {}
-          setUser(null);
-          try { if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (err) {}
-          setLoading(false);
-          return;
-        }
-      } catch (err) {}
+      if (e && e.status === 401) {
+        // Only clear token if we expected admin access
+        try { localStorage.removeItem('brewski_jwt'); } catch (err) {}
+        setUser(null);
+        try { if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (err) {}
+        setLoading(false);
+        return;
+      }
       Alert.alert('Error', String(e && e.message));
     }
     setLoading(false);
@@ -454,7 +459,9 @@ function ManagerPanel({ user }) {
   return (
     <View>
       <Text style={{ fontSize: 16, fontWeight: '700' }}>{customer ? customer.name : 'Manager Console'}</Text>
-      <Text style={{ marginTop: 8 }}>Manage users for your customer (ID: {user.customer_id})</Text>
+      <Text style={{ marginTop: 8 }}>
+        {customer ? `Manage users for ${customer.name} (ID: ${customer.id})` : `Manage users for your customer (ID: ${user.customer_id})`}
+      </Text>
       <FlatList data={users} keyExtractor={u => String(u.id)} renderItem={({item}) => (
         <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
           <Text>{item.username} {item.role ? `(${item.role})` : ''} — {item.email || 'no email'}</Text>

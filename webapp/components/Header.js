@@ -11,7 +11,9 @@ export default function Header({ title, token, onMenuPress, onDashboardPress, on
           <View style={styles.bar} />
         </Pressable>
       )}
-      <Text style={styles.appTitle}>{title || 'Brew Remote'}</Text>
+      <Pressable onPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }} accessibilityLabel="Home">
+        <Text style={styles.appTitle}>{title || 'Brew Remote'}</Text>
+      </Pressable>
       <View style={styles.rightArea}>
         {hideControls ? null : (
           token ? (

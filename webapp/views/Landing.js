@@ -15,11 +15,11 @@ export default function Landing({ onLoginPress, onDashboardPress }) {
         </View>
         <Text style={styles.lead}>A local controller + secure remote portal for fermentation, mash, boil & cellar operations. Stay in control from anywhere without exposing your whole network.</Text>
         <View style={styles.ctaRow}>
-          <Pressable style={styles.ctaPrimary} onPress={onDashboardPress} accessibilityLabel="Open Dashboard">
-            <Text style={styles.ctaPrimaryText}>Open Dashboard</Text>
+          <Pressable style={styles.ctaPrimary} onPress={onDashboardPress} accessibilityLabel="Dashboard">
+            <Text style={styles.ctaPrimaryText}>Dashboard</Text>
           </Pressable>
-          <Pressable style={styles.ctaSecondary} onPress={onLoginPress} accessibilityLabel="Login">
-            <Text style={styles.ctaSecondaryText}>Login</Text>
+          <Pressable style={styles.ctaSecondary} onPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/admin'; } catch (e) { onLoginPress && onLoginPress(); } }} accessibilityLabel="Manage">
+            <Text style={styles.ctaSecondaryText}>Manage</Text>
           </Pressable>
         </View>
         <View style={styles.miniFeaturesRow}>
