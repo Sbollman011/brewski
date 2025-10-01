@@ -489,14 +489,20 @@ function ManagerPanel({ user, doFetch, onPermissionDenied }) {
       <Text style={{ marginTop: 8 }}>
         {customer ? `Manage users for ${customer.name} (ID: ${customer.id})` : `Manage users for your customer (ID: ${user.customer_id})`}
       </Text>
-      <FlatList data={users} keyExtractor={u => String(u.id)} renderItem={({item}) => (
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
-          <Text>{item.username} {item.role ? `(${item.role})` : ''} — {item.email || 'no email'}</Text>
-          <TouchableOpacity onPress={() => deleteUser(item.id)} style={{ marginLeft: 12 }}>
-            <Text style={{ color: '#b71c1c' }}>Delete</Text>
-          </TouchableOpacity>
-        </View>
-      )} />
+      <FlatList data={users} keyExtractor={u => String(u.id)} renderItem={({item}) => {
+        const role = item.role || 'user';
+        const canDelete = ['user','privileged'].includes(role) && item.id !== user.id;
+        return (
+          <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
+            <Text>{item.username} {item.role ? `(${item.role})` : ''} — {item.email || 'no email'}</Text>
+            {canDelete && (
+              <TouchableOpacity onPress={() => deleteUser(item.id)} style={{ marginLeft: 12 }}>
+                <Text style={{ color: '#b71c1c' }}>Delete</Text>
+              </TouchableOpacity>
+            )}
+          </View>
+        );
+      }} />
       <Text style={{ marginTop: 8, fontWeight: '600' }}>Create User</Text>
       <TextInput value={newUser.username} onChangeText={t => setNewUser(s => ({...s, username: t}))} placeholder="Username" style={styles.input} />
       <TextInput value={newUser.password} onChangeText={t => setNewUser(s => ({...s, password: t}))} placeholder="Password" style={styles.input} secureTextEntry />

@@ -1,7 +1,11 @@
 import React from 'react';
 import { View, Text, Pressable, StyleSheet, ScrollView, Image } from 'react-native';
 
-export default function Landing({ onLoginPress, onDashboardPress }) {
+// Props:
+//  - onLoginPress(): open login screen (generic)
+//  - onDashboardPress(): go to dashboard (respecting auth)
+//  - onManagePress(): attempt to open manage/admin portal (SPA-managed)
+export default function Landing({ onLoginPress, onDashboardPress, onManagePress }) {
   return (
     <ScrollView style={styles.container} contentContainerStyle={styles.scrollContent}>
       <View style={styles.hero}>
@@ -18,7 +22,15 @@ export default function Landing({ onLoginPress, onDashboardPress }) {
           <Pressable style={styles.ctaPrimary} onPress={onDashboardPress} accessibilityLabel="Dashboard">
             <Text style={styles.ctaPrimaryText}>Dashboard</Text>
           </Pressable>
-          <Pressable style={styles.ctaSecondary} onPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/admin'; } catch (e) { onLoginPress && onLoginPress(); } }} accessibilityLabel="Manage">
+          <Pressable style={styles.ctaSecondary} onPress={() => {
+            if (onManagePress) {
+              onManagePress();
+              return;
+            }
+            // Fallback: previous behavior (full navigation) if handler not supplied
+            try { if (typeof window !== 'undefined') window.location.href = '/admin'; }
+            catch (e) { onLoginPress && onLoginPress(); }
+          }} accessibilityLabel="Manage">
             <Text style={styles.ctaSecondaryText}>Manage</Text>
           </Pressable>
         </View>

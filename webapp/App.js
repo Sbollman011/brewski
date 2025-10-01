@@ -401,14 +401,27 @@ export default function App() {
           )}
           <View style={styles.content}>
             {Platform.OS === 'web' && screen === 'landing' && (
-              <Landing onLoginPress={() => setScreen('login')} onDashboardPress={() => {
-                if (!token) {
+              <Landing
+                onLoginPress={() => setScreen('login')}
+                onDashboardPress={() => {
+                  if (!token) {
+                    setScreen('login');
+                  } else {
+                    openScreen('dashboard');
+                  }
+                }}
+                onManagePress={() => {
+                  if (token) {
+                    openScreen('admin');
+                    return;
+                  }
+                  // Record intent then show login without triggering server 401
+                  intendedScreenRef.current = 'admin';
                   setScreen('login');
-                } else {
-                  // Authenticated: navigate within SPA to dashboard (no full reload)
-                  openScreen('dashboard');
-                }
-              }} />
+                  // Update URL to /admin so upon reload or deep link consistency is preserved (no network request)
+                  try { if (typeof window !== 'undefined') window.history.pushState({}, '', '/admin'); } catch (e) {}
+                }}
+              />
             )}
             {!token && screen !== 'login' && screen !== 'landing' && null}
             {screen === 'login' && !token && <LoginScreen onLogin={(t) => {

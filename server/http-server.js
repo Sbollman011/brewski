@@ -73,11 +73,25 @@ function startHttpServer(opts = {}) {
 
       // Simple static serving for built webapp
       try {
+        // Resolve which web build directory to use (production export preferred)
+        // Priority order:
+        //  1. server/public (populated by deploy-web.sh)
+        //  2. webapp/web-build (local dev export)
+        //  3. fallback legacy (handled below by web-admin pages)
+        const resolveWebBuildDir = () => {
+          const prodDir = path.join(__dirname, 'public');
+          if (fs.existsSync(path.join(prodDir, 'index.html'))) return prodDir;
+          const devDir = path.join(__dirname, '..', 'webapp', 'web-build');
+          if (fs.existsSync(path.join(devDir, 'index.html'))) return devDir;
+          return null;
+        };
+        const resolvedWebBuildDir = resolveWebBuildDir();
+
         // admin UI: prefer serving the SPA web-build index if present so the
         // React app can handle the /admin route. If no web build exists,
         // fall back to the small server-side admin page in server/web-admin.
-  if (url.pathname === '/admin' || url.pathname === '/admin/') {
-          const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
+        if (url.pathname === '/admin' || url.pathname === '/admin/') {
+          const webBuildDir = resolvedWebBuildDir || path.join(__dirname, '..', 'webapp', 'web-build');
           const indexPath = path.join(webBuildDir, 'index.html');
           // If a built SPA exists, require a valid token to serve the admin UI.
           // This prevents unauthenticated users from loading the admin SPA; instead
@@ -152,58 +166,60 @@ function startHttpServer(opts = {}) {
             return;
           }
         }
-          // Manager UI: similar to /admin but for manager users. Serve /manage
-          if (url.pathname === '/manage' || url.pathname === '/manage/') {
-            const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
-            const indexPath = path.join(webBuildDir, 'index.html');
-            if (fs.existsSync(indexPath)) {
-              // If a full SPA exists, fall back to admin SPA logic above (which enforces admin only),
-              // so here we prefer the lightweight manager page below.
+        // Manager UI: similar to /admin but for manager users. Serve /manage
+        if (url.pathname === '/manage' || url.pathname === '/manage/') {
+          const webBuildDir = resolvedWebBuildDir || path.join(__dirname, '..', 'webapp', 'web-build');
+          const indexPath = path.join(webBuildDir, 'index.html');
+          if (fs.existsSync(indexPath)) {
+            // For production we now allow the full SPA to handle /manage; token gating happens client-side.
+            // (We keep legacy small page fallback below if no build exists.)
+          }
+          const managePath = path.join(__dirname, 'web-admin', 'manage.html');
+          if (!fs.existsSync(indexPath) && fs.existsSync(managePath)) {
+            // Require a valid token and that it maps to a manager or admin
+            const authHeader = (req.headers && (req.headers['authorization'] || '')) || '';
+            const parts = authHeader.split(' ');
+            let token = null;
+            if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
+            if (!token) token = url.searchParams && url.searchParams.get('token');
+            const BRIDGE = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
+            let ok = false;
+            if (BRIDGE && token === BRIDGE) {
+              // legacy bridge token — allow (bridge considered privileged)
+              ok = true;
             }
-            const managePath = path.join(__dirname, 'web-admin', 'manage.html');
-            if (fs.existsSync(managePath)) {
-              // Require a valid token and that it maps to a manager or admin
-              const authHeader = (req.headers && (req.headers['authorization'] || '')) || '';
-              const parts = authHeader.split(' ');
-              let token = null;
-              if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
-              if (!token) token = url.searchParams && url.searchParams.get('token');
-              const BRIDGE = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
-              let ok = false;
-              if (BRIDGE && token === BRIDGE) {
-                // legacy bridge token — allow (bridge considered privileged)
-                ok = true;
-              }
-              if (!ok && token) {
-                try {
-                  const { verifyToken, findUserById } = require('./lib/auth');
-                  const claims = verifyToken(token);
-                  if (claims) {
-                    const u = findUserById(claims.sub);
-                    if (u && (Number(u.is_admin) === 1 || u.role === 'manager')) ok = true;
-                  }
-                } catch (e) { /* invalid token */ }
-              }
-              if (!ok) {
-                setSecurityHeadersLocal();
-                res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
-                res.end('<!doctype html><html><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1><p>Manager access required.</p></body></html>');
-                return;
-              }
+            if (!ok && token) {
+              try {
+                const { verifyToken, findUserById } = require('./lib/auth');
+                const claims = verifyToken(token);
+                if (claims) {
+                  const u = findUserById(claims.sub);
+                  if (u && (Number(u.is_admin) === 1 || u.role === 'manager')) ok = true;
+                }
+              } catch (e) { /* invalid token */ }
+            }
+            if (!ok) {
               setSecurityHeadersLocal();
-              res.setHeader('Content-Type', 'text/html; charset=utf-8');
-              res.setHeader('Cache-Control', 'no-cache');
-              fs.createReadStream(managePath).pipe(res);
+              res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+              res.end('<!doctype html><html><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1><p>Manager access required.</p></body></html>');
               return;
             }
+            setSecurityHeadersLocal();
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            fs.createReadStream(managePath).pipe(res);
+            return;
           }
-        const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
+        }
+        const webBuildDir = resolvedWebBuildDir || path.join(__dirname, '..', 'webapp', 'web-build');
         // assets
         if (url.pathname.startsWith('/assets/')) {
           const rel = decodeURIComponent(url.pathname.replace(/^\/assets\//, ''));
-          const filePath = path.join(path.join(__dirname, '..', 'webapp', 'assets'), rel);
+          // Assets directory inside chosen build dir
+          const assetsRoot = path.join(webBuildDir, 'assets');
+          const filePath = path.join(assetsRoot, rel);
           const resolved = path.resolve(filePath);
-          if (!resolved.startsWith(path.resolve(path.join(__dirname, '..', 'webapp', 'assets')))) { res.writeHead(403); res.end('forbidden'); return; }
+          if (!resolved.startsWith(path.resolve(assetsRoot))) { res.writeHead(403); res.end('forbidden'); return; }
           if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
             setSecurityHeadersLocal();
             const ext = path.extname(resolved).toLowerCase();
