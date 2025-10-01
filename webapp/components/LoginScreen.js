@@ -17,12 +17,23 @@ export default function LoginScreen({ onLogin, onForgot }) {
     }
     setLoading(true);
     try {
-      const resp = await apiFetch('/admin/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      });
-      const json = await resp.json();
+      const resp = await apiFetch('/admin/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+      let json = null;
+      try {
+        json = await resp.json();
+      } catch (e) {
+        // If content-type was HTML, surface a friendlier message
+        try {
+          const txt = await resp.text();
+          if (txt && /^<!doctype html>/i.test(txt.trim())) {
+            throw new Error('Server returned HTML instead of JSON. Check API host routing.');
+          } else if (txt) {
+            throw new Error(txt.slice(0, 160));
+          }
+        } catch (inner) {
+          throw inner;
+        }
+      }
       if (resp.ok && json && json.token) {
         try { localStorage.setItem('brewski_jwt', json.token); } catch (e) { /* ignore */ }
         onLogin(json.token);

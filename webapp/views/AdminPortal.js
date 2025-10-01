@@ -11,19 +11,23 @@ const doFetch = async (path, opts = {}) => {
       if (token) headers['Authorization'] = `Bearer ${token}`;
     } catch (e) {}
 
-    // Route admin API calls to the central backend host so web builds (dev or
-    // production) always reach the real API instead of any local dev server that
-    // might serve HTML. For non-admin paths, use same-origin relative URLs.
+    // Route admin API calls to the central API host unless we're already
+    // running on that host. This is necessary when the frontend and API are
+    // served on separate hostnames (for example cloudflared routes brewingremote.com
+    // -> frontend:8081 and api.brewingremote.com -> backend:8080). In that case
+    // calling /admin/api on the frontend origin would return the SPA HTML.
     let finalUrl = path;
-  try {
-  const API_HOST = 'api.brewingremote.com';
-      const loc = window.location || {};
-      // If this is an admin API path, always target the central API host.
+    try {
+      const API_HOST = 'api.brewingremote.com';
+      const loc = (typeof window !== 'undefined' && window.location) ? window.location : {};
       if (String(path || '').startsWith('/admin/api')) {
-        finalUrl = `https://${API_HOST}${path.startsWith('/') ? path : '/' + path}`;
+        // If we're already on the API host, use same-origin; otherwise target API_HOST
+        if (loc && loc.hostname === API_HOST) {
+          finalUrl = path;
+        } else {
+          finalUrl = `https://${API_HOST}${path.startsWith('/') ? path : '/' + path}`;
+        }
       } else {
-        // For other paths (assets or non-admin SPA routes), keep same-origin
-        // behavior so the browser requests the files served by the server.
         finalUrl = path;
       }
     } catch (e) { finalUrl = path; }
@@ -144,22 +148,30 @@ export default function AdminPortal() {
   return (
     <View style={{ padding: 12, flex: 1 }}>
       <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>Admin Portal</Text>
-      {!user && <Text>Please sign in with an admin account.</Text>}
-      {user && Number(user.is_admin) !== 1 && <Text>You are not an admin.</Text>}
-      {user && Number(user.is_admin) === 1 && (
+      {!user && <Text>Please sign in with an admin or manager account.</Text>}
+      {user && (
         <ScrollView contentContainerStyle={{ paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-          <View style={{ marginBottom: 8 }}><Text>Signed in as: {user.username} ({user.email || 'no email'})</Text></View>
-          <View style={{ flexDirection: 'row', marginBottom: 8 }}>
-            <TouchableOpacity onPress={() => setShowCreate(true)} style={{ backgroundColor: '#1b5e20', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 6 }}>
-              <Text style={{ color: '#fff' }}>Create Customer</Text>
-            </TouchableOpacity>
-          </View>
-          <FlatList data={customers} keyExtractor={i => String(i.id)} renderItem={({item}) => <Row item={item} onEdit={setEditing} />} style={{ marginTop: 12 }} />
-          <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 }}>
-            <Button title="Prev" onPress={() => setPage(Math.max(0, page-1))} disabled={page<=0} />
-            <Text style={{ alignSelf: 'center' }}>{page+1} / {Math.max(1, Math.ceil((total||customers.length)/limit))}</Text>
-            <Button title="Next" onPress={() => setPage(page+1)} disabled={(page+1)*limit >= (total||customers.length)} />
-          </View>
+          <View style={{ marginBottom: 8 }}><Text>Signed in as: {user.username} ({user.email || 'no email'}){user.role ? ` — ${user.role}` : ''}</Text></View>
+          {/* If the user is an admin, show customer management. If manager, show a scoped manager panel. */}
+          {Number(user.is_admin) === 1 ? (
+            <View>
+              <View style={{ flexDirection: 'row', marginBottom: 8 }}>
+                <TouchableOpacity onPress={() => setShowCreate(true)} style={{ backgroundColor: '#1b5e20', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 6 }}>
+                  <Text style={{ color: '#fff' }}>Create Customer</Text>
+                </TouchableOpacity>
+              </View>
+              <FlatList data={customers} keyExtractor={i => String(i.id)} renderItem={({item}) => <Row item={item} onEdit={setEditing} />} style={{ marginTop: 12 }} />
+              <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 }}>
+                <Button title="Prev" onPress={() => setPage(Math.max(0, page-1))} disabled={page<=0} />
+                <Text style={{ alignSelf: 'center' }}>{page+1} / {Math.max(1, Math.ceil((total||customers.length)/limit))}</Text>
+                <Button title="Next" onPress={() => setPage(page+1)} disabled={(page+1)*limit >= (total||customers.length)} />
+              </View>
+            </View>
+          ) : user.role === 'manager' ? (
+            <ManagerPanel user={user} />
+          ) : (
+            <Text>You do not have access to this portal.</Text>
+          )}
         </ScrollView>
       )}
 
@@ -206,14 +218,14 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
   const [controller_port, setControllerPort] = useState('');
   const [metadata, setMetadata] = useState(initial ? (initial.metadata||'') : '');
   const [users, setUsers] = useState([]);
-  const [newUser, setNewUser] = useState({ username: '', password: '', email: '', name: '', is_admin: false });
-  const [sensors, setSensors] = useState([]);
-  const [newSensorKey, setNewSensorKey] = useState('');
+  const [newUser, setNewUser] = useState({ username: '', password: '', email: '', name: '', role: 'user' });
+  const [topics, setTopics] = useState([]);
+  const [newTopicKey, setNewTopicKey] = useState('');
   const [confirm, setConfirm] = useState(null);
 
   // Reset create-user form when switching to a new customer (create mode)
   useEffect(() => {
-    if (!initial) setNewUser({ username: '', password: '', email: '', name: '', is_admin: false });
+    if (!initial) setNewUser({ username: '', password: '', email: '', name: '', role: 'user' });
   }, [initial]);
 
   async function loadUsers() {
@@ -229,29 +241,29 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
     try {
       const body = Object.assign({}, newUser);
       const res = await doFetch(`/admin/api/customers/${initial.id}/users`, { method: 'POST', body });
-      if (res && res.ok) { setNewUser({ username:'', password:'', email:'', name:'', is_admin:false }); loadUsers(); }
+      if (res && res.ok) { setNewUser({ username:'', password:'', email:'', name:'', role: 'user' }); loadUsers(); }
     } catch (e) { Alert.alert('Create user failed', String(e && e.message)); }
   }
 
-  async function loadSensors() {
+  async function loadTopics() {
     if (!initial || !initial.id) return;
     try {
-      const res = await doFetch(`/admin/api/customers/${initial.id}/sensors`);
-      if (res && res.sensors) setSensors(res.sensors);
-    } catch (e) { console.error('loadSensors', e && e.message); setSensors([]); }
+      const res = await doFetch(`/admin/api/customers/${initial.id}/topics`);
+      if (res && res.topics) setTopics(res.topics);
+    } catch (e) { console.error('loadTopics', e && e.message); setTopics([]); }
   }
 
 
 
-  async function createSensor() {
+  async function createTopic() {
     if (!initial || !initial.id) return;
     try {
-      const res = await doFetch(`/admin/api/customers/${initial.id}/sensors`, { method: 'POST', body: { sensor_key: newSensorKey } });
-      if (res && res.ok) { setNewSensorKey(''); loadSensors(); }
-    } catch (e) { Alert.alert('Create sensor failed', String(e && e.message)); }
+      const res = await doFetch(`/admin/api/customers/${initial.id}/topics`, { method: 'POST', body: { topic_key: newTopicKey } });
+      if (res && res.ok) { setNewTopicKey(''); loadTopics(); }
+    } catch (e) { Alert.alert('Create topic failed', String(e && e.message)); }
   }
 
-  useEffect(() => { loadUsers(); loadSensors(); }, []);
+  useEffect(() => { loadUsers(); loadTopics(); }, []);
 
 
   // Delete user with confirmation (uses React modal)
@@ -274,17 +286,17 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
   }
 
   // Delete sensor with confirmation
-  async function deleteSensor(sensorId) {
+  async function deleteTopic(topicId) {
     if (!initial || !initial.id) return;
     setConfirm({
-      title: 'Delete Sensor',
-      message: 'Are you sure you want to delete this sensor?',
+      title: 'Delete Topic',
+      message: 'Are you sure you want to delete this topic?',
       onConfirm: async () => {
         try {
-          const res = await doFetch(`/admin/api/customers/${initial.id}/sensors/${sensorId}`, { method: 'DELETE' });
-          console.log('deleteSensor response', res);
-          loadSensors();
-          try { Alert.alert('Deleted', 'Sensor deleted'); } catch (e) { if (typeof window !== 'undefined') window.alert('Sensor deleted'); }
+          const res = await doFetch(`/admin/api/customers/${initial.id}/topics/${topicId}`, { method: 'DELETE' });
+          console.log('deleteTopic response', res);
+          loadTopics();
+          try { Alert.alert('Deleted', 'Topic deleted'); } catch (e) { if (typeof window !== 'undefined') window.alert('Topic deleted'); }
         } catch (e) { Alert.alert('Delete failed', String(e && e.message)); }
         setConfirm(null);
       },
@@ -339,7 +351,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
           <Text style={{ fontSize: 16, fontWeight: '700' }}>Users</Text>
           <FlatList data={users} keyExtractor={u => String(u.id)} renderItem={({item}) => (
             <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
-              <Text>{item.username} {item.is_admin ? '(admin)' : ''} — {item.email || 'no email'}</Text>
+              <Text>{item.username} {item.role ? `(${item.role})` : ''} — {item.email || 'no email'}</Text>
               <TouchableOpacity onPress={() => deleteUser(item.id)} style={{ marginLeft: 12 }}>
                 <Text style={{ color: '#b71c1c' }}>Delete</Text>
               </TouchableOpacity>
@@ -350,12 +362,18 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
           <TextInput value={newUser.password} onChangeText={t => setNewUser(s => ({...s, password: t}))} placeholder="Password" style={styles.input} secureTextEntry />
           <TextInput value={newUser.name} onChangeText={t => setNewUser(s => ({...s, name: t}))} placeholder="Full name" style={styles.input} />
           <TextInput value={newUser.email} onChangeText={t => setNewUser(s => ({...s, email: t}))} placeholder="Email" style={styles.input} />
-          <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8 }}>
-            <TouchableOpacity onPress={() => setNewUser(s => ({...s, is_admin: !s.is_admin}))} style={{ marginRight: 8 }}>
-              <Text style={{ color: newUser.is_admin ? '#1b5e20' : '#666' }}>{newUser.is_admin ? '☑' : '☐'}</Text>
-            </TouchableOpacity>
-            <Text>Grant admin privileges</Text>
+          {/* Role picker: allow admin to assign 'user', 'privileged', or 'admin' */}
+          <View style={{ marginTop: 8 }}>
+            <Text style={{ marginBottom: 6 }}>Role</Text>
+            <View style={{ flexDirection: 'row' }}>
+              {['user','privileged','manager','admin'].map(r => (
+                <TouchableOpacity key={r} onPress={() => setNewUser(s => ({ ...s, role: r }))} style={{ marginRight: 12 }}>
+                  <Text style={{ color: newUser.role === r ? '#1b5e20' : '#666' }}>{newUser.role === r ? '☑' : '☐'} {r}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
           </View>
+          {/* Admin status is determined by selecting the 'admin' role above; no direct toggle here. */}
           <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 8 }}>
             <TouchableOpacity onPress={createUser} style={{ backgroundColor: '#1b5e20', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}>
               <Text style={{ color: '#fff' }}>Create User</Text>
@@ -364,19 +382,19 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
 
           {/* Sensors */}
           <View style={{ marginTop: 18 }}>
-            <Text style={{ fontSize: 16, fontWeight: '700' }}>Sensors / Raw Inputs</Text>
-            <FlatList data={sensors} keyExtractor={s => String(s.id)} renderItem={({item}) => (
+            <Text style={{ fontSize: 16, fontWeight: '700' }}>Topics</Text>
+            <FlatList data={topics} keyExtractor={s => String(s.id)} renderItem={({item}) => (
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
-                <Text>{item.sensor_key} — {item.metadata || ''}</Text>
-                <TouchableOpacity onPress={() => deleteSensor(item.id)} style={{ marginLeft: 12 }}>
+                <Text>{item.topic_key || item.sensor_key || item.key} — {item.metadata || ''}</Text>
+                <TouchableOpacity onPress={() => deleteTopic(item.id)} style={{ marginLeft: 12 }}>
                   <Text style={{ color: '#b71c1c' }}>Delete</Text>
                 </TouchableOpacity>
               </View>
             )} />
-            <TextInput value={newSensorKey} onChangeText={setNewSensorKey} placeholder="Sensor key" style={styles.input} />
+            <TextInput value={newTopicKey} onChangeText={setNewTopicKey} placeholder="Topic key" style={styles.input} />
             <View style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
-              <TouchableOpacity onPress={createSensor} style={{ backgroundColor: '#1b5e20', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}>
-                <Text style={{ color: '#fff' }}>Add Sensor</Text>
+              <TouchableOpacity onPress={createTopic} style={{ backgroundColor: '#1b5e20', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}>
+                <Text style={{ color: '#fff' }}>Add Topic</Text>
               </TouchableOpacity>
             </View>
           </View>
@@ -394,6 +412,67 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
           <ConfirmModal visible={true} title={confirm.title} message={confirm.message} onCancel={confirm.onCancel} onConfirm={confirm.onConfirm} />
         ) : null}
       </ScrollView>
+    </View>
+  );
+}
+
+function ManagerPanel({ user }) {
+  const [users, setUsers] = useState([]);
+  const [customer, setCustomer] = useState(null);
+  const [newUser, setNewUser] = useState({ username: '', password: '', email: '', name: '' });
+
+  async function load() {
+    if (!user || !user.customer_id) return;
+    try {
+      const ures = await doFetch(`/admin/api/customers/${user.customer_id}/users`);
+      if (ures && ures.users) setUsers(ures.users);
+    } catch (e) { console.error('manager load users', e && e.message); }
+    try {
+      const cres = await doFetch(`/admin/api/customers/${user.customer_id}`);
+      if (cres && cres.customer) setCustomer(cres.customer);
+    } catch (e) { console.error('manager load customer', e && e.message); }
+  }
+
+  useEffect(() => { load(); }, []);
+
+  async function createUser() {
+    if (!user || !user.customer_id) return;
+    try {
+      const body = { ...newUser, role: 'user' };
+      const res = await doFetch(`/admin/api/customers/${user.customer_id}/users`, { method: 'POST', body });
+      if (res && res.ok) { setNewUser({ username:'', password:'', email:'', name: '' }); load(); }
+    } catch (e) { Alert.alert('Create user failed', String(e && e.message)); }
+  }
+
+  async function deleteUser(id) {
+    try {
+      await doFetch(`/admin/api/users/${id}`, { method: 'DELETE' });
+      load();
+    } catch (e) { Alert.alert('Delete failed', String(e && e.message)); }
+  }
+
+  return (
+    <View>
+      <Text style={{ fontSize: 16, fontWeight: '700' }}>{customer ? customer.name : 'Manager Console'}</Text>
+      <Text style={{ marginTop: 8 }}>Manage users for your customer (ID: {user.customer_id})</Text>
+      <FlatList data={users} keyExtractor={u => String(u.id)} renderItem={({item}) => (
+        <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
+          <Text>{item.username} {item.role ? `(${item.role})` : ''} — {item.email || 'no email'}</Text>
+          <TouchableOpacity onPress={() => deleteUser(item.id)} style={{ marginLeft: 12 }}>
+            <Text style={{ color: '#b71c1c' }}>Delete</Text>
+          </TouchableOpacity>
+        </View>
+      )} />
+      <Text style={{ marginTop: 8, fontWeight: '600' }}>Create User</Text>
+      <TextInput value={newUser.username} onChangeText={t => setNewUser(s => ({...s, username: t}))} placeholder="Username" style={styles.input} />
+      <TextInput value={newUser.password} onChangeText={t => setNewUser(s => ({...s, password: t}))} placeholder="Password" style={styles.input} secureTextEntry />
+      <TextInput value={newUser.name} onChangeText={t => setNewUser(s => ({...s, name: t}))} placeholder="Full name" style={styles.input} />
+      <TextInput value={newUser.email} onChangeText={t => setNewUser(s => ({...s, email: t}))} placeholder="Email" style={styles.input} />
+      <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 8 }}>
+        <TouchableOpacity onPress={createUser} style={{ backgroundColor: '#1b5e20', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}>
+          <Text style={{ color: '#fff' }}>Create User</Text>
+        </TouchableOpacity>
+      </View>
     </View>
   );
 }

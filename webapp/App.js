@@ -125,10 +125,12 @@ export default function App() {
   // being immediately redirected away.
   useEffect(() => {
     try {
-      const isAdminPath = (typeof window !== 'undefined' && window.location && String(window.location.pathname).startsWith('/admin'));
+      const pathname = (typeof window !== 'undefined' && window.location) ? String(window.location.pathname) : '';
+      const isAdminPath = pathname.startsWith('/admin');
+      const isManagePath = pathname.startsWith('/manage');
       if (token) {
-        // If the browser path is /admin, keep the admin screen; otherwise, move to dashboard
-        if (isAdminPath) {
+        // If the browser path is /admin or /manage, keep the admin screen; otherwise, move to dashboard
+        if (isAdminPath || isManagePath) {
           setScreen('admin');
         } else if (screen !== 'admin') {
           setScreen('dashboard');
@@ -148,6 +150,42 @@ export default function App() {
       }
     } catch (e) { }
   }, []);
+
+  // On web, if the path is /manage, open the manager portal if token maps to admin or manager
+  useEffect(() => {
+    try {
+      if (typeof window === 'undefined' || !window.location) return;
+      if (!String(window.location.pathname).startsWith('/manage')) return;
+      // If no token, keep user on login; once token is set the other effect will switch screen
+      if (!token) return;
+      try {
+        // Check current user's role by calling /admin/api/me — prefer SPA-local stored user if present
+        const meRaw = localStorage.getItem('brewski_me');
+        if (meRaw) {
+          const me = JSON.parse(meRaw);
+          if (me && (Number(me.is_admin) === 1 || me.role === 'manager')) {
+            setScreen('admin');
+            try { window.history.replaceState({}, document.title, '/manage'); } catch (e) {}
+            return;
+          }
+        }
+        // Fallback: fetch /admin/api/me to discover role
+        fetch('/admin/api/me', { headers: { 'Authorization': token ? ('Bearer ' + token) : '' } }).then(r => {
+          if (!r.ok) return null;
+          return r.json();
+        }).then(json => {
+          if (json && json.user && (Number(json.user.is_admin) === 1 || json.user.role === 'manager')) {
+            try { localStorage.setItem('brewski_me', JSON.stringify(json.user)); } catch (e) {}
+            setScreen('admin');
+            try { window.history.replaceState({}, document.title, '/manage'); } catch (e) {}
+          } else {
+            // Not allowed — redirect to landing or login
+            setScreen('login');
+          }
+        }).catch(() => setScreen('login'));
+      } catch (e) { }
+    } catch (e) { }
+  }, [token]);
 
   // Redirect unauthenticated users away from protected screens into login.
   useEffect(() => {

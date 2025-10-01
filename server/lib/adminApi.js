@@ -234,43 +234,64 @@ function handleAdminApi(req, res, url) {
           const parts = url.pathname.split('/').filter(Boolean);
           const cid = Number(parts[parts.length - 2]);
           if (!cid) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_customer_id' })); return true; }
+          let me;
           try {
-            const me = findUserById(req.user.id);
-            if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+            me = findUserById(req.user.id);
+            if (!me) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
           } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return true; }
 
-          if (req.method === 'GET') {
-            try {
-              const Database = require('better-sqlite3');
-              const path = require('path');
-              const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
-              const db = new Database(DB_PATH);
-              const rows = db.prepare('SELECT id, username, email, name, role, is_admin, customer_id, created_at, updated_at FROM users WHERE customer_id = ? ORDER BY id').all(cid);
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, users: rows }));
-            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
-            return true;
+          // GET list of users: admin-only
+            if (req.method === 'GET') {
+              try {
+                const isAdmin = Number(me.is_admin) === 1;
+                const isManagerForCustomer = (me.role === 'manager' && Number(me.customer_id) === cid);
+                if (!isAdmin && !isManagerForCustomer) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+                const Database = require('better-sqlite3');
+                const path = require('path');
+                const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+                const db = new Database(DB_PATH);
+                const rows = db.prepare('SELECT id, username, email, name, role, is_admin, customer_id, created_at, updated_at FROM users WHERE customer_id = ? ORDER BY id').all(cid);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, users: rows }));
+              } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+              return true;
           }
 
           // POST -> create user under this customer
-          parseBodyJson(req, res, (err, obj) => {
-            if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
-            const username = obj && obj.username ? String(obj.username).trim() : '';
-            const password = obj && obj.password ? String(obj.password) : '';
-            const email = obj && obj.email ? String(obj.email).trim() : null;
-            const name = obj && obj.name ? String(obj.name).trim() : null;
-            const role = obj && obj.role ? String(obj.role).trim() : null;
-            const is_admin = obj && (obj.is_admin === true || obj.is_admin === 1) ? 1 : 0;
-            if (!username || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+          // Allow admins to create users anywhere; allow 'privileged' role users to create users only for their own customer (and with limited privileges)
+          if (req.method === 'POST') {
             try {
-              const existing = findUserByUsername(username);
-              if (existing) { res.writeHead(409); res.end(JSON.stringify({ error: 'username_exists' })); return; }
-              const u = createUser(username, password, { email, name, role, is_admin, customer_id: cid });
-              res.writeHead(200, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ ok: true, user: { id: u.id, username: u.username } }));
-            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
-          });
-          return true;
+              // Allow admins anywhere; allow managers to create users only for their own customer
+              const allowedForManager = (me.role === 'manager' && Number(me.customer_id) === cid);
+              if (!(Number(me.is_admin) === 1 || allowedForManager)) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+            } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error' })); return true; }
+
+            parseBodyJson(req, res, (err, obj) => {
+              if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+              const username = obj && obj.username ? String(obj.username).trim() : '';
+              const password = obj && obj.password ? String(obj.password) : '';
+              const email = obj && obj.email ? String(obj.email).trim() : null;
+              const name = obj && obj.name ? String(obj.name).trim() : null;
+              // Creator-specified role is accepted; is_admin will be derived from the role
+              let role = obj && obj.role ? String(obj.role).trim() : null;
+              let is_admin = (role === 'admin') ? 1 : 0;
+              if (!username || !password) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+              try {
+                const existing = findUserByUsername(username);
+                if (existing) { res.writeHead(409); res.end(JSON.stringify({ error: 'username_exists' })); return; }
+                // If creator is not full admin (i.e. manager), they cannot create admin users
+                if (Number(me.is_admin) !== 1) {
+                  is_admin = 0;
+                  // force role to 'user' for manager-created accounts
+                  role = 'user';
+                }
+                const u = createUser(username, password, { email, name, role, is_admin, customer_id: cid });
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, user: { id: u.id, username: u.username } }));
+              } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+            });
+            return true;
+          }
         }
 
       // Admin-only: list customers (supports ?limit=&offset=)
@@ -309,6 +330,38 @@ function handleAdminApi(req, res, url) {
           }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, customers: rows, total }));
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+        return true;
+      }
+
+      // GET single customer (admin OR manager for own customer)
+      if (url.pathname.match(/^\/admin\/api\/customers\/\d+$/) && req.method === 'GET') {
+        const id = Number(url.pathname.split('/').pop());
+        if (!id) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'bad_id' })); return true; }
+        try {
+          const { findUserById } = require('./auth');
+          const me = findUserById(req.user.id);
+          if (!me) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          const isAdmin = Number(me.is_admin) === 1;
+          const isManagerOwn = (me.role === 'manager' && Number(me.customer_id) === id);
+          if (!isAdmin && !isManagerOwn) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          const Database = require('better-sqlite3');
+          const path = require('path');
+          const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+          const db = new Database(DB_PATH);
+          const colInfo = db.prepare("PRAGMA table_info(customers)").all();
+          const hasHost1 = colInfo.some(c => c && c.name === 'controller_host1');
+          const hasHost2 = colInfo.some(c => c && c.name === 'controller_host2');
+          let row;
+          if (hasHost1) {
+            if (hasHost2) row = db.prepare('SELECT id, slug, name, controller_host1, controller_host2, controller_ip, controller_port, metadata, created_at, updated_at FROM customers WHERE id = ?').get(id);
+            else row = db.prepare('SELECT id, slug, name, controller_host1, controller_ip, controller_port, metadata, created_at, updated_at FROM customers WHERE id = ?').get(id);
+          } else {
+            row = db.prepare('SELECT id, slug, name, controller_ip, controller_port, metadata, created_at, updated_at FROM customers WHERE id = ?').get(id);
+          }
+          if (!row) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return true; }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, customer: row }));
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
         return true;
       }
@@ -441,10 +494,23 @@ function handleAdminApi(req, res, url) {
               const path = require('path');
               const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
               const db = new Database(DB_PATH);
-              const stmt = db.prepare('DELETE FROM users WHERE id = ?');
-              const info = stmt.run(uid);
-              if (info.changes === 0) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return true; }
-              res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); return true;
+              // Determine requesting user privileges
+              const me = findUserById(req.user.id);
+              if (!me) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+              const target = db.prepare('SELECT id, is_admin, customer_id FROM users WHERE id = ?').get(uid);
+              if (!target) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'not_found' })); return true; }
+              // Admins can delete anyone; managers can delete non-admins in their own customer
+              if (Number(me.is_admin) === 1) {
+                const info = db.prepare('DELETE FROM users WHERE id = ?').run(uid);
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); return true;
+              }
+              if (me.role === 'manager' && Number(me.customer_id) === Number(target.customer_id)) {
+                if (Number(target.is_admin) === 1) { res.writeHead(403, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'forbidden' })); return true; }
+                const info = db.prepare('DELETE FROM users WHERE id = ?').run(uid);
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true })); return true;
+              }
+              // otherwise unauthorized
+              res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true;
             } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'delete_failed', message: e && e.message })); return true; }
           }
 
@@ -471,8 +537,9 @@ function handleAdminApi(req, res, url) {
           }
         }
 
-        // Admin-only: sensors under customer
-        if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/sensors/)) {
+        // Admin-only: sensors/topics under customer
+        // Keep sensors handlers for backward compatibility but expose Topics endpoints
+        if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/(sensors|topics)/)) {
           const parts = url.pathname.split('/').filter(Boolean);
           const cid = Number(parts[parts.length - 2]);
           if (!cid) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_customer_id' })); return true; }
@@ -494,23 +561,28 @@ function handleAdminApi(req, res, url) {
               const colInfo = db.prepare("PRAGMA table_info(sensors)").all();
               const hasSensorKey = colInfo.some(c => c && c.name === 'sensor_key');
               const hasKey = colInfo.some(c => c && c.name === 'key');
+              const hasTopicKey = colInfo.some(c => c && c.name === 'topic_key');
               const hasMetadata = colInfo.some(c => c && c.name === 'metadata');
               let rows = [];
-              if (hasSensorKey) {
-                if (hasMetadata) rows = db.prepare('SELECT id, customer_id, sensor_key, metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
-                else rows = db.prepare('SELECT id, customer_id, sensor_key, NULL AS metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+              // Prefer topic_key if present (new schema), otherwise sensor_key, otherwise key
+              if (hasTopicKey) {
+                if (hasMetadata) rows = db.prepare('SELECT id, customer_id, topic_key, metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+                else rows = db.prepare('SELECT id, customer_id, topic_key, NULL AS metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+              } else if (hasSensorKey) {
+                if (hasMetadata) rows = db.prepare('SELECT id, customer_id, sensor_key AS topic_key, metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+                else rows = db.prepare('SELECT id, customer_id, sensor_key AS topic_key, NULL AS metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
               } else if (hasKey) {
-                if (hasMetadata) rows = db.prepare('SELECT id, customer_id, `key` AS sensor_key, metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
-                else rows = db.prepare('SELECT id, customer_id, `key` AS sensor_key, NULL AS metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+                if (hasMetadata) rows = db.prepare('SELECT id, customer_id, `key` AS topic_key, metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
+                else rows = db.prepare('SELECT id, customer_id, `key` AS topic_key, NULL AS metadata, created_at FROM sensors WHERE customer_id = ? ORDER BY id').all(cid);
               } else {
                 // No suitable column found; respond with explicit error
                 res.writeHead(500);
-                res.end(JSON.stringify({ error: 'server_error', detail: 'sensors table missing sensor_key/key column' }));
+                res.end(JSON.stringify({ error: 'server_error', detail: 'sensors table missing topic_key/sensor_key/key column' }));
                 return true;
               }
-              // Normalize shape to include sensor_key
-              const out = rows.map(r => ({ id: r.id, customer_id: r.customer_id, sensor_key: r.sensor_key, metadata: r.metadata, created_at: r.created_at }));
-              res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, sensors: out }));
+              // Normalize shape to include topic_key
+              const out = rows.map(r => ({ id: r.id, customer_id: r.customer_id, topic_key: r.topic_key, metadata: r.metadata, created_at: r.created_at }));
+              res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, topics: out }));
             } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
             return true;
           }
@@ -519,9 +591,10 @@ function handleAdminApi(req, res, url) {
           if (req.method === 'POST') {
             parseBodyJson(req, res, (err, obj) => {
               if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
-              const sensor_key = obj && (obj.sensor_key || obj.key) ? String(obj.sensor_key || obj.key).trim() : '';
+              // Accept topic_key, sensor_key, or key in the body
+              const topic_key = obj && (obj.topic_key || obj.sensor_key || obj.key) ? String(obj.topic_key || obj.sensor_key || obj.key).trim() : '';
               const metadata = obj && obj.metadata ? String(obj.metadata) : null;
-              if (!sensor_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+              if (!topic_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
               try {
                 const Database = require('better-sqlite3');
                 const path = require('path');
@@ -531,28 +604,32 @@ function handleAdminApi(req, res, url) {
                 // Insert into either `sensor_key` or `key` depending on which column exists.
                 // Prefer `sensor_key` if present; otherwise fallback to `key`.
                 const colInfo = db.prepare("PRAGMA table_info(sensors)").all();
+                const hasTopicKey = colInfo.some(c => c && c.name === 'topic_key');
                 const hasSensorKey = colInfo.some(c => c && c.name === 'sensor_key');
                 const hasKey = colInfo.some(c => c && c.name === 'key');
                 const hasMetadata = colInfo.some(c => c && c.name === 'metadata');
                 let info;
-                if (hasSensorKey) {
-                  if (hasMetadata) info = db.prepare('INSERT INTO sensors (customer_id, sensor_key, metadata, created_at) VALUES (?, ?, ?, ?)').run(cid, sensor_key, metadata, now);
-                  else info = db.prepare('INSERT INTO sensors (customer_id, sensor_key, created_at) VALUES (?, ?, ?)').run(cid, sensor_key, now);
+                if (hasTopicKey) {
+                  if (hasMetadata) info = db.prepare('INSERT INTO sensors (customer_id, topic_key, metadata, created_at) VALUES (?, ?, ?, ?)').run(cid, topic_key, metadata, now);
+                  else info = db.prepare('INSERT INTO sensors (customer_id, topic_key, created_at) VALUES (?, ?, ?)').run(cid, topic_key, now);
+                } else if (hasSensorKey) {
+                  if (hasMetadata) info = db.prepare('INSERT INTO sensors (customer_id, sensor_key, metadata, created_at) VALUES (?, ?, ?, ?)').run(cid, topic_key, metadata, now);
+                  else info = db.prepare('INSERT INTO sensors (customer_id, sensor_key, created_at) VALUES (?, ?, ?)').run(cid, topic_key, now);
                 } else if (hasKey) {
-                  if (hasMetadata) info = db.prepare('INSERT INTO sensors (customer_id, `key`, metadata, created_at) VALUES (?, ?, ?, ?)').run(cid, sensor_key, metadata, now);
-                  else info = db.prepare('INSERT INTO sensors (customer_id, `key`, created_at) VALUES (?, ?, ?)').run(cid, sensor_key, now);
+                  if (hasMetadata) info = db.prepare('INSERT INTO sensors (customer_id, `key`, metadata, created_at) VALUES (?, ?, ?, ?)').run(cid, topic_key, metadata, now);
+                  else info = db.prepare('INSERT INTO sensors (customer_id, `key`, created_at) VALUES (?, ?, ?)').run(cid, topic_key, now);
                 } else {
                   // No suitable column found; return an explicit error
-                  res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: 'sensors table missing sensor_key/key column' })); return;
+                  res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: 'sensors table missing topic_key/sensor_key/key column' })); return;
                 }
-                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, sensor: { id: info.lastInsertRowid, sensor_key } }));
+                res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: true, topic: { id: info.lastInsertRowid, topic_key } }));
               } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
             });
             return true;
           }
 
           // DELETE /admin/api/customers/:id/sensors/:sid -> delete sensor
-          if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/sensors\/\d+$/) && req.method === 'DELETE') {
+          if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/(sensors|topics)\/\d+$/) && req.method === 'DELETE') {
             try {
               const parts = url.pathname.split('/').filter(Boolean);
               const cid2 = Number(parts[parts.length - 3]); // customers/<id>/sensors/<sid>

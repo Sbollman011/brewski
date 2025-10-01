@@ -311,6 +311,7 @@ function runMigration() {
       controller_id INTEGER,
       name TEXT,
       key TEXT,
+      topic_key TEXT,
       type TEXT,
       unit TEXT,
       created_at INTEGER NOT NULL,
@@ -371,6 +372,26 @@ function runMigration() {
 
     // Re-enable foreign keys
     db.pragma('foreign_keys = ON');
+
+    // Populate topic_key from existing columns if missing (idempotent)
+    try {
+      if (DO_APPLY) {
+        if (columnExists(db, 'sensors', 'topic_key')) {
+          console.log('Ensuring topic_key values exist where possible');
+          // If topic_key is NULL, try to copy from sensor_key or key
+          if (columnExists(db, 'sensors', 'sensor_key')) {
+            const info = db.prepare('UPDATE sensors SET topic_key = sensor_key WHERE topic_key IS NULL AND sensor_key IS NOT NULL').run();
+            console.log('Copied sensor_key -> topic_key rows=', info.changes);
+          }
+          if (columnExists(db, 'sensors', 'key')) {
+            const info2 = db.prepare('UPDATE sensors SET topic_key = `key` WHERE topic_key IS NULL AND `key` IS NOT NULL').run();
+            console.log('Copied key -> topic_key rows=', info2.changes);
+          }
+        }
+      } else {
+        console.log('DRY RUN: would populate topic_key from sensor_key/key where missing');
+      }
+    } catch (e) { console.error('topic_key population failed', e && e.message); }
 
     if (DO_APPLY) console.log('Migration applied successfully');
     else console.log('Dry run complete. No changes were applied.');

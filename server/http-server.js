@@ -76,7 +76,7 @@ function startHttpServer(opts = {}) {
         // admin UI: prefer serving the SPA web-build index if present so the
         // React app can handle the /admin route. If no web build exists,
         // fall back to the small server-side admin page in server/web-admin.
-        if (url.pathname === '/admin' || url.pathname === '/admin/') {
+  if (url.pathname === '/admin' || url.pathname === '/admin/') {
           const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
           const indexPath = path.join(webBuildDir, 'index.html');
           // If a built SPA exists, require a valid token to serve the admin UI.
@@ -152,6 +152,51 @@ function startHttpServer(opts = {}) {
             return;
           }
         }
+          // Manager UI: similar to /admin but for manager users. Serve /manage
+          if (url.pathname === '/manage' || url.pathname === '/manage/') {
+            const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
+            const indexPath = path.join(webBuildDir, 'index.html');
+            if (fs.existsSync(indexPath)) {
+              // If a full SPA exists, fall back to admin SPA logic above (which enforces admin only),
+              // so here we prefer the lightweight manager page below.
+            }
+            const managePath = path.join(__dirname, 'web-admin', 'manage.html');
+            if (fs.existsSync(managePath)) {
+              // Require a valid token and that it maps to a manager or admin
+              const authHeader = (req.headers && (req.headers['authorization'] || '')) || '';
+              const parts = authHeader.split(' ');
+              let token = null;
+              if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
+              if (!token) token = url.searchParams && url.searchParams.get('token');
+              const BRIDGE = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
+              let ok = false;
+              if (BRIDGE && token === BRIDGE) {
+                // legacy bridge token — allow (bridge considered privileged)
+                ok = true;
+              }
+              if (!ok && token) {
+                try {
+                  const { verifyToken, findUserById } = require('./lib/auth');
+                  const claims = verifyToken(token);
+                  if (claims) {
+                    const u = findUserById(claims.sub);
+                    if (u && (Number(u.is_admin) === 1 || u.role === 'manager')) ok = true;
+                  }
+                } catch (e) { /* invalid token */ }
+              }
+              if (!ok) {
+                setSecurityHeadersLocal();
+                res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-cache' });
+                res.end('<!doctype html><html><head><meta charset="utf-8"><title>401 Unauthorized</title></head><body><h1>401 Unauthorized</h1><p>Manager access required.</p></body></html>');
+                return;
+              }
+              setSecurityHeadersLocal();
+              res.setHeader('Content-Type', 'text/html; charset=utf-8');
+              res.setHeader('Cache-Control', 'no-cache');
+              fs.createReadStream(managePath).pipe(res);
+              return;
+            }
+          }
         const webBuildDir = path.join(__dirname, '..', 'webapp', 'web-build');
         // assets
         if (url.pathname.startsWith('/assets/')) {

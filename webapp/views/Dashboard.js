@@ -150,6 +150,15 @@ export default function Dashboard({ token }) {
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;
+      // helper to avoid sending on sockets that are not OPEN
+      const safeSend = (socket, payload) => {
+        try {
+          if (!socket) return;
+          if (socket.readyState !== 1) return;
+          socket.send(JSON.stringify(payload));
+        } catch (e) { /* swallow send errors */ }
+      };
+
       ws.onopen = () => {
         // reset attempts
         reconnectMeta.current.attempts = 0;
@@ -159,13 +168,13 @@ export default function Dashboard({ token }) {
         // request current target and sensor for the default devices once connected
         const sendInitialGets = () => {
           defaultDevices.forEach(d => {
-            try { ws.send(JSON.stringify({ type: 'get', topic: `${d.key}/Target`, id: `${d.key}-init-target` })); } catch (e) {}
-            try { ws.send(JSON.stringify({ type: 'get', topic: `${d.key}/Sensor`, id: `${d.key}-init-sensor` })); } catch (e) {}
+            safeSend(ws, { type: 'get', topic: `${d.key}/Target`, id: `${d.key}-init-target` });
+            safeSend(ws, { type: 'get', topic: `${d.key}/Sensor`, id: `${d.key}-init-sensor` });
             targetRequestCounts.current[d.key] = (targetRequestCounts.current[d.key] || 0) + 1;
           });
         };
         // ask bridge for a snapshot inventory to populate cache without extra GET churn
-        try { ws.send(JSON.stringify({ type: 'inventory', id: 'initial-inventory' })); } catch (e) {}
+  safeSend(ws, { type: 'inventory', id: 'initial-inventory' });
         // initial burst, plus retries after 1s and 3s to handle missed replies
         setTimeout(sendInitialGets, 200);
         setTimeout(sendInitialGets, 1000);
@@ -181,11 +190,11 @@ export default function Dashboard({ token }) {
             const haveTarget = gTargets[base] !== undefined && gTargets[base] !== null;
             if (!haveSensor) {
               const id = base + '-retry-sensor-' + retryCount;
-              try { ws.send(JSON.stringify({ type: 'get', topic: `${base}/Sensor`, id })); } catch (e) {}
+              safeSend(ws, { type: 'get', topic: `${base}/Sensor`, id });
             }
             if (!haveTarget) {
               const id = base + '-retry-target-' + retryCount;
-              try { ws.send(JSON.stringify({ type: 'get', topic: `${base}/Target`, id })); targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1; } catch (e) {}
+              safeSend(ws, { type: 'get', topic: `${base}/Target`, id }); targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
             }
           });
         }, 4000);
@@ -216,7 +225,7 @@ export default function Dashboard({ token }) {
                 // if we have sensor but no target yet for this base, trigger a one-time on-demand get
                 if (!(base in gTargets)) {
                   const id = base + '-onDemandTarget';
-                  try { ws.send(JSON.stringify({ type: 'get', topic: `${base}/Target`, id })); targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1; debug('On-demand get Target for base', base); } catch (e) {}
+                  safeSend(ws, { type: 'get', topic: `${base}/Target`, id }); targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1; debug('On-demand get Target for base', base);
                 }
               }
               if (lowerTopic.endsWith('/target')) {
@@ -302,6 +311,8 @@ export default function Dashboard({ token }) {
         }
       };
       ws.onclose = () => {
+        // clear any retry timer associated with this socket so it won't try to send on a closed socket
+        try { if (ws && ws._retryTimer) { clearInterval(ws._retryTimer); ws._retryTimer = null; } } catch (e) {}
         wsRef.current = null;
         // attempt reconnect if token still valid and user hasn't logged out
         if (token) {

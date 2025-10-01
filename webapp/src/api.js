@@ -6,21 +6,52 @@ export async function apiFetch(path, opts = {}) {
     if (token) init.headers['Authorization'] = `Bearer ${token}`;
   } catch (e) { /* ignore missing localStorage */ }
 
-  const API_HOST = 'api.brewingremote.com'; // use central API host for web/native
+  const API_HOST = 'api.brewingremote.com'; // central API host
 
   // Normalize path -> always prefix with leading slash for join safety
   let rel = typeof path === 'string' ? path : '';
   if (!rel.startsWith('/')) rel = '/' + rel;
 
-  // When running under native/Expo (non-web) OR when caller mistakenly passes a relative path
-  // we construct an absolute URL to the API host.
+  // Determine if we should use same-origin (SPA served from brewingremote.com) vs central API host.
   let finalPath = rel;
   try {
     const isWeb = (typeof window !== 'undefined' && typeof window.document !== 'undefined');
-    // Always use the API host for absolute calls now (both web & native) to avoid any ambiguity
-    finalPath = `https://${API_HOST}${rel}`;
+    if (isWeb) {
+      const host = window.location.hostname || '';
+      const isCentral = host === API_HOST;
+      // If we are on brewingremote.com (app host) use same-origin to avoid CORS and leverage tunnel.
+      // If we're on api host OR a mobile/native runtime (non-web) then use the central API host.
+      if (isCentral) {
+        finalPath = `https://${API_HOST}${rel}`;
+      } else {
+        // Force absolute URL for login endpoint so we never accidentally
+        // fetch the SPA HTML when requesting JSON.
+        if (rel.startsWith('/admin/api/login') || rel.startsWith('/admin/api/register') || rel.startsWith('/admin/api/forgot') || rel.startsWith('/admin/api/reset')) {
+          finalPath = `https://${API_HOST}${rel}`;
+        } else if (rel.startsWith('/admin/api/')) {
+          // For authenticated admin API calls we prefer the API host too to avoid HTML 200 responses
+          // when the frontend server also handles /admin routes.
+          finalPath = `https://${API_HOST}${rel}`;
+        } else {
+          finalPath = rel; // same-origin for non-admin-api paths
+        }
+      }
+    } else {
+      // native context -> central host
+      finalPath = `https://${API_HOST}${rel}`;
+    }
   } catch (e) {
-    finalPath = `https://${API_HOST}${rel}`;
+    finalPath = rel; // fallback same-origin
+  }
+
+  // Ensure we explicitly prefer JSON
+  if (!init.headers['Accept']) init.headers['Accept'] = 'application/json, text/plain;q=0.9,*/*;q=0.1';
+  if (init.body && typeof init.body !== 'string') {
+    // If caller didn't serialize body, do it (unless already a FormData / Blob etc.)
+    if (!(typeof FormData !== 'undefined' && init.body instanceof FormData)) {
+      init.body = JSON.stringify(init.body);
+      if (!init.headers['Content-Type']) init.headers['Content-Type'] = 'application/json';
+    }
   }
 
   const res = await fetch(finalPath, init);
