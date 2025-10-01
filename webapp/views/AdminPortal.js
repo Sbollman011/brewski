@@ -2,57 +2,43 @@ import React, { useEffect, useState } from 'react';
 import { View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView } from 'react-native';
 import { apiFetch } from '../src/api';
 
-const doFetch = async (path, opts = {}) => {
-  // On web, use same-origin relative paths so the admin SPA talks to the server that served it.
-  if (typeof window !== 'undefined') {
-    const headers = Object.assign({}, opts.headers || {});
-    try {
-      const token = localStorage.getItem('brewski_jwt');
-      if (token) headers['Authorization'] = `Bearer ${token}`;
-    } catch (e) {}
+const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
+  const API_HOST = 'api.brewingremote.com';
+  const token = typeof tokenProvider === 'function' ? tokenProvider() : tokenProvider;
+  const headers = Object.assign({}, opts.headers || {});
+  if (token && !headers['Authorization']) headers['Authorization'] = `Bearer ${token}`;
+  if (!headers['Accept']) headers['Accept'] = 'application/json';
+  const method = opts.method || 'GET';
+  const body = opts.body && method !== 'GET' ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : undefined;
 
-    // Route admin API calls to the central API host unless we're already
-    // running on that host. This is necessary when the frontend and API are
-    // served on separate hostnames (for example cloudflared routes brewingremote.com
-    // -> frontend:8081 and api.brewingremote.com -> backend:8080). In that case
-    // calling /admin/api on the frontend origin would return the SPA HTML.
-    let finalUrl = path;
-    try {
-      const API_HOST = 'api.brewingremote.com';
-      const loc = (typeof window !== 'undefined' && window.location) ? window.location : {};
-      if (String(path || '').startsWith('/admin/api')) {
-        // If we're already on the API host, use same-origin; otherwise target API_HOST
-        if (loc && loc.hostname === API_HOST) {
-          finalUrl = path;
-        } else {
-          finalUrl = `https://${API_HOST}${path.startsWith('/') ? path : '/' + path}`;
-        }
-      } else {
-        finalUrl = path;
-      }
-    } catch (e) { finalUrl = path; }
-
-    const res = await fetch(finalUrl, Object.assign({ headers, method: opts.method || 'GET', body: opts.body ? JSON.stringify(opts.body) : undefined }, {}));
-    // If unauthorized, don't force a full-page navigation back to /admin.
-    // Instead surface the 401 to the SPA and let the app clear the token and
-    // show the login/unauthorized UI. This prevents a fast reload/redirect loop
-    // when the server intentionally returns a 401 HTML response for /admin.
-    if (res.status === 401) {
-      // try to consume any JSON error body first
-      let bodyTxt = '';
-      try { bodyTxt = await res.text(); } catch (e) {}
-      const err = new Error(`HTTP 401 ${bodyTxt}`);
-      err.status = 401;
-      throw err;
+  // Always build absolute URL for /admin/api when not already absolute to avoid HTML SPA responses.
+  let finalUrl = path;
+  if (typeof path === 'string' && path.startsWith('/admin/api')) {
+    finalUrl = `https://${API_HOST}${path}`;
+  } else if (typeof path === 'string' && !/^https?:/i.test(path)) {
+    // Non admin relative path – leave as-is (same-origin) on web, but on native prefix.
+    if (typeof window === 'undefined') {
+      finalUrl = `https://${API_HOST}${path.startsWith('/') ? path : '/' + path}`;
     }
-    if (!res.ok) {
-      const txt = await res.text().catch(() => '');
-      throw new Error(`HTTP ${res.status} ${txt}`);
-    }
-    return await res.json();
   }
-  // Fallback to apiFetch (native) which will route to configured API host
-  return await apiFetch(path, opts).then(r => r.json ? r.json() : r);
+
+  const res = await fetch(finalUrl, { method, headers, body });
+  if (res.status === 401) {
+    if (token) {
+      // Helpful diagnostic only if we *thought* we had a token
+      console.warn('doFetch 401 with token present, path=', path);
+    }
+    let bodyTxt = '';
+    try { bodyTxt = await res.text(); } catch (e) {}
+    const err = new Error(`HTTP 401 ${bodyTxt || 'unauthorized'}`);
+    err.status = 401;
+    throw err;
+  }
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status} ${txt}`);
+  }
+  try { return await res.json(); } catch (e) { return {}; }
 };
 
 function Row({ item, onEdit }) {
@@ -68,8 +54,9 @@ function Row({ item, onEdit }) {
   );
 }
 
-export default function AdminPortal() {
-  const [user, setUser] = useState(null);
+export default function AdminPortal({ currentUser, loadingUser, token }) {
+  const doFetch = React.useMemo(() => doFetchFactory(() => token), [token]);
+  const [user, setUser] = useState(currentUser || null);
   const [customers, setCustomers] = useState([]);
   const [page, setPage] = useState(0);
   const [limit] = useState(25);
@@ -78,29 +65,24 @@ export default function AdminPortal() {
   const [editing, setEditing] = useState(null);
   const [showCreate, setShowCreate] = useState(false);
 
+  // Sync prop currentUser into local state when it changes
+  useEffect(() => { if (currentUser && (!user || user.id !== currentUser.id)) setUser(currentUser); }, [currentUser]);
+
   useEffect(() => {
-    // load current user (if token present)
+    if (currentUser) return; // parent already provides user
     (async () => {
       try {
         const me = await doFetch('/admin/api/me');
         if (me && me.user) setUser(me.user);
       } catch (e) {
-        // If the API responded with a 401, clear any stale token and surface
-        // the unauthenticated state inside the SPA rather than forcing a
-        // full-page navigation. This prevents redirect loops while keeping
-        // the admin token persistence when valid.
-        try {
-            if (e && e.status === 401) {
-            try { localStorage.removeItem('brewski_jwt'); } catch (err) {}
-            setUser(null);
-            try { if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (err) {}
-            return;
-          }
-        } catch (err) {}
-        // otherwise just ignore and allow the SPA to show its message
+        if (e && e.status === 401) {
+          try { localStorage.removeItem('brewski_jwt'); } catch (err) {}
+          setUser(null);
+          try { if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (err) {}
+        }
       }
     })();
-  }, []);
+  }, [currentUser]);
 
   // Load paginated customers ONLY for admins (managers shouldn't call the admin-only endpoint and trigger 401s)
   useEffect(() => {
@@ -136,15 +118,15 @@ export default function AdminPortal() {
 
   async function createCustomer(payload) {
     try {
-      const res = await doFetch('/admin/api/customers', { method: 'POST', body: payload });
-      if (res && res.ok) { setShowCreate(false); setPage(0); loadPage(0); }
+      await doFetch('/admin/api/customers', { method: 'POST', body: payload });
+      setShowCreate(false); setPage(0); loadPage(0);
     } catch (e) { Alert.alert('Create failed', String(e && e.message)); }
   }
 
   async function updateCustomer(id, payload) {
     try {
-      const res = await doFetch(`/admin/api/customers/${id}`, { method: 'PUT', body: payload });
-      if (res && res.ok) { setEditing(null); loadPage(page); }
+      await doFetch(`/admin/api/customers/${id}`, { method: 'PUT', body: payload });
+      setEditing(null); loadPage(page);
     } catch (e) { Alert.alert('Update failed', String(e && e.message)); }
   }
 
@@ -153,39 +135,57 @@ export default function AdminPortal() {
   return (
     <View style={{ padding: 12, flex: 1 }}>
       <Text style={{ fontSize: 20, fontWeight: '700', marginBottom: 8 }}>Admin Portal</Text>
-      {!user && <Text>Please sign in with an admin or manager account.</Text>}
-      {user && (
-        <ScrollView contentContainerStyle={{ paddingBottom: 40 }} keyboardShouldPersistTaps="handled">
-          <View style={{ marginBottom: 8 }}><Text>Signed in as: {user.username} ({user.email || 'no email'}){user.role ? ` — ${user.role}` : ''}</Text></View>
-          {/* If the user is an admin, show customer management. If manager, show a scoped manager panel. */}
-          {Number(user.is_admin) === 1 ? (
-            <View>
+  {!user && !loadingUser && <Text>Please sign in with an admin or manager account.</Text>}
+  {!user && loadingUser && <Text style={{ color: '#666' }}>Verifying access…</Text>}
+      {user && Number(user.is_admin) === 1 && (
+        <FlatList
+          data={customers}
+          keyExtractor={i => String(i.id)}
+          renderItem={({item}) => <Row item={item} onEdit={setEditing} />}
+          ListHeaderComponent={(
+            <View style={{ paddingBottom: 4 }}>
+              <View style={{ marginBottom: 8 }}>
+                <Text>Signed in as: {user.username} ({user.email || 'no email'}){user.role ? ` — ${user.role}` : ''}</Text>
+              </View>
               <View style={{ flexDirection: 'row', marginBottom: 8 }}>
                 <TouchableOpacity onPress={() => setShowCreate(true)} style={{ backgroundColor: '#1b5e20', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 6 }}>
                   <Text style={{ color: '#fff' }}>Create Customer</Text>
                 </TouchableOpacity>
               </View>
-              <FlatList data={customers} keyExtractor={i => String(i.id)} renderItem={({item}) => <Row item={item} onEdit={setEditing} />} style={{ marginTop: 12 }} />
+            </View>
+          )}
+          ListFooterComponent={(
+            <View style={{ paddingVertical: 12 }}>
               <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 8 }}>
                 <Button title="Prev" onPress={() => setPage(Math.max(0, page-1))} disabled={page<=0} />
                 <Text style={{ alignSelf: 'center' }}>{page+1} / {Math.max(1, Math.ceil((total||customers.length)/limit))}</Text>
                 <Button title="Next" onPress={() => setPage(page+1)} disabled={(page+1)*limit >= (total||customers.length)} />
               </View>
             </View>
-          ) : user.role === 'manager' ? (
-            <ManagerPanel user={user} />
-          ) : (
-            <Text>You do not have access to this portal.</Text>
           )}
-        </ScrollView>
+          contentContainerStyle={{ paddingBottom: 40 }}
+        />
+      )}
+      {user && Number(user.is_admin) !== 1 && user.role === 'manager' && (
+        <View style={{ flex: 1 }}>
+          <View style={{ marginBottom: 8 }}>
+            <Text>Signed in as: {user.username} ({user.email || 'no email'}){user.role ? ` — ${user.role}` : ''}</Text>
+          </View>
+          <ManagerPanel user={user} doFetch={doFetch} />
+        </View>
+      )}
+      {user && Number(user.is_admin) !== 1 && user.role !== 'manager' && (
+        <View>
+          <Text>You do not have access to this portal.</Text>
+        </View>
       )}
 
       <Modal visible={!!editing} animationType="slide">
-        {editing && <CustomerEditor initial={editing} onCancel={() => setEditing(null)} onSave={(payload) => updateCustomer(editing.id, payload)} onDeleted={() => { setEditing(null); loadPage(0); }} />}
+        {editing && <CustomerEditor doFetch={doFetch} initial={editing} onCancel={() => setEditing(null)} onSave={(payload) => updateCustomer(editing.id, payload)} onDeleted={() => { setEditing(null); loadPage(0); }} />}
       </Modal>
 
       <Modal visible={showCreate} animationType="slide">
-        <CustomerEditor onCancel={() => setShowCreate(false)} onSave={(payload) => createCustomer(payload)} />
+        <CustomerEditor doFetch={doFetch} onCancel={() => setShowCreate(false)} onSave={(payload) => createCustomer(payload)} />
       </Modal>
     </View>
   );
@@ -213,7 +213,7 @@ function ConfirmModal({ visible, title, message, onCancel, onConfirm }) {
   );
 }
 
-function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
+function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch }) {
   const [slug, setSlug] = useState(initial ? initial.slug : '');
   const [name, setName] = useState(initial ? initial.name : '');
   // New: support two host fields; fall back to legacy controller_ip if present
@@ -245,8 +245,9 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
     if (!initial || !initial.id) return;
     try {
       const body = Object.assign({}, newUser);
-      const res = await doFetch(`/admin/api/customers/${initial.id}/users`, { method: 'POST', body });
-      if (res && res.ok) { setNewUser({ username:'', password:'', email:'', name:'', role: 'user' }); loadUsers(); }
+      await doFetch(`/admin/api/customers/${initial.id}/users`, { method: 'POST', body });
+      setNewUser({ username:'', password:'', email:'', name:'', role: 'user' });
+      loadUsers();
     } catch (e) { Alert.alert('Create user failed', String(e && e.message)); }
   }
 
@@ -263,8 +264,9 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted }) {
   async function createTopic() {
     if (!initial || !initial.id) return;
     try {
-      const res = await doFetch(`/admin/api/customers/${initial.id}/topics`, { method: 'POST', body: { topic_key: newTopicKey } });
-      if (res && res.ok) { setNewTopicKey(''); loadTopics(); }
+      await doFetch(`/admin/api/customers/${initial.id}/topics`, { method: 'POST', body: { topic_key: newTopicKey } });
+      setNewTopicKey('');
+      loadTopics();
     } catch (e) { Alert.alert('Create topic failed', String(e && e.message)); }
   }
 

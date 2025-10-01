@@ -41,18 +41,32 @@ function AboutScreen({ onBack }) {
 export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   // Default to landing on web, but show login first on native (mobile) devices
-  const [screen, setScreen] = useState(Platform.OS === 'web' ? 'landing' : 'login'); // 'landing' | 'dashboard' | 'settings' | 'about' | 'login' | 'forgot' | 'reset'
+  const [screen, setScreen] = useState(Platform.OS === 'web' ? 'landing' : 'login'); // native never shows landing
   const [token, setToken] = useState(null);
+  const tokenRef = useRef(null);
   const [initialResetToken, setInitialResetToken] = useState('');
   const [cachedUser, setCachedUser] = useState(null); // minimal user info for role-based nav
   const [userLoading, setUserLoading] = useState(false);
+  const intendedScreenRef = useRef(null); // remembers where user wanted to go pre-auth
+
+  // Static header title per requirement
+  const APP_TITLE = 'Brew Remote';
+
+  // Derived access flag for manage/admin portal
+  const hasManageAccess = !!(cachedUser && (Number(cachedUser.is_admin) === 1 || cachedUser.role === 'manager' || cachedUser.role === 'admin'));
 
   async function ensureUserLoaded(force = false) {
     if (!token) return;
     if (!force && (cachedUser || userLoading)) return;
     try {
       setUserLoading(true);
-      const res = await apiFetch('/admin/api/me');
+      let res = await apiFetch('/admin/api/me');
+      // On native (no window, no localStorage), apiFetch should still send Authorization, but defensively retry with explicit token
+      if (res && res.status === 401 && tokenRef.current) {
+        try {
+          res = await fetch('https://api.brewingremote.com/admin/api/me', { headers: { 'Authorization': 'Bearer ' + tokenRef.current, 'Accept': 'application/json' } });
+        } catch (_) {}
+      }
       if (!res || !res.ok) return;
       let js = null;
       try { js = await res.json(); } catch (e) { js = null; }
@@ -104,10 +118,11 @@ export default function App() {
   // that read localStorage will include the current token.
   useEffect(() => {
     try {
-      if (typeof window === 'undefined') return;
-      if (token) localStorage.setItem('brewski_jwt', token);
-      else localStorage.removeItem('brewski_jwt');
+      if (typeof window !== 'undefined') {
+        if (token) localStorage.setItem('brewski_jwt', token); else localStorage.removeItem('brewski_jwt');
+      }
     } catch (e) { }
+    tokenRef.current = token;
   }, [token]);
 
   // On web, detect reset token in the URL (either ?token= or in the hash) and open the reset screen
@@ -156,11 +171,14 @@ export default function App() {
       const pathname = (typeof window !== 'undefined' && window.location) ? String(window.location.pathname) : '';
       const isAdminPath = pathname.startsWith('/admin');
       const isManagePath = pathname.startsWith('/manage');
+      const isDashPath = pathname === '/dashboard' || pathname === '/dashboard/';
       if (isAdminPath || isManagePath) {
         setScreen('admin');
-      } else if (pathname === '/' || pathname === '') {
-        // Stay on landing when root path and user just authenticated (let them choose)
+      } else if ((pathname === '/' || pathname === '') && Platform.OS === 'web') {
+        // Web root: allow landing. Native: skip directly to dashboard.
         setScreen('landing');
+      } else if (isDashPath) {
+        setScreen('dashboard');
       } else {
         setScreen('dashboard');
       }
@@ -175,6 +193,14 @@ export default function App() {
   useEffect(() => {
     if (!token) { setCachedUser(null); return; }
     if (!cachedUser) ensureUserLoaded(false);
+  }, [token]);
+
+  // Force an eager user load right after token acquisition to populate role quickly (optimistic Manage rendering)
+  useEffect(() => {
+    if (!token) return;
+    // slight delay to allow token persistence before fetch
+    const h = setTimeout(() => { ensureUserLoaded(true); }, 50);
+    return () => clearTimeout(h);
   }, [token]);
 
   // On web, if the path is /admin open the admin screen by default
@@ -233,10 +259,75 @@ export default function App() {
     return undefined;
   }, [screen, token]);
 
+  // If authenticated but still on an auth-only screen (login/forgot/reset) move to dashboard (or intended)
+  useEffect(() => {
+    if (token && ['login', 'forgot', 'reset'].includes(screen)) {
+      const desired = intendedScreenRef.current;
+      if (desired === 'admin') {
+        openScreen('admin');
+      } else {
+        openScreen('dashboard');
+      }
+      intendedScreenRef.current = null;
+    }
+  }, [token, screen]);
+
+  // Fallback guard: if we somehow have token but screen is a non-rendering value, coerce to dashboard
+  useEffect(() => {
+    if (token && !['landing','dashboard','admin','settings','about','login','forgot','reset'].includes(screen)) {
+      setScreen('dashboard');
+    }
+  }, [token, screen]);
+
+  // Handle direct deep links while unauthenticated: record intended screen
+  useEffect(() => {
+    if (token) return; // only care pre-auth
+    try {
+      if (typeof window === 'undefined') return;
+      const pathname = String(window.location.pathname || '');
+      if (/^\/admin/.test(pathname) || /^\/manage/.test(pathname)) {
+        intendedScreenRef.current = 'admin';
+        setScreen('login');
+      } else if (pathname === '/dashboard' || pathname === '/dashboard/') {
+        intendedScreenRef.current = 'dashboard';
+        setScreen('login');
+      }
+    } catch (e) {}
+  }, [token]);
+
+  function openDashboard() {
+    if (!token) {
+      intendedScreenRef.current = 'dashboard';
+      openScreen('dashboard');
+      return;
+    }
+    openScreen('dashboard');
+  }
+
+  function handleLogout() {
+    try { localStorage.removeItem('brewski_jwt'); } catch (e) { }
+    try { localStorage.removeItem('brewski_me'); } catch (e) { }
+    setCachedUser(null);
+    setToken(null);
+    intendedScreenRef.current = null;
+    if (Platform.OS === 'web') {
+      setScreen('dashboard');
+      try { if (typeof window !== 'undefined') window.history.pushState({}, '', '/dashboard'); } catch (e) {}
+    } else {
+      setScreen('login');
+    }
+  }
+
   const openScreen = (name) => {
+    if (name === 'landing' && Platform.OS !== 'web') {
+      name = 'dashboard';
+    }
+    if (!token && ['dashboard', 'admin', 'settings', 'about'].includes(name)) {
+      intendedScreenRef.current = (name === 'admin') ? 'admin' : 'dashboard';
+      name = 'login';
+    }
     setScreen(name);
     setMenuOpen(false);
-    // Update browser URL on web to reflect leaving or entering admin context so effects don't fight navigation.
     try {
       if (Platform.OS === 'web' && typeof window !== 'undefined') {
         if (name === 'admin') {
@@ -246,44 +337,10 @@ export default function App() {
         } else if (name === 'landing') {
           window.history.pushState({}, '', '/');
         } else {
-          // keep a lightweight hash for other internal pseudo-screens to avoid server 404s
           window.history.pushState({}, '', '/#' + name);
         }
       }
-    } catch (e) { /* ignore */ }
-  };
-
-  function openDashboard() {
-    // On web, navigate same-tab to the server dashboard path
-    try {
-      if (typeof window !== 'undefined' && window.location) {
-        window.location.href = '/dashboard/';
-        return;
-      }
-    } catch (e) {
-      // fall through to native linking
-    }
-
-    // Fallback: use React Native Linking for native runtimes
-    try {
-      const url = 'https://' + (typeof window !== 'undefined' ? window.location.host : '');
-      Linking.openURL(url + '/dashboard/');
-    } catch (e) {
-      // best-effort; nothing else to do
-    }
-  }
-
-  function handleLogout() {
-    try { localStorage.removeItem('brewski_jwt'); } catch (e) { }
-    setToken(null);
-    setScreen('dashboard');
-  }
-
-  const titleMap = {
-    landing: 'Brew Remote',
-    dashboard: 'Brew Remote',
-    settings: 'Settings',
-    about: 'About',
+    } catch (e) { }
   };
 
   // Push notification registration removed
@@ -295,7 +352,7 @@ export default function App() {
       <SafeAreaView style={styles.root} edges={["left", "right", "bottom"]}>
         {/* Push notification warning banner removed */}
         <Header
-          title={titleMap[screen] || 'Brew Remote'}
+          title={APP_TITLE}
           token={token}
           hideControls={['login', 'forgot', 'reset', 'landing'].includes(screen)}
           onMenuPress={() => {
@@ -317,16 +374,16 @@ export default function App() {
               <Pressable onPress={() => openScreen('dashboard')} style={{ paddingVertical: 8 }}>
                 <Text style={styles.menuItem}>Dashboard</Text>
               </Pressable>
-              {/* Manage portal (admin or manager) */}
-              {token && cachedUser && (Number(cachedUser.is_admin) === 1 || cachedUser.role === 'manager') && (
-                <Pressable onPress={() => { openScreen('admin'); }} style={{ paddingVertical: 8 }}>
-                  <Text style={styles.menuItem}>Manage</Text>
-                </Pressable>
-              )}
+              {/* Manage portal (admin or manager). Show loading placeholder while role resolves. */}
               {token && !cachedUser && userLoading && (
                 <View style={{ paddingVertical: 8 }}>
-                  <Text style={[styles.menuItem, { opacity: 0.6 }]}>Loading role...</Text>
+                  <Text style={[styles.menuItem, { opacity: 0.5 }]}>Manage (loading…)</Text>
                 </View>
+              )}
+              {token && hasManageAccess && (
+                <Pressable onPress={() => openScreen('admin')} style={{ paddingVertical: 8 }}>
+                  <Text style={styles.menuItem}>Manage</Text>
+                </Pressable>
               )}
               <Pressable onPress={() => openScreen('settings')} style={{ paddingVertical: 8 }}>
                 <Text style={styles.menuItem}>Settings</Text>
@@ -343,7 +400,7 @@ export default function App() {
             </View>
           )}
           <View style={styles.content}>
-            {screen === 'landing' && (
+            {Platform.OS === 'web' && screen === 'landing' && (
               <Landing onLoginPress={() => setScreen('login')} onDashboardPress={() => {
                 if (!token) {
                   setScreen('login');
@@ -369,14 +426,37 @@ export default function App() {
                 }
               } catch (e) { /* fall back to default behavior below */ }
 
-              // Default: set token and navigate within SPA
+              // Default: set token and navigate within SPA honoring intended destination
               setToken(t);
-              try { if (typeof window !== 'undefined' && window.location && String(window.location.pathname).startsWith('/admin')) setScreen('admin'); else setScreen('dashboard'); } catch (e) { setScreen('dashboard'); }
+              // Eagerly refresh user info so Manage appears quickly in menu (esp. native)
+              setTimeout(() => { try { ensureUserLoaded(true); } catch(e){} }, 0);
+              const desired = intendedScreenRef.current || (typeof window !== 'undefined' && String(window.location.pathname).startsWith('/dashboard') ? 'dashboard' : null);
+              if (desired === 'admin') {
+                openScreen('admin');
+              } else {
+                openScreen('dashboard');
+              }
+              intendedScreenRef.current = null;
             }} onForgot={() => setScreen('forgot')} />}
             {screen === 'forgot' && !token && <ForgotPasswordScreen onBack={() => setScreen('login')} />}
             {screen === 'reset' && !token && <ResetPasswordScreen initialToken={initialResetToken} onBack={() => setScreen('login')} />}
             {screen === 'dashboard' && token && <Dashboard token={token} />}
-            {screen === 'admin' && token && <AdminPortal />}
+            {screen === 'admin' && token && (
+              hasManageAccess ? (
+                <AdminPortal currentUser={cachedUser} loadingUser={userLoading} token={token} />
+              ) : (userLoading ? (
+                <View style={{ padding: 20 }}>
+                  <Text style={{ fontSize: 16, color: '#444' }}>Loading access…</Text>
+                </View>
+              ) : (
+                // If not loading and still no access, fall back to dashboard automatically (prevents stale unauthorized screen)
+                (() => { setTimeout(() => { if (!hasManageAccess) openScreen('dashboard'); }, 50); return (
+                  <View style={{ padding: 20 }}>
+                    <Text style={{ fontSize: 16, color: '#a33' }}>You do not have access to Manage.</Text>
+                  </View>
+                ); })()
+              ))
+            )}
             {screen === 'settings' && token && <SettingsScreen onBack={() => setScreen('dashboard')} />}
             {screen === 'about' && token && <AboutScreen onBack={() => setScreen('dashboard')} />}
           </View>
