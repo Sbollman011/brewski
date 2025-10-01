@@ -423,13 +423,14 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch }) {
   );
 }
 
-function ManagerPanel({ user }) {
+function ManagerPanel({ user, doFetch }) {
   const [users, setUsers] = useState([]);
   const [customer, setCustomer] = useState(null);
   const [newUser, setNewUser] = useState({ username: '', password: '', email: '', name: '' });
 
   async function load() {
     if (!user || !user.customer_id) return;
+    if (!doFetch) { console.warn('ManagerPanel missing doFetch'); return; }
     try {
       const ures = await doFetch(`/admin/api/customers/${user.customer_id}/users`);
       if (ures && ures.users) setUsers(ures.users);
@@ -444,14 +445,17 @@ function ManagerPanel({ user }) {
 
   async function createUser() {
     if (!user || !user.customer_id) return;
+    if (!doFetch) { console.warn('ManagerPanel createUser missing doFetch'); return; }
     try {
       const body = { ...newUser, role: 'user' };
-      const res = await doFetch(`/admin/api/customers/${user.customer_id}/users`, { method: 'POST', body });
-      if (res && res.ok) { setNewUser({ username:'', password:'', email:'', name: '' }); load(); }
+      await doFetch(`/admin/api/customers/${user.customer_id}/users`, { method: 'POST', body });
+      setNewUser({ username:'', password:'', email:'', name: '' });
+      load();
     } catch (e) { Alert.alert('Create user failed', String(e && e.message)); }
   }
 
   async function deleteUser(id) {
+    if (!doFetch) { console.warn('ManagerPanel deleteUser missing doFetch'); return; }
     try {
       await doFetch(`/admin/api/users/${id}`, { method: 'DELETE' });
       load();
