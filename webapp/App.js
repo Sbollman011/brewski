@@ -343,13 +343,13 @@ export default function App() {
             </View>
           )}
           <View style={styles.content}>
-            {screen === 'landing' && !token && (
+            {screen === 'landing' && (
               <Landing onLoginPress={() => setScreen('login')} onDashboardPress={() => {
                 if (!token) {
                   setScreen('login');
                 } else {
-                  setMenuOpen(false);
-                  openDashboard();
+                  // Authenticated: navigate within SPA to dashboard (no full reload)
+                  openScreen('dashboard');
                 }
               }} />
             )}
