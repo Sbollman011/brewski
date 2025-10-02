@@ -1,7 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView } from 'react-native';
 import Header from '../components/Header';
-import SideMenu from '../components/SideMenu';
 // Accessible placeholder color (sufficient contrast on light backgrounds on mobile & web)
 const PLACEHOLDER_COLOR = '#555';
 import { apiFetch } from '../src/api';
@@ -356,38 +355,26 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     if (onSave) await onSave(payload);
   }
 
-  const [menuOpen, setMenuOpen] = useState(false);
   const roleColorNeutral = '#1b5e20';
-  // In create mode we now remove header + side menu entirely per request
-  const showNav = !!initial; // only show header/menu when editing existing customer
+  // In create mode we previously hid header+menu; now we still hide header for create mode, but SideMenu is removed.
+  const showNav = !!initial; // only show header when editing existing customer
   return (
     <View style={{ flex: 1, backgroundColor: '#fafafa' }}>
       {showNav && (
-        <>
-          <Header
-            title={initial ? 'Edit Customer' : 'Create Customer'}
-            token={token}
-            menuOpen={menuOpen}
-            onMenuPress={() => setMenuOpen(o => !o)}
-            onLogoutPress={() => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (e) {} if (onCancel) onCancel(); }}
-            onLoginPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }}
-          />
-          <SideMenu
-            open={menuOpen}
-            onClose={() => setMenuOpen(false)}
-            items={[
-              { label: 'Dashboard', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/dashboard'; } catch(e){} } },
-              { label: 'Manage', onPress: () => {}, autoClose: true },
-              token ? { label: 'Logout', destructive: true, onPress: () => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch(e){} if (onCancel) onCancel(); } } : { label: 'Login', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch(e){} } }
-            ]}
-          />
-        </>
+        <Header
+          title={initial ? 'Edit Customer' : 'Create Customer'}
+          token={token}
+          hideControls={true} // no side menu in edit view
+          onLogoutPress={() => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (e) {} if (onCancel) onCancel(); }}
+          onLoginPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }}
+        />
       )}
       <ScrollView
         contentContainerStyle={styles.editorScroll}
         keyboardShouldPersistTaps="handled"
-        accessibilityElementsHidden={showNav && menuOpen}
-        importantForAccessibility={showNav && menuOpen ? 'no-hide-descendants' : 'auto'}
+        // Side menu removed; always expose content to accessibility services
+        accessibilityElementsHidden={false}
+        importantForAccessibility='auto'
       >
         <View style={[styles.formCard, !showNav && { marginTop: 12 }] }>
           <Text style={styles.sectionTitle}>{initial ? 'Edit Customer' : 'Create Customer'}</Text>
