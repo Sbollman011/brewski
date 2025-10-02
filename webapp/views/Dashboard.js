@@ -345,7 +345,10 @@ export default function Dashboard({ token }) {
         const base = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
         const fallbackUrl = `${base}?token=${encodeURIComponent(token)}`;
         try {
-          const alt = new WebSocket(fallbackUrl, `Bearer ${token}`);
+          // Fallback attempt without a subprotocol. Previous code used a subprotocol string
+          // with a space ("Bearer <token>") which is not RFC6455-compliant (tokens cannot contain spaces).
+          // Token is already conveyed via the query parameter, so we omit subprotocol entirely here.
+          const alt = new WebSocket(fallbackUrl);
           wsRef.current = alt;
           alt.onopen = () => {
             reconnectMeta.current.attempts = 0;
