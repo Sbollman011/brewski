@@ -50,8 +50,8 @@ function setSecurityHeaders(req, res, server) {
   // script can load while keeping the rest of script-src locked to 'self'.
   const csp = [
     "default-src 'none'",
-    "script-src 'self' https://static.cloudflareinsights.com",
-    "script-src-elem 'self' https://static.cloudflareinsights.com",
+    "script-src 'self'",
+    "script-src-elem 'self'",
     "style-src 'self' 'unsafe-inline'",
     "connect-src 'self' wss: https:",
     "img-src 'self' data: https:",

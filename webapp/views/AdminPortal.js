@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView } from 'react-native';
+import Header from '../components/Header';
+import SideMenu from '../components/SideMenu';
 import { apiFetch } from '../src/api';
 
 const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
@@ -196,11 +198,11 @@ export default function AdminPortal({ currentUser, loadingUser, token }) {
       )}
 
       <Modal visible={!!editing} animationType="slide">
-        {editing && <CustomerEditor doFetch={doFetch} initial={editing} onCancel={() => setEditing(null)} onSave={(payload) => updateCustomer(editing.id, payload)} onDeleted={() => { setEditing(null); loadPage(0); }} />}
+        {editing && <CustomerEditor token={token} doFetch={doFetch} initial={editing} onCancel={() => setEditing(null)} onSave={(payload) => updateCustomer(editing.id, payload)} onDeleted={() => { setEditing(null); loadPage(0); }} />}
       </Modal>
 
       <Modal visible={showCreate} animationType="slide">
-        <CustomerEditor doFetch={doFetch} onCancel={() => setShowCreate(false)} onSave={(payload) => createCustomer(payload)} />
+        <CustomerEditor token={token} doFetch={doFetch} onCancel={() => setShowCreate(false)} onSave={(payload) => createCustomer(payload)} />
       </Modal>
     </View>
   );
@@ -228,14 +230,13 @@ function ConfirmModal({ visible, title, message, onCancel, onConfirm }) {
   );
 }
 
-function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch }) {
+function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }) {
   const [slug, setSlug] = useState(initial ? initial.slug : '');
   const [name, setName] = useState(initial ? initial.name : '');
   // New: support two host fields; fall back to legacy controller_ip if present
   const [controller_host1, setControllerHost1] = useState(initial ? (initial.controller_host1 || initial.controller_ip || '') : '');
   const [controller_host2, setControllerHost2] = useState(initial ? (initial.controller_host2 || '') : '');
-  // controller_port is managed internally; remove from editable fields
-  const [controller_port, setControllerPort] = useState('');
+  // controller_port managed internally; removed from UI
   const [metadata, setMetadata] = useState(initial ? (initial.metadata||'') : '');
   const [users, setUsers] = useState([]);
   const [newUser, setNewUser] = useState({ username: '', password: '', email: '', name: '', role: 'user' });
@@ -353,86 +354,130 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch }) {
     if (onSave) await onSave(payload);
   }
 
+  const [menuOpen, setMenuOpen] = useState(false);
+  const roleColorNeutral = '#1b5e20';
   return (
-    <View style={{ padding: 16, flex: 1 }}>
-      <ScrollView contentContainerStyle={{ paddingBottom: 32 }} keyboardShouldPersistTaps="handled">
-        <Text style={{ fontSize: 18, fontWeight: '700' }}>{initial ? 'Edit Customer' : 'Create Customer'}</Text>
-        <TextInput value={name} onChangeText={setName} placeholder="Name" style={styles.input} />
-        <TextInput value={slug} onChangeText={setSlug} placeholder="Slug" style={styles.input} />
-        <TextInput value={controller_host1} onChangeText={setControllerHost1} placeholder="Host (primary)" style={styles.input} />
-        <TextInput value={controller_host2} onChangeText={setControllerHost2} placeholder="Host (secondary, optional)" style={styles.input} />
-        <Text style={{ fontSize: 12, color: '#666', marginTop: 6 }}>Ports are managed internally; leave blank.</Text>
-        <TextInput value={metadata} onChangeText={setMetadata} placeholder="Metadata (JSON)" style={[styles.input, styles.metadataInput]} multiline textAlignVertical="top" />
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 12 }}>
-          <Button title="Cancel" onPress={onCancel} />
-          <Button title="Save" onPress={save} />
+    <View style={{ flex: 1, backgroundColor: '#fafafa' }}>
+      <Header
+        title={initial ? 'Edit Customer' : 'Create Customer'}
+        token={token}
+        menuOpen={menuOpen}
+        onMenuPress={() => setMenuOpen(o => !o)}
+        onLogoutPress={() => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (e) {} if (onCancel) onCancel(); }}
+        onLoginPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }}
+      />
+      <SideMenu
+        open={menuOpen}
+        onClose={() => setMenuOpen(false)}
+        items={[
+          { label: 'Dashboard', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/dashboard'; } catch(e){} } },
+          { label: 'Manage', onPress: () => {}, autoClose: true },
+          token ? { label: 'Logout', destructive: true, onPress: () => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch(e){} if (onCancel) onCancel(); } } : { label: 'Login', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch(e){} } }
+        ]}
+      />
+      <ScrollView
+        contentContainerStyle={styles.editorScroll}
+        keyboardShouldPersistTaps="handled"
+        accessibilityElementsHidden={menuOpen}
+        importantForAccessibility={menuOpen ? 'no-hide-descendants' : 'auto'}
+      >
+        <View style={styles.formCard}>
+          <Text style={styles.sectionTitle}>{initial ? 'Edit Customer' : 'Create Customer'}</Text>
+          <TextInput value={name} onChangeText={setName} placeholder="Name" style={styles.input} />
+          <TextInput value={slug} onChangeText={setSlug} placeholder="Slug" style={styles.input} />
+          <TextInput value={controller_host1} onChangeText={setControllerHost1} placeholder="Host (primary)" style={styles.input} />
+          <TextInput value={controller_host2} onChangeText={setControllerHost2} placeholder="Host (secondary, optional)" style={styles.input} />
+          <Text style={styles.inlineHint}>Ports are managed internally; leave blank.</Text>
+          <TextInput value={metadata} onChangeText={setMetadata} placeholder="Metadata (JSON)" style={[styles.input, styles.metadataInput]} multiline textAlignVertical="top" />
+          <View style={styles.actionRow}>
+            <TouchableOpacity onPress={onCancel} style={[styles.btn, styles.btnSecondary]}><Text style={styles.btnSecondaryText}>Cancel</Text></TouchableOpacity>
+            <TouchableOpacity onPress={save} style={[styles.btn, styles.btnPrimary]}><Text style={styles.btnPrimaryText}>Save</Text></TouchableOpacity>
+          </View>
         </View>
-      {/* Users section */}
-      {initial && initial.id ? (
-        <View style={{ marginTop: 18 }}>
-          <Text style={{ fontSize: 16, fontWeight: '700' }}>Users</Text>
-          <FlatList data={users} keyExtractor={u => String(u.id)} renderItem={({item}) => (
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
-              <Text>{item.username} {item.role ? `(${item.role})` : ''} — {item.email || 'no email'}</Text>
-              <TouchableOpacity onPress={() => deleteUser(item.id)} style={{ marginLeft: 12 }}>
-                <Text style={{ color: '#b71c1c' }}>Delete</Text>
-              </TouchableOpacity>
+        {initial && initial.id ? (
+          <View style={styles.sectionBlock}>
+            <Text style={styles.sectionTitle}>Users ({users.length})</Text>
+            <View style={styles.tableHeader}>
+              <Text style={[styles.th, {flex:2}]}>User</Text>
+              <Text style={[styles.th, {flex:1}]}>Role</Text>
+              <Text style={[styles.th, {flex:2}]}>Email</Text>
+              <Text style={[styles.th, styles.thAction]}>Actions</Text>
             </View>
-          )} />
-          <Text style={{ marginTop: 8, fontWeight: '600' }}>Create User</Text>
-          <TextInput value={newUser.username} onChangeText={t => setNewUser(s => ({...s, username: t}))} placeholder="Username" style={styles.input} />
-          <TextInput value={newUser.password} onChangeText={t => setNewUser(s => ({...s, password: t}))} placeholder="Password" style={styles.input} secureTextEntry />
-          <TextInput value={newUser.name} onChangeText={t => setNewUser(s => ({...s, name: t}))} placeholder="Full name" style={styles.input} />
-          <TextInput value={newUser.email} onChangeText={t => setNewUser(s => ({...s, email: t}))} placeholder="Email" style={styles.input} />
-          {/* Role picker: allow admin to assign 'user', 'privileged', or 'admin' */}
-          <View style={{ marginTop: 8 }}>
-            <Text style={{ marginBottom: 6 }}>Role</Text>
-            <View style={{ flexDirection: 'row' }}>
-              {['user','privileged','manager','admin'].map(r => (
-                <TouchableOpacity key={r} onPress={() => setNewUser(s => ({ ...s, role: r }))} style={{ marginRight: 12 }}>
-                  <Text style={{ color: newUser.role === r ? '#1b5e20' : '#666' }}>{newUser.role === r ? '☑' : '☐'} {r}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-          </View>
-          {/* Admin status is determined by selecting the 'admin' role above; no direct toggle here. */}
-          <View style={{ flexDirection: 'row', justifyContent: 'flex-end', marginTop: 8 }}>
-            <TouchableOpacity onPress={createUser} style={{ backgroundColor: '#1b5e20', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}>
-              <Text style={{ color: '#fff' }}>Create User</Text>
-            </TouchableOpacity>
-          </View>
-
-          {/* Sensors */}
-          <View style={{ marginTop: 18 }}>
-            <Text style={{ fontSize: 16, fontWeight: '700' }}>Topics</Text>
-            <FlatList data={topics} keyExtractor={s => String(s.id)} renderItem={({item}) => (
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 6 }}>
-                <Text>{item.topic_key || item.sensor_key || item.key} — {item.metadata || ''}</Text>
-                <TouchableOpacity onPress={() => deleteTopic(item.id)} style={{ marginLeft: 12 }}>
-                  <Text style={{ color: '#b71c1c' }}>Delete</Text>
-                </TouchableOpacity>
+            {users.length === 0 && <Text style={styles.emptyText}>No users yet.</Text>}
+            {users.map((item, idx) => {
+              const role = (item.role || 'user');
+              return (
+                <View key={item.id} style={[styles.userRow, idx % 2 === 1 && styles.userRowAlt]}>
+                  <Text style={[styles.td, {flex:2}]}>{item.username}</Text>
+                  <View style={[styles.td, {flex:1}]}> 
+                    <Text style={[styles.roleBadgeNeutral]} accessibilityLabel={`Role: ${role}`}>{role}</Text>
+                  </View>
+                  <Text style={[styles.td, {flex:2}]}>{item.email || '—'}</Text>
+                  <View style={[styles.td, styles.rowEnd]}>
+                    <TouchableOpacity onPress={() => deleteUser(item.id)} accessibilityLabel={`Delete user ${item.username}`}>
+                      <Text style={styles.deleteLink}>Delete</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })}
+            <View style={styles.subSection}>
+              <Text style={styles.subSectionTitle}>Create User</Text>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.username} onChangeText={t => setNewUser(s => ({...s, username: t}))} placeholder="Username" style={[styles.input, styles.inlineInput]} /></View>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.password} onChangeText={t => setNewUser(s => ({...s, password: t}))} placeholder="Password" style={[styles.input, styles.inlineInput]} secureTextEntry /></View>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.name} onChangeText={t => setNewUser(s => ({...s, name: t}))} placeholder="Full name" style={[styles.input, styles.inlineInput]} /></View>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.email} onChangeText={t => setNewUser(s => ({...s, email: t}))} placeholder="Email" style={[styles.input, styles.inlineInput]} /></View>
+              <Text style={styles.rolePickerLabel}>Role</Text>
+              <View style={styles.rolePickerRow}>
+                {['user','privileged','manager','admin'].map(r => (
+                  <TouchableOpacity key={r} onPress={() => setNewUser(s => ({ ...s, role: r }))} style={styles.rolePickOption}>
+                    <Text style={[styles.rolePickText, newUser.role === r && styles.rolePickTextActive]}>{newUser.role === r ? '☑' : '☐'} {r}</Text>
+                  </TouchableOpacity>
+                ))}
               </View>
-            )} />
-            <TextInput value={newTopicKey} onChangeText={setNewTopicKey} placeholder="Topic key" style={styles.input} />
-            <View style={{ flexDirection: 'row', justifyContent: 'flex-end' }}>
-              <TouchableOpacity onPress={createTopic} style={{ backgroundColor: '#1b5e20', paddingHorizontal: 10, paddingVertical: 8, borderRadius: 6 }}>
-                <Text style={{ color: '#fff' }}>Add Topic</Text>
+              <View style={styles.formButtonsRight}>
+                <TouchableOpacity onPress={createUser} style={[styles.btn, styles.btnPrimarySmall]}><Text style={styles.btnPrimaryText}>Create User</Text></TouchableOpacity>
+              </View>
+            </View>
+            <View style={styles.subSection}>
+              <Text style={styles.sectionTitle}>Topics ({topics.length})</Text>
+              <View style={styles.tableHeader}>
+                <Text style={[styles.th, {flex:2}]}>Key</Text>
+                <Text style={[styles.th, {flex:3}]}>Metadata</Text>
+                <Text style={[styles.th, styles.thAction]}>Actions</Text>
+              </View>
+              {topics.length === 0 && <Text style={styles.emptyText}>No topics yet.</Text>}
+              {topics.map((item, idx) => (
+                <View key={item.id} style={[styles.topicRow, idx % 2 === 1 && styles.userRowAlt]}>
+                  <Text style={[styles.td, {flex:2}]}>{item.topic_key || item.sensor_key || item.key}</Text>
+                  <Text style={[styles.td, {flex:3}]} numberOfLines={1}>{item.metadata || ''}</Text>
+                  <View style={[styles.td, styles.rowEnd]}>
+                    <TouchableOpacity onPress={() => deleteTopic(item.id)} accessibilityLabel={`Delete topic ${item.topic_key || item.key}`}>
+                      <Text style={styles.deleteLink}>Delete</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              ))}
+              <View style={styles.inlineFormRow}>
+                <TextInput value={newTopicKey} onChangeText={setNewTopicKey} placeholder="Topic key" style={[styles.input, styles.inlineInput]} />
+              </View>
+              <View style={styles.formButtonsRight}>
+                <TouchableOpacity onPress={createTopic} style={[styles.btn, styles.btnPrimarySmall]}><Text style={styles.btnPrimaryText}>Add Topic</Text></TouchableOpacity>
+              </View>
+            </View>
+            <View style={styles.dangerZone}>
+              <Text style={styles.dangerTitle}>Danger Zone</Text>
+              <Text style={styles.dangerDesc}>Delete this customer and ALL associated users and topics. This cannot be undone.</Text>
+              <TouchableOpacity onPress={deleteCustomer} style={[styles.btn, styles.btnDanger]} accessibilityLabel="Delete customer">
+                <Text style={styles.btnDangerText}>Delete Customer</Text>
               </TouchableOpacity>
             </View>
           </View>
-
-          {/* Delete customer button */}
-          <View style={{ marginTop: 24, alignItems: 'flex-end' }}>
-            <TouchableOpacity onPress={deleteCustomer} style={{ backgroundColor: '#b71c1c', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 6 }}>
-              <Text style={{ color: '#fff', fontWeight: '700' }}>Delete Customer</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      ) : null}
-      {/* Render confirmation modal when requested */}
+        ) : null}
         {confirm ? (
           <ConfirmModal visible={true} title={confirm.title} message={confirm.message} onCancel={confirm.onCancel} onConfirm={confirm.onConfirm} />
         ) : null}
+        <View style={{ height: 40 }} />
       </ScrollView>
     </View>
   );
@@ -530,6 +575,48 @@ const styles = StyleSheet.create({
   noticeText: { flex: 1, color: '#8a1c13', fontSize: 13 },
   noticeClose: { marginLeft: 12, paddingHorizontal: 6, paddingVertical: 2 },
   noticeCloseText: { color: '#8a1c13', fontWeight: '700', fontSize: 12 }
+});
+// Extended styles appended (kept original ones for backward compatibility)
+Object.assign(styles, {
+  editorScroll: { padding: 16, paddingBottom: 56 },
+  formCard: { backgroundColor: '#fff', padding: 16, borderRadius: 8, shadowColor: '#000', shadowOpacity: 0.05, shadowRadius: 4, elevation: 1 },
+  sectionBlock: { marginTop: 24 },
+  sectionTitle: { fontSize: 16, fontWeight: '700', marginTop: 4 },
+  inlineHint: { fontSize: 12, color: '#666', marginTop: 6 },
+  actionRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 14 },
+  btn: { paddingVertical: 10, paddingHorizontal: 16, borderRadius: 6 },
+  btnPrimary: { backgroundColor: '#1b5e20' },
+  btnPrimarySmall: { backgroundColor: '#1b5e20', paddingVertical: 8, paddingHorizontal: 12, borderRadius: 6 },
+  btnPrimaryText: { color: '#fff', fontWeight: '600' },
+  btnSecondary: { backgroundColor: '#eee' },
+  btnSecondaryText: { color: '#333', fontWeight: '600' },
+  btnDanger: { backgroundColor: '#b71c1c', marginTop: 12 },
+  btnDangerText: { color: '#fff', fontWeight: '700' },
+  tableHeader: { flexDirection: 'row', marginTop: 12, borderBottomWidth: 1, borderColor: '#ddd', paddingVertical: 6 },
+  th: { fontSize: 12, fontWeight: '700', color: '#444' },
+  thAction: { width: 70, textAlign: 'right' },
+  userRow: { flexDirection: 'row', paddingVertical: 8, borderBottomWidth: 1, borderColor: '#f0f0f0' },
+  topicRow: { flexDirection: 'row', paddingVertical: 8, borderBottomWidth: 1, borderColor: '#f0f0f0' },
+  userRowAlt: { backgroundColor: '#fafafa' },
+  td: { fontSize: 13, color: '#222', paddingRight: 8 },
+  rowEnd: { alignItems: 'flex-end', justifyContent: 'center' },
+  deleteLink: { color: '#b71c1c', fontSize: 12, fontWeight: '600' },
+  emptyText: { fontSize: 12, color: '#666', marginTop: 4 },
+  roleBadge: { fontSize: 11, paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4, textTransform: 'capitalize', borderWidth: 1, overflow: 'hidden', alignSelf: 'flex-start' },
+  roleBadgeNeutral: { fontSize: 11, paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999, backgroundColor: '#e5efe5', color: '#1b5e20', textTransform: 'capitalize', overflow: 'hidden', alignSelf: 'flex-start' },
+  subSection: { marginTop: 24 },
+  subSectionTitle: { fontSize: 14, fontWeight: '700', marginBottom: 4 },
+  inlineFormRow: { marginTop: 8 },
+  inlineInput: { marginTop: 0 },
+  rolePickerLabel: { marginTop: 12, fontSize: 12, fontWeight: '600', color: '#333' },
+  rolePickerRow: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 6 },
+  rolePickOption: { marginRight: 12, marginBottom: 6 },
+  rolePickText: { fontSize: 13, color: '#666' },
+  rolePickTextActive: { color: '#1b5e20', fontWeight: '700' },
+  formButtonsRight: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: 12 },
+  dangerZone: { marginTop: 36, padding: 16, backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#f5d3d3' },
+  dangerTitle: { fontSize: 14, fontWeight: '700', color: '#b71c1c' },
+  dangerDesc: { fontSize: 12, color: '#7a2a2a', marginTop: 4, lineHeight: 16 }
 });
 
 function PermissionNotice({ message, onClose }) {

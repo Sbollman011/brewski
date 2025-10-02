@@ -147,6 +147,21 @@ function startHttpServer(opts = {}) {
               setSecurityHeadersLocal();
               res.setHeader('Content-Type', 'text/html; charset=utf-8');
               res.setHeader('Cache-Control', 'no-cache');
+              const useNonce = process.env.CSP_ENABLE_NONCE === '1';
+              if (useNonce) {
+                try {
+                  let html = fs.readFileSync(indexPath, 'utf8');
+                  const nonce = (res.locals && res.locals.cspNonce) || '';
+                  if (nonce) {
+                    // Inject nonce into any inline <style id="expo-reset"> and placeholder <script nonce-slot>
+                    html = html.replace('<style id="expo-reset"', `<style id=\"expo-reset\" nonce=\"${nonce}\"`);
+                  }
+                  res.end(html);
+                  return;
+                } catch (e) {
+                  // Fallback to raw stream
+                }
+              }
               fs.createReadStream(indexPath).pipe(res);
               return;
             } catch (e) {
@@ -207,6 +222,16 @@ function startHttpServer(opts = {}) {
             setSecurityHeadersLocal();
             res.setHeader('Content-Type', 'text/html; charset=utf-8');
             res.setHeader('Cache-Control', 'no-cache');
+            const useNonce = process.env.CSP_ENABLE_NONCE === '1';
+            if (useNonce) {
+              try {
+                let html = fs.readFileSync(managePath, 'utf8');
+                const nonce = (res.locals && res.locals.cspNonce) || '';
+                if (nonce) html = html.replace('<style id="expo-reset"', `<style id=\"expo-reset\" nonce=\"${nonce}\"`);
+                res.end(html);
+                return;
+              } catch (e) {}
+            }
             fs.createReadStream(managePath).pipe(res);
             return;
           }
@@ -238,6 +263,16 @@ function startHttpServer(opts = {}) {
               setSecurityHeadersLocal();
               res.setHeader('Content-Type', 'text/html; charset=utf-8');
               res.setHeader('Cache-Control', 'no-cache');
+              const useNonce = process.env.CSP_ENABLE_NONCE === '1';
+              if (useNonce) {
+                try {
+                  let html = fs.readFileSync(indexPath, 'utf8');
+                  const nonce = (res.locals && res.locals.cspNonce) || '';
+                  if (nonce) html = html.replace('<style id="expo-reset"', `<style id=\"expo-reset\" nonce=\"${nonce}\"`);
+                  res.end(html);
+                  return true;
+                } catch (e) {}
+              }
               fs.createReadStream(indexPath).pipe(res);
               return true;
             }
@@ -261,6 +296,16 @@ function startHttpServer(opts = {}) {
               setSecurityHeadersLocal();
               res.setHeader('Content-Type', 'text/html; charset=utf-8');
               res.setHeader('Cache-Control', 'no-cache');
+              const useNonce = process.env.CSP_ENABLE_NONCE === '1';
+              if (useNonce) {
+                try {
+                  let html = fs.readFileSync(indexPath, 'utf8');
+                  const nonce = (res.locals && res.locals.cspNonce) || '';
+                  if (nonce) html = html.replace('<style id="expo-reset"', `<style id=\"expo-reset\" nonce=\"${nonce}\"`);
+                  res.end(html);
+                  return true;
+                } catch (e) {}
+              }
               fs.createReadStream(indexPath).pipe(res);
               return true;
             }

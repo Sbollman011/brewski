@@ -6,6 +6,7 @@ import Dashboard from './views/Dashboard';
 import AdminPortal from './views/AdminPortal';
 import Landing from './views/Landing';
 import Header from './components/Header';
+import SideMenu from './components/SideMenu';
 import LoginScreen from './components/LoginScreen';
 import ForgotPasswordScreen from './components/ForgotPasswordScreen';
 import ResetPasswordScreen from './components/ResetPasswordScreen';
@@ -355,6 +356,7 @@ export default function App() {
           title={APP_TITLE}
           token={token}
           hideControls={['login', 'forgot', 'reset', 'landing'].includes(screen)}
+          menuOpen={menuOpen}
           onMenuPress={() => {
             const next = !menuOpen;
             setMenuOpen(next);
@@ -367,38 +369,18 @@ export default function App() {
           onLoginPress={() => { setMenuOpen(false); setScreen('login'); }}
           onLogoutPress={() => { handleLogout(); setMenuOpen(false); }}
         />
-        <View style={styles.body}>
-          {/* Side menu */}
-          {menuOpen && (
-            <View style={styles.sideMenu}>
-              <Pressable onPress={() => openScreen('dashboard')} style={{ paddingVertical: 8 }}>
-                <Text style={styles.menuItem}>Dashboard</Text>
-              </Pressable>
-              {/* Manage portal (admin or manager). Show loading placeholder while role resolves. */}
-              {token && !cachedUser && userLoading && (
-                <View style={{ paddingVertical: 8 }}>
-                  <Text style={[styles.menuItem, { opacity: 0.5 }]}>Manage (loading…)</Text>
-                </View>
-              )}
-              {token && hasManageAccess && (
-                <Pressable onPress={() => openScreen('admin')} style={{ paddingVertical: 8 }}>
-                  <Text style={styles.menuItem}>Manage</Text>
-                </Pressable>
-              )}
-              <Pressable onPress={() => openScreen('settings')} style={{ paddingVertical: 8 }}>
-                <Text style={styles.menuItem}>Settings</Text>
-              </Pressable>
-              {token ? (
-                <Pressable onPress={() => { handleLogout(); setMenuOpen(false); }} style={{ paddingVertical: 8 }}>
-                  <Text style={[styles.menuItem, { color: '#ffcccb' }]}>Logout</Text>
-                </Pressable>
-              ) : (
-                <Pressable onPress={() => { setMenuOpen(false); setScreen('login'); }} style={{ paddingVertical: 8 }}>
-                  <Text style={styles.menuItem}>Login</Text>
-                </Pressable>
-              )}
-            </View>
-          )}
+  <View style={styles.body} accessibilityElementsHidden={menuOpen} importantForAccessibility={menuOpen ? 'no-hide-descendants' : 'auto'}>
+          <SideMenu
+            open={menuOpen}
+            onClose={() => setMenuOpen(false)}
+            items={[
+              { label: 'Dashboard', onPress: () => openScreen('dashboard') },
+              token && !cachedUser && userLoading ? { label: 'Manage (loading…)', disabled: true } : null,
+              token && hasManageAccess ? { label: 'Manage', onPress: () => openScreen('admin') } : null,
+              { label: 'Settings', onPress: () => openScreen('settings') },
+              token ? { label: 'Logout', destructive: true, onPress: () => { handleLogout(); } } : { label: 'Login', onPress: () => setScreen('login') }
+            ].filter(Boolean)}
+          />
           <View style={styles.content}>
             {Platform.OS === 'web' && screen === 'landing' && (
               <Landing
@@ -488,6 +470,7 @@ const styles = StyleSheet.create({
   hamburger: { padding: 4 },
   bar: { width: 22, height: 3, backgroundColor: '#fff', marginVertical: 2, borderRadius: 2 },
   body: { flex: 1, flexDirection: 'row' },
+  // Deprecated: inline side menu styles (kept for backward compatibility; remove if unused elsewhere)
   sideMenu: { width: 200, backgroundColor: '#1b5e20', paddingTop: 16, paddingHorizontal: 12 },
   menuHeader: { color: '#fff', fontWeight: '700', marginBottom: 12, fontSize: 16 },
   menuItem: { color: '#f1f8f1', paddingVertical: 6, fontSize: 14 },
