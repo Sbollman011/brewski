@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react';
 import { View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView } from 'react-native';
 import Header from '../components/Header';
 import SideMenu from '../components/SideMenu';
+// Accessible placeholder color (sufficient contrast on light backgrounds on mobile & web)
+const PLACEHOLDER_COLOR = '#555';
 import { apiFetch } from '../src/api';
 
 const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
@@ -389,12 +391,12 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       >
         <View style={[styles.formCard, !showNav && { marginTop: 12 }] }>
           <Text style={styles.sectionTitle}>{initial ? 'Edit Customer' : 'Create Customer'}</Text>
-          <TextInput value={name} onChangeText={setName} placeholder="Name" style={styles.input} />
-          <TextInput value={slug} onChangeText={setSlug} placeholder="Slug" style={styles.input} />
-          <TextInput value={controller_host1} onChangeText={setControllerHost1} placeholder="Host (primary)" style={styles.input} />
-          <TextInput value={controller_host2} onChangeText={setControllerHost2} placeholder="Host (secondary, optional)" style={styles.input} />
+          <TextInput value={name} onChangeText={setName} placeholder="Name" placeholderTextColor={PLACEHOLDER_COLOR} style={styles.input} />
+          <TextInput value={slug} onChangeText={setSlug} placeholder="Slug" placeholderTextColor={PLACEHOLDER_COLOR} style={styles.input} />
+          <TextInput value={controller_host1} onChangeText={setControllerHost1} placeholder="Host (primary)" placeholderTextColor={PLACEHOLDER_COLOR} style={styles.input} />
+          <TextInput value={controller_host2} onChangeText={setControllerHost2} placeholder="Host (secondary, optional)" placeholderTextColor={PLACEHOLDER_COLOR} style={styles.input} />
           <Text style={styles.inlineHint}>Ports are managed internally; leave blank.</Text>
-          <TextInput value={metadata} onChangeText={setMetadata} placeholder="Metadata (JSON)" style={[styles.input, styles.metadataInput]} multiline textAlignVertical="top" />
+          <TextInput value={metadata} onChangeText={setMetadata} placeholder="Metadata (JSON)" placeholderTextColor={PLACEHOLDER_COLOR} style={[styles.input, styles.metadataInput]} multiline textAlignVertical="top" />
           <View style={styles.actionRow}>
             <TouchableOpacity onPress={onCancel} style={[styles.btn, styles.btnSecondary]}><Text style={styles.btnSecondaryText}>Cancel</Text></TouchableOpacity>
             <TouchableOpacity onPress={save} style={[styles.btn, styles.btnPrimary]}><Text style={styles.btnPrimaryText}>Save</Text></TouchableOpacity>
@@ -429,10 +431,10 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
             })}
             <View style={styles.subSection}>
               <Text style={styles.subSectionTitle}>Create User</Text>
-              <View style={styles.inlineFormRow}><TextInput value={newUser.username} onChangeText={t => setNewUser(s => ({...s, username: t}))} placeholder="Username" style={[styles.input, styles.inlineInput]} /></View>
-              <View style={styles.inlineFormRow}><TextInput value={newUser.password} onChangeText={t => setNewUser(s => ({...s, password: t}))} placeholder="Password" style={[styles.input, styles.inlineInput]} secureTextEntry /></View>
-              <View style={styles.inlineFormRow}><TextInput value={newUser.name} onChangeText={t => setNewUser(s => ({...s, name: t}))} placeholder="Full name" style={[styles.input, styles.inlineInput]} /></View>
-              <View style={styles.inlineFormRow}><TextInput value={newUser.email} onChangeText={t => setNewUser(s => ({...s, email: t}))} placeholder="Email" style={[styles.input, styles.inlineInput]} /></View>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.username} onChangeText={t => setNewUser(s => ({...s, username: t}))} placeholder="Username" placeholderTextColor={PLACEHOLDER_COLOR} style={[styles.input, styles.inlineInput]} /></View>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.password} onChangeText={t => setNewUser(s => ({...s, password: t}))} placeholder="Password" placeholderTextColor={PLACEHOLDER_COLOR} style={[styles.input, styles.inlineInput]} secureTextEntry /></View>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.name} onChangeText={t => setNewUser(s => ({...s, name: t}))} placeholder="Full name" placeholderTextColor={PLACEHOLDER_COLOR} style={[styles.input, styles.inlineInput]} /></View>
+              <View style={styles.inlineFormRow}><TextInput value={newUser.email} onChangeText={t => setNewUser(s => ({...s, email: t}))} placeholder="Email" placeholderTextColor={PLACEHOLDER_COLOR} style={[styles.input, styles.inlineInput]} /></View>
               <Text style={styles.rolePickerLabel}>Role</Text>
               <View style={styles.rolePickerRow}>
                 {['user','privileged','manager','admin'].map(r => (
@@ -465,7 +467,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
                 </View>
               ))}
               <View style={styles.inlineFormRow}>
-                <TextInput value={newTopicKey} onChangeText={setNewTopicKey} placeholder="Topic key" style={[styles.input, styles.inlineInput]} />
+                <TextInput value={newTopicKey} onChangeText={setNewTopicKey} placeholder="Topic key" placeholderTextColor={PLACEHOLDER_COLOR} style={[styles.input, styles.inlineInput]} />
               </View>
               <View style={styles.formButtonsRight}>
                 <TouchableOpacity onPress={createTopic} style={[styles.btn, styles.btnPrimarySmall]}><Text style={styles.btnPrimaryText}>Add Topic</Text></TouchableOpacity>
