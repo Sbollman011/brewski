@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
-import { SafeAreaView, View, Text, StyleSheet, Pressable, Animated, Easing, TextInput, Button, ScrollView } from 'react-native';
+import { SafeAreaView, View, Text, StyleSheet, Pressable, Animated, Easing, TextInput, Button, ScrollView, useWindowDimensions } from 'react-native';
 import Constants from 'expo-constants';
 import Gauge from '../components/Gauge';
 
@@ -36,6 +36,8 @@ function deriveThreshold(key){
 }
 
 export default function Dashboard({ token }) {
+  // responsive layout measurements
+  const { width: winWidth } = useWindowDimensions();
   const wsRef = useRef(null);
   const [sensorValue, setSensorValue] = useState(null);
   const [displayedSensorValue, setDisplayedSensorValue] = useState(null);
@@ -473,6 +475,26 @@ export default function Dashboard({ token }) {
     connectWebSocket();
   };
 
+  // Responsive gauge layout calculations
+  const { cols, gaugeSize, columnWidth, gap } = useMemo(() => {
+    // base horizontal padding in container is 16 (from styles.container)
+    const horizontalPadding = 32; // left + right
+    const contentWidth = Math.max(0, (winWidth || 0) - horizontalPadding);
+    // Determine column count via breakpoints
+    let c = 1;
+    if (contentWidth >= 520) c = 2;
+    if (contentWidth >= 820) c = 3;
+    if (contentWidth >= 1150) c = 4;
+    // Don't exceed number of devices (at least 1)
+    // (deviceList not yet defined here; adjust later after definition if needed)
+    const gapVal = 16; // px between columns
+    const colWidth = (contentWidth - gapVal * (c - 1)) / c;
+    // Gauge internal width expands ~1.36x size (size * 1.12 + padding). Derive size from column width.
+    const rawGaugeSize = colWidth / 1.36;
+    const sized = Math.max(130, Math.min(rawGaugeSize, 210));
+    return { cols: c, gaugeSize: sized, columnWidth: colWidth, gap: gapVal };
+  }, [winWidth]);
+
   if (!token) {
     return (
       <SafeAreaView style={styles.container}>
@@ -489,22 +511,20 @@ export default function Dashboard({ token }) {
       <ScrollView style={styles.scroll} contentContainerStyle={styles.contentContainer}>
         {!loading && (
           <>
-            <View style={styles.gaugeWrap}>
+            <View style={[styles.gaugeWrap, { flexDirection:'row', flexWrap:'wrap', justifyContent:'center', marginHorizontal: -(gap/2) }]}> 
               {deviceList.map((d, i) => {
                 const sensorVal = gSensors[d.key] ?? null;
                 const targetVal = gTargets[d.key] ?? null;
-                // derive green range: preference to dynamic thresholds override
-                // heuristic color bands (no editable UI): choose ranges per device type
                 let gStart = 0, gEnd = 220;
                 const upKey = d.key.toUpperCase();
                 if (upKey.includes('FERM')) { gStart = 55; gEnd = 80; }
                 else if (upKey.includes('MASH')) { gStart = 150; gEnd = 160; }
-                else if (upKey.includes('BOIL') || upKey.includes('HLT')) { gStart = 0; gEnd = 220; } // plain mode
+                else if (upKey.includes('BOIL') || upKey.includes('HLT')) { gStart = 0; gEnd = 220; }
                 return (
-                  <View key={`gwrap-${d.key}`} style={{ width:'100%', alignItems:'center' }}>
+                  <View key={`gwrap-${d.key}`} style={{ width: columnWidth, padding: gap/2, alignItems:'center' }}>
                     <Gauge
                       key={`g-${d.key}`}
-                      size={GAUGE_SIZE + 15}
+                      size={gaugeSize}
                       title={d.label}
                       sensorValue={sensorVal}
                       targetValue={targetVal}
@@ -515,7 +535,6 @@ export default function Dashboard({ token }) {
                       greenStart={gStart}
                       greenEnd={gEnd}
                     />
-                    {/* Threshold editor removed per request */}
                   </View>
                 );
               })}
