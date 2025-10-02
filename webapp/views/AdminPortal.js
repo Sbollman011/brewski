@@ -356,32 +356,38 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
 
   const [menuOpen, setMenuOpen] = useState(false);
   const roleColorNeutral = '#1b5e20';
+  // In create mode we now remove header + side menu entirely per request
+  const showNav = !!initial; // only show header/menu when editing existing customer
   return (
     <View style={{ flex: 1, backgroundColor: '#fafafa' }}>
-      <Header
-        title={initial ? 'Edit Customer' : 'Create Customer'}
-        token={token}
-        menuOpen={menuOpen}
-        onMenuPress={() => setMenuOpen(o => !o)}
-        onLogoutPress={() => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (e) {} if (onCancel) onCancel(); }}
-        onLoginPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }}
-      />
-      <SideMenu
-        open={menuOpen}
-        onClose={() => setMenuOpen(false)}
-        items={[
-          { label: 'Dashboard', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/dashboard'; } catch(e){} } },
-          { label: 'Manage', onPress: () => {}, autoClose: true },
-          token ? { label: 'Logout', destructive: true, onPress: () => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch(e){} if (onCancel) onCancel(); } } : { label: 'Login', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch(e){} } }
-        ]}
-      />
+      {showNav && (
+        <>
+          <Header
+            title={initial ? 'Edit Customer' : 'Create Customer'}
+            token={token}
+            menuOpen={menuOpen}
+            onMenuPress={() => setMenuOpen(o => !o)}
+            onLogoutPress={() => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (e) {} if (onCancel) onCancel(); }}
+            onLoginPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }}
+          />
+          <SideMenu
+            open={menuOpen}
+            onClose={() => setMenuOpen(false)}
+            items={[
+              { label: 'Dashboard', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/dashboard'; } catch(e){} } },
+              { label: 'Manage', onPress: () => {}, autoClose: true },
+              token ? { label: 'Logout', destructive: true, onPress: () => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch(e){} if (onCancel) onCancel(); } } : { label: 'Login', onPress: () => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch(e){} } }
+            ]}
+          />
+        </>
+      )}
       <ScrollView
         contentContainerStyle={styles.editorScroll}
         keyboardShouldPersistTaps="handled"
-        accessibilityElementsHidden={menuOpen}
-        importantForAccessibility={menuOpen ? 'no-hide-descendants' : 'auto'}
+        accessibilityElementsHidden={showNav && menuOpen}
+        importantForAccessibility={showNav && menuOpen ? 'no-hide-descendants' : 'auto'}
       >
-        <View style={styles.formCard}>
+        <View style={[styles.formCard, !showNav && { marginTop: 12 }] }>
           <Text style={styles.sectionTitle}>{initial ? 'Edit Customer' : 'Create Customer'}</Text>
           <TextInput value={name} onChangeText={setName} placeholder="Name" style={styles.input} />
           <TextInput value={slug} onChangeText={setSlug} placeholder="Slug" style={styles.input} />
