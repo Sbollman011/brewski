@@ -143,12 +143,17 @@ export default function Dashboard({ token }) {
     }, delay);
   };
 
+  const isReactNative = (() => {
+    try { return (typeof navigator !== 'undefined' && navigator.product === 'ReactNative'); } catch (e) { return false; }
+  })();
+
   const connectWebSocket = async () => {
     if (!token) return false; // don't attempt without JWT
     const host = resolveHost();
     const base = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
     // include token as query param (primary). We'll add a fallback retry with a single subprotocol only if needed.
     const url = `${base}?token=${encodeURIComponent(token)}`;
+    debug('[WS attempt] primary url=', url, 'token.len=', token && token.length);
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;
@@ -348,7 +353,21 @@ export default function Dashboard({ token }) {
           // Fallback attempt without a subprotocol. Previous code used a subprotocol string
           // with a space ("Bearer <token>") which is not RFC6455-compliant (tokens cannot contain spaces).
           // Token is already conveyed via the query parameter, so we omit subprotocol entirely here.
-          const alt = new WebSocket(fallbackUrl);
+          let alt;
+          if (isReactNative) {
+            // React Native's WebSocket implementation supports a headers options object as 2nd/3rd param.
+            // Attempt with Authorization header in case query param is being stripped or cached strangely.
+            try {
+              // Some RN versions accept (url, null, { headers }); others (url, [], { headers })
+              alt = new WebSocket(fallbackUrl, [], { headers: { Authorization: `Bearer ${token}` } });
+              debug('[WS fallback] RN header attempt with Authorization, url=', fallbackUrl);
+            } catch (e) {
+              debug('[WS fallback] header attempt failed to construct, falling back to plain url', e && e.message);
+              alt = new WebSocket(fallbackUrl);
+            }
+          } else {
+            alt = new WebSocket(fallbackUrl);
+          }
           wsRef.current = alt;
           alt.onopen = () => {
             reconnectMeta.current.attempts = 0;
@@ -361,6 +380,12 @@ export default function Dashboard({ token }) {
     }, 1200);
     return () => clearTimeout(timer);
   }, [token, connectAttempt]);
+
+  // Log token arrival timing relative to initial mount to detect race where first attempt has no token
+  useEffect(() => {
+    if (!token) return;
+    debug('[TOKEN ready] len=', token.length, 'head=', token.slice(0,10));
+  }, [token]);
 
   useEffect(() => {
     if (!token) return; // wait until token provided
