@@ -297,6 +297,39 @@ export default function Dashboard({ token }) {
             markConnected();
             debug('Current DUMMYtest/Target', n);
           }
+          // grouped inventory snapshot (new message type from bridge)
+          if (obj.type === 'grouped-inventory' && obj.data && typeof obj.data === 'object') {
+            // Flatten grouped inventory topics into sensor/target maps
+            const groups = obj.data;
+            const nextSensors = {}; const nextTargets = {};
+            Object.values(groups).forEach(g => {
+              if (!g || !g.topics) return;
+              Object.entries(g.topics).forEach(([topic, val]) => {
+                if (/\/sensor$/i.test(topic)) { const base = topic.replace(/\/Sensor$/i,''); const n = Number(val); if (!Number.isNaN(n)) nextSensors[base] = n; }
+                if (/\/target$/i.test(topic)) { const base = topic.replace(/\/Target$/i,''); const n = Number(val); if (!Number.isNaN(n)) nextTargets[base] = n; }
+              });
+            });
+            if (Object.keys(nextSensors).length) setGSensors(prev => ({ ...nextSensors, ...prev }));
+            if (Object.keys(nextTargets).length) setGTargets(prev => ({ ...nextTargets, ...prev }));
+            markConnected();
+          }
+          // real-time every message broadcast
+          if (obj.type === 'mqtt-message' && typeof obj.topic === 'string') {
+            const topic = obj.topic;
+            const lowerTopic = topic.toLowerCase();
+            const n = Number(obj.payload);
+            if (!Number.isNaN(n)) {
+              if (lowerTopic.endsWith('/sensor')) {
+                const base = topic.replace(/\/Sensor$/i,'');
+                setGSensors(prev => ({ ...prev, [base]: n }));
+                markConnected();
+              } else if (lowerTopic.endsWith('/target')) {
+                const base = topic.replace(/\/Target$/i,'');
+                setGTargets(prev => ({ ...prev, [base]: n }));
+                markConnected();
+              }
+            }
+          }
           // inventory snapshot
           if (obj.type === 'inventory' && obj.data && typeof obj.data === 'object') {
             const inv = obj.data || {};
@@ -536,6 +569,7 @@ export default function Dashboard({ token }) {
     <SafeAreaView style={styles.container}>
       {/* small spacer to keep content below any header/hamburger */}
       <View style={[styles.headerSpacer, { height: (Constants.statusBarHeight || 0) + 12 }]} />
+      {/* Placeholder future: group filter UI (to filter deviceList by second topic segment/group) */}
       <ScrollView style={styles.scroll} contentContainerStyle={styles.contentContainer}>
         {!loading && (
           <>

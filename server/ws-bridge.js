@@ -44,6 +44,20 @@ function startWsBridge(opts = {}) {
 
   const wss = new WebSocket.Server({ noServer: true });
 
+  // If an mqttClient instance is provided, attach listeners to broadcast real-time updates
+  // to all connected WebSocket clients. This pushes each MQTT message as { type:'mqtt-message', topic, payload, retained }.
+  if (mqttClient && mqttClient.on) {
+    try {
+      mqttClient.on('message', ({ topic, payload, retained, seq }) => {
+        try { broadcast({ type: 'mqtt-message', topic, payload, retained: !!retained, seq }); } catch (e) {}
+        if (/\/(Target|Sensor)$/i.test(topic)) {
+          // Also push a current update so existing dashboard logic listening for 'current' stays compatible
+          try { broadcast({ type: 'current', topic, payload, retained: !!retained }); } catch (e) {}
+        }
+      });
+    } catch (e) { console.error('ws-bridge: failed attaching mqttClient message listener', e && e.message ? e.message : e); }
+  }
+
   function effectiveBridgeToken() {
     if (process.env.DISABLE_BRIDGE_TOKEN === '1') return null;
     return process.env.BRIDGE_TOKEN || null;
@@ -122,6 +136,11 @@ function startWsBridge(opts = {}) {
     const seen = Array.from((seenTopics && seenTopics.keys && typeof seenTopics.keys === 'function') ? seenTopics.keys() : []);
     const merged = Array.from(new Set([...configured, ...seen]));
     try { ws.send(JSON.stringify({ type: 'topics', data: merged, ts: Date.now() })); } catch (e) {}
+    // Send grouped inventory snapshot if mqttClient offers it (lightweight initial hydration)
+    if (mqttClient && typeof mqttClient.getGroupedInventory === 'function') {
+      try { ws.send(JSON.stringify({ type: 'grouped-inventory', data: mqttClient.getGroupedInventory({ onlyTerminal: true }), ts: Date.now() })); } catch (e) {}
+      try { ws.send(JSON.stringify({ type: 'summary', data: mqttClient.snapshotSummary ? mqttClient.snapshotSummary() : {}, ts: Date.now() })); } catch (e) {}
+    }
 
     try {
       for (const [topic, payload] of (latestValue && latestValue.entries ? latestValue.entries() : [])) {
