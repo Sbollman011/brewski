@@ -49,9 +49,15 @@ export default function App() {
   const [cachedUser, setCachedUser] = useState(null); // minimal user info for role-based nav
   const [userLoading, setUserLoading] = useState(false);
   const intendedScreenRef = useRef(null); // remembers where user wanted to go pre-auth
+  const [customerInfo, setCustomerInfo] = useState(null); // customer info for dynamic header title
 
-  // Static header title per requirement
-  const APP_TITLE = 'Brew Remote';
+  // Dynamic header title based on customer, fallback to default
+  const getHeaderTitle = () => {
+    if (customerInfo && customerInfo.name) {
+      return customerInfo.name;
+    }
+    return 'Brew Remote';
+  };
 
   // Derived access flag for manage/admin portal
   const hasManageAccess = !!(cachedUser && (Number(cachedUser.is_admin) === 1 || cachedUser.role === 'manager' || cachedUser.role === 'admin'));
@@ -309,6 +315,7 @@ export default function App() {
     try { localStorage.removeItem('brewski_jwt'); } catch (e) { }
     try { localStorage.removeItem('brewski_me'); } catch (e) { }
     setCachedUser(null);
+    setCustomerInfo(null);
     setToken(null);
     intendedScreenRef.current = null;
     if (Platform.OS === 'web') {
@@ -353,7 +360,7 @@ export default function App() {
       <SafeAreaView style={styles.root} edges={["left", "right", "bottom"]}>
         {/* Push notification warning banner removed */}
         <Header
-          title={APP_TITLE}
+          title={getHeaderTitle()}
           token={token}
           hideControls={['login', 'forgot', 'reset', 'landing'].includes(screen)}
           menuOpen={menuOpen}
@@ -435,7 +442,7 @@ export default function App() {
             }} onForgot={() => setScreen('forgot')} />}
             {screen === 'forgot' && !token && <ForgotPasswordScreen onBack={() => setScreen('login')} />}
             {screen === 'reset' && !token && <ResetPasswordScreen initialToken={initialResetToken} onBack={() => setScreen('login')} />}
-            {screen === 'dashboard' && token && <Dashboard token={token} />}
+            {screen === 'dashboard' && token && <Dashboard token={token} onCustomerLoaded={setCustomerInfo} />}
             {screen === 'admin' && token && (
               hasManageAccess ? (
                 <AdminPortal currentUser={cachedUser} loadingUser={userLoading} token={token} />

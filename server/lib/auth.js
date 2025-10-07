@@ -68,19 +68,37 @@ function createUser(username, password, opts = {}) {
 }
 
 function findUserByUsername(username) {
-  const stmt = _db_.prepare('SELECT id, username, password_hash, email, customer_id, role, is_admin FROM users WHERE username = ?');
+  const stmt = _db_.prepare(`
+    SELECT u.id, u.username, u.password_hash, u.email, u.customer_id, u.role, u.is_admin, 
+           c.slug as customer_slug, c.name as customer_name
+    FROM users u 
+    LEFT JOIN customers c ON u.customer_id = c.id 
+    WHERE u.username = ?
+  `);
   return stmt.get(username);
 }
 
 function findUserByEmail(email) {
   if (!email) return null;
-  const stmt = _db_.prepare('SELECT id, username, password_hash, email, customer_id, role, is_admin FROM users WHERE email = ?');
+  const stmt = _db_.prepare(`
+    SELECT u.id, u.username, u.password_hash, u.email, u.customer_id, u.role, u.is_admin,
+           c.slug as customer_slug, c.name as customer_name
+    FROM users u 
+    LEFT JOIN customers c ON u.customer_id = c.id 
+    WHERE u.email = ?
+  `);
   return stmt.get(email);
 }
 
 function findUserById(id) {
   if (!id) return null;
-  const stmt = _db_.prepare('SELECT id, username, password_hash, email, customer_id, role, is_admin FROM users WHERE id = ?');
+  const stmt = _db_.prepare(`
+    SELECT u.id, u.username, u.password_hash, u.email, u.customer_id, u.role, u.is_admin,
+           c.slug as customer_slug, c.name as customer_name
+    FROM users u 
+    LEFT JOIN customers c ON u.customer_id = c.id 
+    WHERE u.id = ?
+  `);
   return stmt.get(id);
 }
 
@@ -127,6 +145,12 @@ function updateUserFieldsByUsername(username, fields = {}) {
   return updateUserById(user.id, fields);
 }
 
+function findCustomerBySlug(slug) {
+  if (!slug) return null;
+  const stmt = _db_.prepare('SELECT id, slug, name FROM customers WHERE slug = ?');
+  return stmt.get(slug);
+}
+
 function updateUserEmailByUsername(username, email) {
   if (!username || !email) return false;
   const stmt = _db_.prepare('UPDATE users SET email = ? WHERE username = ?');
@@ -142,4 +166,4 @@ function verifyToken(token) {
   try { return jwt.verify(token, _JWT_SECRET_); } catch (e) { return null; }
 }
 
-module.exports = { createUser, findUserByUsername, findUserByEmail, findUserById, verifyPassword, updateUserPasswordById, updateUserEmailByUsername, signToken, verifyToken, DB_FILE: _DB_FILE_ };
+module.exports = { createUser, findUserByUsername, findUserByEmail, findUserById, verifyPassword, updateUserPasswordById, updateUserEmailByUsername, signToken, verifyToken, findCustomerBySlug, DB_FILE: _DB_FILE_ };

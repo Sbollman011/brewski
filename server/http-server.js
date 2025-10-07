@@ -47,6 +47,58 @@ function startHttpServer(opts = {}) {
         return;
       }
 
+      if (url.pathname === '/api/latest' && req.method === 'GET') {
+        setSecurityHeadersLocal();
+        try {
+          // Auth: Bearer JWT or bridge token
+          const authHeader = (req.headers['authorization'] || '').toString();
+          const parts = authHeader.split(' ');
+          let token = null;
+            if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
+          if (!token) token = url.searchParams.get('token');
+          const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
+          let user = null;
+          if (token) {
+            if (BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
+              user = { id: 'bridge', customer_id: 1, is_admin: 1 };
+            } else {
+              try {
+                const { verifyToken, findUserById } = require('./lib/auth');
+                const claims = verifyToken(token);
+                if (claims) {
+                  const u = findUserById(claims.sub);
+                  if (u) user = u;
+                }
+              } catch (e) {}
+            }
+          }
+          if (!user) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+            return;
+          }
+          const customerId = Number(user.customer_id || 1);
+          const Database = require('better-sqlite3');
+          const dbPath = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, 'brewski.sqlite3');
+          const db = new Database(dbPath);
+          // Sensors may or may not have topic_key; we expose key plus last_value/last_ts/last_raw
+          const rows = db.prepare('SELECT id, key, topic_key, type, unit, last_value, last_ts, last_raw FROM sensors WHERE customer_id = ? AND last_ts IS NOT NULL ORDER BY last_ts DESC LIMIT 1000').all(customerId);
+          // Include customer context for frontend filtering
+          const customerInfo = db.prepare('SELECT slug, name FROM customers WHERE id = ?').get(customerId);
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+          res.end(JSON.stringify({ 
+            ok: true, 
+            sensors: rows,
+            customer: customerInfo || { slug: 'default', name: 'Default Customer' }
+          }));
+          try { db.close(); } catch (e) {}
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'server_error', detail: e && e.message }));
+        }
+        return;
+      }
+
       if (url.pathname === '/info') {
         const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : process.env.BRIDGE_TOKEN || null;
         const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');

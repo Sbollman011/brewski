@@ -314,6 +314,9 @@ function runMigration() {
       topic_key TEXT,
       type TEXT,
       unit TEXT,
+      last_value REAL,
+      last_ts INTEGER,
+      last_raw TEXT,
       created_at INTEGER NOT NULL,
       FOREIGN KEY(customer_id) REFERENCES customers(id) ON DELETE CASCADE,
       FOREIGN KEY(controller_id) REFERENCES controllers(id) ON DELETE SET NULL
@@ -332,7 +335,8 @@ function runMigration() {
     // Indexes
     doExec(`CREATE INDEX IF NOT EXISTS idx_users_customer ON users(customer_id);`);
     doExec(`CREATE INDEX IF NOT EXISTS idx_controllers_customer ON controllers(customer_id);`);
-    doExec(`CREATE INDEX IF NOT EXISTS idx_sensors_customer ON sensors(customer_id);`);
+  doExec(`CREATE INDEX IF NOT EXISTS idx_sensors_customer ON sensors(customer_id);`);
+  doExec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sensors_customer_key ON sensors(customer_id, key);`);
     doExec(`CREATE INDEX IF NOT EXISTS idx_telemetry_sensor_ts ON telemetry(sensor_id, ts);`);
 
     // Ensure default customer exists and migrate existing users into it if they lack customer_id
@@ -372,6 +376,20 @@ function runMigration() {
 
     // Re-enable foreign keys
     db.pragma('foreign_keys = ON');
+
+    // Ensure new snapshot columns exist if migrating from an older schema lacking them.
+    const addColumnIfMissing = (table, col, type) => {
+      if (!columnExists(db, table, col)) {
+        console.log(`Will add ${table}.${col}`);
+        if (DO_APPLY) {
+          try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`); } catch (e) { console.error('Failed adding column', col, e && e.message); }
+        }
+      }
+    };
+    addColumnIfMissing('sensors', 'topic_key', 'TEXT');
+    addColumnIfMissing('sensors', 'last_value', 'REAL');
+    addColumnIfMissing('sensors', 'last_ts', 'INTEGER');
+    addColumnIfMissing('sensors', 'last_raw', 'TEXT');
 
     // Populate topic_key from existing columns if missing (idempotent)
     try {

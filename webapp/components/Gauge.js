@@ -95,7 +95,7 @@ export default function Gauge({ title='Sensor', size=195, sensorValue=null, targ
   const containerHeight = Math.round(size + 80);
 
   return (
-    <View style={{ alignItems:'center', marginVertical:6, width: '100%', alignSelf: 'center', borderBottomWidth:1, borderBottomColor:'#e6e6e6', paddingBottom:8, marginBottom:12 }}>
+    <View style={{ alignItems:'center', marginVertical:6, width: '100%', alignSelf: 'center', paddingBottom:4, marginBottom:4 }}>
   <Text style={{ fontSize:16, fontWeight:'700', marginBottom:4, marginTop:-8, backgroundColor:'transparent' }}>{title}</Text>
     {Svg ? (
   // SVG gauge container with inline slider overlay
@@ -248,15 +248,81 @@ export default function Gauge({ title='Sensor', size=195, sensorValue=null, targ
               <TouchableOpacity onPress={() => { try { const nv = Math.max(SENSOR_MIN, Math.round((targetValue||0) - 1)); onSetTarget(nv); } catch(e){} }} style={{ width:28, alignItems:'center', justifyContent:'center', paddingVertical:4 }}>
                 <Text style={{ fontSize:16, color:'rgba(0,0,0,0.55)' }}>{'◀'}</Text>
               </TouchableOpacity>
-              <View ref={trackRef} style={{ flex:1, marginHorizontal:8 }} onLayout={(e)=>setTrackWidth(e.nativeEvent.layout.width)} {...panResponder.panHandlers}>
-                <View style={{ height:28, backgroundColor:'rgba(0,0,0,0.05)', borderRadius:14, overflow:'hidden', justifyContent:'center', borderWidth:1, borderColor:'rgba(0,0,0,0.08)', paddingHorizontal:8 }}>
+              <View ref={trackRef} style={{ flex:1, marginHorizontal:8, position: 'relative' }} onLayout={(e)=>setTrackWidth(e.nativeEvent.layout.width)} {...panResponder.panHandlers}>
+                <View style={{ height:28, backgroundColor:'rgba(0,0,0,0.05)', borderRadius:14, overflow:'visible', justifyContent:'center', borderWidth:1, borderColor:'rgba(0,0,0,0.08)', paddingHorizontal:8 }}>
                   {(() => {
                     const safePct = (dragPct !== null)
                       ? Math.max(0, Math.min(100, dragPct))
                       : (typeof targetValue === 'number' && !Number.isNaN(targetValue)
                           ? Math.max(0, Math.min(100, (targetValue / SENSOR_MAX) * 100))
                           : 0);
-                    return <View style={{ width: `${safePct}%`, height:10, backgroundColor:'#2196f3', borderRadius:6 }} />;
+                    const currentValue = (dragPct !== null) 
+                      ? Math.round(SENSOR_MIN + (dragPct / 100) * (SENSOR_MAX - SENSOR_MIN))
+                      : (targetValue || 0);
+                    
+                    return (
+                      <>
+                        <View style={{ width: `${safePct}%`, height:10, backgroundColor:'#2196f3', borderRadius:6 }} />
+                        {/* Position indicator bubble */}
+                        <View style={{ 
+                          position: 'absolute', 
+                          left: `${Math.max(8, Math.min(92, safePct))}%`, 
+                          top: -32,
+                          alignItems: 'center',
+                          opacity: dragPct !== null ? 1 : 0,
+                          transform: [{ translateX: -12 }]
+                        }}>
+                          {/* Bubble background */}
+                          <View style={{
+                            backgroundColor: '#2196f3',
+                            paddingHorizontal: 8,
+                            paddingVertical: 4,
+                            borderRadius: 8,
+                            minWidth: 32,
+                            alignItems: 'center',
+                            shadowColor: '#000',
+                            shadowOffset: { width: 0, height: 2 },
+                            shadowOpacity: 0.25,
+                            shadowRadius: 4,
+                            elevation: 5
+                          }}>
+                            <Text style={{ color: '#fff', fontSize: 11, fontWeight: '600' }}>
+                              {currentValue}°
+                            </Text>
+                          </View>
+                          {/* Bubble pointer */}
+                          <View style={{
+                            width: 0,
+                            height: 0,
+                            borderLeftWidth: 6,
+                            borderRightWidth: 6,
+                            borderTopWidth: 6,
+                            borderLeftColor: 'transparent',
+                            borderRightColor: 'transparent',
+                            borderTopColor: '#2196f3',
+                            marginTop: -1
+                          }} />
+                        </View>
+                        {/* Track thumb */}
+                        <View style={{
+                          position: 'absolute',
+                          left: `${safePct}%`,
+                          top: '50%',
+                          width: 18,
+                          height: 18,
+                          borderRadius: 9,
+                          backgroundColor: '#2196f3',
+                          borderWidth: 2,
+                          borderColor: '#fff',
+                          transform: [{ translateX: -9 }, { translateY: -9 }],
+                          shadowColor: '#000',
+                          shadowOffset: { width: 0, height: 1 },
+                          shadowOpacity: 0.2,
+                          shadowRadius: 2,
+                          elevation: 3
+                        }} />
+                      </>
+                    );
                   })()}
                 </View>
               </View>

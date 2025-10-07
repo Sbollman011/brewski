@@ -10,6 +10,8 @@ const mqtt = require('mqtt');
 const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
+// Lazy load ingestion to avoid requiring DB if not desired
+let ingestNumeric = null;
 
 // Centralized configuration constants with env fallbacks. Use these instead of
 // sprinkling process.env throughout business logic so future refactors or
@@ -150,6 +152,63 @@ class NextMqttClient extends EventEmitter {
           this.groupCounters.set(group, (this.groupCounters.get(group) || 0) + 1);
           this.emit('group-message', { group, topic, payload, retained, seq: this.totalMessages });
         }
+        // Ingestion hook: only attempt for terminal /Sensor topics with numeric payload (or JSON containing Temperature)
+        try {
+          if (/\/Sensor$/i.test(topic)) {
+            let numeric = null;
+            let rawForStore = null;
+            if (/^[-+]?[0-9]*\.?[0-9]+$/.test(payload.trim())) {
+              numeric = Number(payload.trim());
+              rawForStore = payload.trim();
+            } else if (payload.startsWith('{') && payload.endsWith('}')) {
+              try {
+                const obj = JSON.parse(payload);
+                // Common Tasmota DS18B20 path: {"DS18B20":{"Id":"...","Temperature":65.3},"TempUnit":"F"}
+                if (obj && typeof obj === 'object') {
+                  // Depth-first search for a Temperature key with numeric value
+                  const stack = [obj];
+                  while (stack.length) {
+                    const cur = stack.pop();
+                    if (cur && typeof cur === 'object') {
+                      if (cur.Temperature !== undefined && typeof cur.Temperature === 'number') { numeric = cur.Temperature; break; }
+                      for (const v of Object.values(cur)) if (v && typeof v === 'object') stack.push(v);
+                    }
+                  }
+                  rawForStore = payload;
+                }
+              } catch (e) { /* ignore */ }
+            }
+            if (numeric !== null && !isNaN(numeric)) {
+              if (!ingestNumeric) {
+                try { ingestNumeric = require('./lib/ingest').ingestNumeric; } catch (e) { /* ignore */ }
+              }
+              if (typeof ingestNumeric === 'function') {
+                // Derive a sensor key: use the topic without trailing /Sensor
+                const baseKey = topic.replace(/\/Sensor$/i, '');
+                // Dynamic customer resolution: extract level 2 segment and map to customer by slug
+                let customerId = Number(process.env.DEFAULT_CUSTOMER_ID || 1); // fallback
+                const topicParts = topic.split('/');
+                if (topicParts.length >= 2) {
+                  const potentialSlug = topicParts[1]; // level 2 segment (0-indexed, so index 1)
+                  if (potentialSlug && potentialSlug !== 'Sensor' && potentialSlug !== 'Target') {
+                    try {
+                      const { findCustomerBySlug } = require('./lib/auth');
+                      const customer = findCustomerBySlug(potentialSlug);
+                      if (customer && customer.id) {
+                        customerId = customer.id;
+                      } else {
+                        // If no customer found for slug, try to find/create BREW customer as catch-all
+                        const brewCustomer = findCustomerBySlug('BREW');
+                        if (brewCustomer && brewCustomer.id) customerId = brewCustomer.id;
+                      }
+                    } catch (e) { /* auth module unavailable, use fallback */ }
+                  }
+                }
+                ingestNumeric({ customerId, key: baseKey, topicKey: baseKey, value: numeric, raw: rawForStore });
+              }
+            }
+          }
+        } catch (e) { /* swallow ingestion errors */ }
         this.emit('message', { topic, payload, seq: this.totalMessages, retained });
       } catch (e) { console.error('next mqtt message error', e && e.stack ? e.stack : e); }
     });
