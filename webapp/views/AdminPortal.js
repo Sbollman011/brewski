@@ -606,6 +606,89 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     }
   }
 
+  // Delete a power label (remove mapping for a single topic/powerKey)
+  async function doDeletePowerLabel(topic, powerKey) {
+    try {
+      const bodyById = initial && initial.id ? { topic, power_key: powerKey, customer_id: initial.id } : null;
+      const bodyBySlug = initial && initial.slug ? { topic, power_key: powerKey, customer_slug: initial.slug } : null;
+      let deleted = false;
+      const tryDelete = async (path, body) => {
+        try { await doFetch(path, { method: 'DELETE', body }); return true; } catch (e) { if (DEBUG) console.warn('AdminPortal: delete failed', path, e && e.message); return false; }
+      };
+
+      if (bodyById) deleted = await tryDelete('/admin/api/power-labels', bodyById);
+      if (!deleted && bodyBySlug) deleted = await tryDelete('/admin/api/power-labels', bodyBySlug);
+      if (!deleted && bodyById) deleted = await tryDelete('/api/power-labels', bodyById);
+      if (!deleted && bodyBySlug) deleted = await tryDelete('/api/power-labels', bodyBySlug);
+
+      if (!deleted) {
+        // Try same-origin fallbacks (browser)
+        if (typeof window !== 'undefined') {
+          try {
+            if (bodyById) {
+              const r = await window.fetch('/admin/api/power-labels', { method: 'DELETE', headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, getAuthHeader()), body: JSON.stringify(bodyById), credentials: 'same-origin' });
+              if (r && r.ok) deleted = true;
+            }
+          } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin delete failed', e && e.message); }
+        }
+      }
+
+      if (!deleted) throw new Error('Delete request failed');
+
+      // Update local powerLabels cache: remove any canonical variants for this topic|powerKey
+      setPowerLabels(prev => {
+        const next = { ...prev };
+        try {
+          const candidates = canonicalCandidatesForTopic(topic);
+          candidates.forEach(t => {
+            delete next[`${t}|${powerKey}`];
+            delete next[`${t}|${powerKey.toUpperCase()}`];
+            delete next[`${t.toUpperCase()}|${powerKey}`];
+            delete next[`${t.toUpperCase()}|${powerKey.toUpperCase()}`];
+          });
+          // also delete the literal topic variants
+          delete next[`${topic}|${powerKey}`];
+          delete next[`${topic}|${powerKey.toUpperCase()}`];
+        } catch (e) {}
+        return next;
+      });
+
+      // Update local UI rows: remove the powerKey from the matching powerStates row
+      setPowerStates(prevRows => {
+        const rows = prevRows.map(r => ({ ...r, powerKeys: { ...r.powerKeys }, labels: { ...r.labels } }));
+        const out = [];
+        for (const r of rows) {
+          if (String(r.topic) === String(topic)) {
+            if (r.powerKeys && r.powerKeys[powerKey]) delete r.powerKeys[powerKey];
+            if (r.labels && r.labels[powerKey]) delete r.labels[powerKey];
+            // If no powerKeys remain, skip this row entirely
+            if (!r.powerKeys || Object.keys(r.powerKeys).length === 0) continue;
+          }
+          out.push(r);
+        }
+        return out;
+      });
+
+      // Refresh authoritative labels in background but don't force a page reload
+      try { await loadPowerLabelsAndStates(); } catch (e) { /* best-effort */ }
+      try { Alert.alert('Deleted', 'Power label removed'); } catch (e) { if (typeof window !== 'undefined') window.alert('Power label removed'); }
+      return true;
+    } catch (e) {
+      if (DEBUG) console.warn('doDeletePowerLabel error', e && e.message);
+      Alert.alert('Delete failed', String(e && e.message));
+      return false;
+    }
+  }
+
+  function confirmDeletePowerLabel(topic, powerKey) {
+    setConfirm({
+      title: 'Delete Power Label',
+      message: `Delete ${powerKey} label for ${topic}? This will remove the input slot; it may be recreated if the device later reports the POWER key again.`,
+      onConfirm: async () => { await doDeletePowerLabel(topic, powerKey); setConfirm(null); },
+      onCancel: () => setConfirm(null)
+    });
+  }
+
   useEffect(() => { loadUsers(); loadTopics(); loadPowerLabelsAndStates(); }, []);
   // Also reload power labels/states whenever the selected customer changes
   useEffect(() => {
@@ -916,13 +999,22 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
                         placeholderTextColor={PLACEHOLDER_COLOR}
                         style={[styles.input, { flex: 1, marginLeft: 8, minWidth: 80 }]}
                       />
-                      <TouchableOpacity
-                        onPress={() => savePowerLabel(row.topic, pk, powerLabels[`${row.topic}|${pk}`] || '')}
-                        style={{ marginLeft: 8, backgroundColor: '#1b5e20', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6 }}
-                        accessibilityLabel={`Save label for ${pk}`}
-                      >
-                        <Text style={{ color: '#fff', fontWeight: '600' }}>Save</Text>
-                      </TouchableOpacity>
+                      <View style={{ flexDirection: 'row', marginLeft: 8, gap: 8 }}>
+                        <TouchableOpacity
+                          onPress={() => savePowerLabel(row.topic, pk, powerLabels[`${row.topic}|${pk}`] || '')}
+                          style={{ backgroundColor: '#1b5e20', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6 }}
+                          accessibilityLabel={`Save label for ${pk}`}
+                        >
+                          <Text style={{ color: '#fff', fontWeight: '600' }}>Save</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity
+                          onPress={() => confirmDeletePowerLabel(row.topic, pk)}
+                          style={{ marginLeft: 4, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6, alignSelf: 'center' }}
+                          accessibilityLabel={`Delete label for ${pk}`}
+                        >
+                          <Text style={{ color: '#b71c1c', fontSize: 13, fontWeight: '700' }}>Delete</Text>
+                        </TouchableOpacity>
+                      </View>
                     </View>
                   ))}
                 </View>
