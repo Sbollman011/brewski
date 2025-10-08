@@ -19,26 +19,48 @@ function startHttpServer(opts = {}) {
   const requestHandler = (req, res) => {
     try {
       let url;
-      try { url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || 'localhost'}`); } catch (err) {
+  // Prefer an explicit SERVER_FQDN when constructing a base URL for parsing.
+  const SERVER_FQDN = process.env.SERVER_FQDN || 'api.brewingremote.com';
+  try { url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || SERVER_FQDN}`); } catch (err) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'invalid_url', detail: String(err && err.message) }));
         return;
       }
 
+      // Diagnostic: log incoming admin/public power-labels requests so we can
+      // correlate browser 502s with server-side activity when tailing cloudflared.
+      try {
+        const originHeader = (req.headers && (req.headers.origin || req.headers['x-forwarded-host'] || req.headers.host)) || '-';
+        if (url.pathname && (url.pathname.includes('/api/power-labels') || url.pathname.startsWith('/admin/api'))) {
+          try { console.log(`[http] ${new Date().toISOString()} ${req.method} ${url.pathname} Origin:${originHeader} CL:${req.headers['content-length'] || 0}`); } catch (e) {}
+        }
+      } catch (e) {}
+
       const setSecurityHeadersLocal = () => setSecurityHeaders(req, res, server);
 
       // Quick health and info endpoints
-      if (req.method === 'OPTIONS') {
-        // Ensure preflight allows the methods the admin SPA will use (PUT/DELETE)
-        setSecurityHeadersLocal();
-        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-        // Allow common headers used by the SPA (JSON body + Authorization header)
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-        res.setHeader('Access-Control-Max-Age', '600');
-        res.writeHead(204);
-        res.end();
-        return;
-      }
+          if (req.method === 'OPTIONS') {
+            // Ensure preflight allows the methods the admin SPA will use (PUT/DELETE)
+            // and returns Access-Control-Allow-Origin when the origin is permitted.
+            setSecurityHeadersLocal();
+            // If getAllowedOrigin helper exists, call it to allow echoing origin
+            try {
+              const { getAllowedOrigin } = require('./lib/security');
+              const allowed = getAllowedOrigin(req);
+              if (allowed) {
+                res.setHeader('Access-Control-Allow-Origin', allowed);
+                res.setHeader('Vary', 'Origin');
+                res.setHeader('Access-Control-Allow-Credentials', 'true');
+              }
+            } catch (e) {}
+            res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+            // Allow common headers used by the SPA (JSON body + Authorization header)
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+            res.setHeader('Access-Control-Max-Age', '600');
+            res.writeHead(204);
+            res.end();
+            return;
+          }
 
       if (url.pathname === '/health') {
         setSecurityHeadersLocal();
@@ -459,12 +481,13 @@ function startHttpServer(opts = {}) {
 
   // Increase keep-alive and headers timeouts to be more forgiving for reverse proxies
   try {
-    // 60s keep-alive, headers timeout slightly larger than keepAlive
-    server.keepAliveTimeout = Number(process.env.SERVER_KEEPALIVE_MS || 60 * 1000);
-    server.headersTimeout = Number(process.env.SERVER_HEADERS_TIMEOUT_MS || 65 * 1000);
+    // Increase defaults to be more forgiving for reverse proxies (cloudflared)
+    // 120s keep-alive, headers timeout slightly larger than keepAlive
+    server.keepAliveTimeout = Number(process.env.SERVER_KEEPALIVE_MS || 120 * 1000);
+    server.headersTimeout = Number(process.env.SERVER_HEADERS_TIMEOUT_MS || 125 * 1000);
   } catch (e) { console.warn('Unable to set server timeouts', e && e.message); }
 
-  server.listen(port, host, () => console.log('http-server listening on', host + ':' + port, server._isHttps ? '(HTTPS)' : '(HTTP)'));
+  server.listen(port, host, () => console.log('http-server listening on', host + ':' + port, server._isHttps ? '(HTTPS)' : '(HTTP)', 'SERVER_FQDN=' + (process.env.SERVER_FQDN || 'api.brewingremote.com')));
 
   return { server, port, host };
 }

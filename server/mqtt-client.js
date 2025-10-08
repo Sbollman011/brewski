@@ -29,7 +29,8 @@ const CONFIG = {
   GROUP_SEGMENT_INDEX: parseInt(process.env.MQTT_GROUP_SEGMENT_INDEX || '1', 10),
   PROTOCOL_RAW: (process.env.MQTT_PROTOCOL || '').toLowerCase(),
   FORCE_TLS: process.env.MQTT_FORCE_TLS === '1',
-  HOST: process.env.MQTT_HOST || process.env.MQTT_BROKER_HOST || '127.0.0.1',
+  // Prefer an explicit MQTT host via env. Fall back to SERVER_FQDN or 127.0.0.1 for legacy.
+  HOST: process.env.MQTT_HOST || process.env.MQTT_BROKER_HOST || process.env.SERVER_FQDN || '127.0.0.1',
   PORT_OVERRIDE: process.env.MQTT_PORT || process.env.MQTT_BROKER_PORT,
   USER: process.env.MQTT_USER || process.env.MQTT_BROKER_USER || process.env.MQTT_INHHOUSE_USER || 'brokeradmin',
   PASS: process.env.MQTT_PASS || process.env.MQTT_BROKER_PASS || process.env.MQTT_INHHOUSE_PASS || 'Heyyou011!',

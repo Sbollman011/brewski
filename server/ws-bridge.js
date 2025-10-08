@@ -72,7 +72,8 @@ function startWsBridge(opts = {}) {
     (async () => {
       try {
         const BRIDGE_TOKEN = effectiveBridgeToken();
-        const urlObj = (() => { try { return new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`); } catch (e) { return { searchParams: new URLSearchParams() }; } })();
+  const SERVER_FQDN = process.env.SERVER_FQDN || 'api.brewingremote.com';
+  const urlObj = (() => { try { return new URL(req.url || '/', `http://${req.headers.host || SERVER_FQDN}`); } catch (e) { return { searchParams: new URLSearchParams() }; } })();
         const authHeader = (req.headers['authorization'] || '').toString();
         const parts = authHeader.split(' ');
         const maybeBearer = (parts.length === 2 && /^Bearer$/i.test(parts[0])) ? parts[1] : null;

@@ -46,19 +46,14 @@ function startPowerStateIngestor() {
   const customerMap = getCustomerSlugMap();
   const catchAllId = customerMap['BREW'];
   if (!catchAllId) {
-    console.error('[power_state_ingestor] No BREW customer found for catch-all. Not ingesting.');
     return;
   }
   mqttClient.registerMessageHandler(({ topic, payload }) => {
-    console.log(`[power_state_ingestor] MQTT message received: topic=${topic}`);
     if (!/\/STATE$/.test(topic)) {
-      // Uncomment to see all non-STATE topics: console.log(`[power_state_ingestor] Skipping non-STATE topic: ${topic}`);
       return;
     }
-    console.log(`[power_state_ingestor] Processing STATE topic: ${topic}`);
     let raw;
     try { raw = typeof payload === 'string' ? JSON.parse(payload) : payload; } catch (e) {
-      console.warn(`[power_state_ingestor] Failed to parse payload for topic ${topic}:`, payload);
       return;
     }
     const slug = extractSlugFromTopic(topic);
@@ -69,14 +64,14 @@ function startPowerStateIngestor() {
         const last = getLastPowerValue(customerId, topic);
         if (last === undefined || last !== val) {
           upsertPowerState(customerId, topic, k, val, JSON.stringify(raw));
-          console.log(`[power_state_ingestor] Upserted: customer=${customerId} topic=${topic} key=${k} value=${raw[k]}`);
+          // suppressed log
         } else {
-          console.log(`[power_state_ingestor] No change for customer=${customerId} topic=${topic} key=${k} value=${raw[k]}`);
+          // suppressed log
         }
       }
     });
   });
-  console.log('[power_state_ingestor] Started and listening for STATE messages.');
+  // started silently
 }
 
 startPowerStateIngestor();

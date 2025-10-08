@@ -1,13 +1,37 @@
 const fs = require('fs');
+// Small helper to safely write a response only if headers haven't been sent yet.
+function safeSend(res, status, body, contentType) {
+  try {
+    if (!res || res.headersSent || res.writableEnded) return;
+    const headers = {};
+    if (contentType) headers['Content-Type'] = contentType;
+    else headers['Content-Type'] = (typeof body === 'string') ? 'text/plain' : 'application/json';
+    res.writeHead(status, headers);
+    res.end(typeof body === 'string' ? body : JSON.stringify(body));
+  } catch (e) {
+    try { console.error('safeSend error', e && e.message); } catch (e) {}
+  }
+}
 const { createUser, findUserByUsername, verifyPassword, signToken, verifyToken, findUserById, updateUserById, updateUserFieldsByUsername } = require('./auth');
 
 function parseBodyJson(req, res, cb) {
   let body = '';
-  req.on('data', c => body += c);
+  let called = false;
+  const done = (err, obj) => {
+    if (called) return;
+    called = true;
+    try { cb(err, obj); } catch (e) { /* swallow callback errors to avoid crashing outer handler */ }
+  };
+  req.on('data', c => { try { body += c; } catch (e) {} });
   req.on('end', () => {
-    try { cb(null, JSON.parse(body || '{}')); } catch (e) { res.writeHead(400); res.end('bad json'); }
+    try {
+      const parsed = JSON.parse(body || '{}');
+      done(null, parsed);
+    } catch (e) {
+      done(new Error('bad_json'));
+    }
   });
-  req.on('error', err => cb(err));
+  req.on('error', err => done(err));
 }
 
 function effectiveBridgeToken() {
@@ -206,11 +230,18 @@ function handleAdminApi(req, res, url) {
 
     // POST /admin/api/power-labels  (create or update a label)
     if (url.pathname === '/admin/api/power-labels' && req.method === 'POST') {
-      return parseBodyJson(req, res, (err, obj) => {
+      parseBodyJson(req, res, (err, obj) => {
         if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
         const { topic, power_key, label, customer_id } = obj || {};
         if (!topic || !power_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
         try {
+          // Lightweight diagnostic logging to help correlate client-side failures
+          // with proxy/origin logs. Avoid logging full request bodies or tokens.
+          try {
+            const originHdr = req.headers && (req.headers.origin || req.headers.referer) ? (req.headers.origin || req.headers.referer) : '<none>';
+            const remote = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : '<unknown>';
+            console.log('[admin-api] POST /admin/api/power-labels ARRIVAL origin=', originHdr, 'remote=', remote, 'body_customer_id=', customer_id ? customer_id : '<none>', 'topic=', topic, 'power_key=', power_key);
+          } catch (e) { /* ignore logging errors */ }
           const { findUserById } = require('./auth');
           const me = findUserById(req.user.id);
           if (!me) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
@@ -232,16 +263,22 @@ function handleAdminApi(req, res, url) {
           }
           
           // Upsert (insert or update)
-          db.prepare('INSERT INTO power_labels (customer_id, topic, power_key, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(customer_id, topic, power_key) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at').run(targetCustomerId, topic, power_key, label, now, now);
+          const info = db.prepare('INSERT INTO power_labels (customer_id, topic, power_key, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(customer_id, topic, power_key) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at').run(targetCustomerId, topic, power_key, label, now, now);
+          // Log successful persistence for correlation with proxy/tunnel logs
+          try {
+            const remote = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : '<unknown>';
+            console.log('[admin-api] POST /admin/api/power-labels PERSISTED user=', me && me.username ? me.username : me && me.id ? me.id : '<unknown>', 'target_customer=', targetCustomerId, 'topic=', topic, 'power_key=', power_key, 'changes=', info && info.changes ? info.changes : 0, 'remote=', remote);
+          } catch (e) { /* ignore logging errors */ }
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
       });
+      return true;
     }
 
     // DELETE /admin/api/power-labels  (delete a label mapping)
     if (url.pathname === '/admin/api/power-labels' && req.method === 'DELETE') {
-      return parseBodyJson(req, res, (err, obj) => {
+      parseBodyJson(req, res, (err, obj) => {
         if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
         const { topic, power_key } = obj || {};
         if (!topic || !power_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
@@ -258,6 +295,7 @@ function handleAdminApi(req, res, url) {
           res.end(JSON.stringify({ ok: true }));
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
       });
+      return true;
     }
 
       // If the route is /admin/api/me return current user info
@@ -578,7 +616,7 @@ function handleAdminApi(req, res, url) {
 
           // PUT /admin/api/users/:id -> update user fields
           if (url.pathname.match(/^\/admin\/api\/users\/\d+$/) && req.method === 'PUT') {
-            return parseBodyJson(req, res, (err, body) => {
+            parseBodyJson(req, res, (err, body) => {
               if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'invalid_json' })); return; }
               const uid = Number(url.pathname.split('/').pop());
               try {
@@ -587,6 +625,7 @@ function handleAdminApi(req, res, url) {
                 return;
               } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'update_failed', message: e && e.message })); return; }
             });
+            return true;
           }
 
           // DELETE /admin/api/users/:id -> delete user
@@ -750,7 +789,10 @@ function handleAdminApi(req, res, url) {
 
       return false; // not handled here
   } catch (e) {
-    res.writeHead(500); res.end('server error'); return true;
+    // Defensive: avoid throwing ERR_HTTP_HEADERS_SENT if some handler already
+    // wrote a response. Use safeSend which checks headersSent/writableEnded.
+    safeSend(res, 500, 'server error', 'text/plain');
+    return true;
   }
 }
 
