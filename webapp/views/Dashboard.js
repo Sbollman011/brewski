@@ -2035,34 +2035,11 @@ function parseJwtPayload(tok) {
     } catch (e) {}
   }
 
-  // RN / in-app visible debug overlay: when DEBUG or running in React Native, render a small
-  // readable panel on-screen so developers can see runtime state without access to console logs.
-  const InAppDebug = () => {
-    if (!DEBUG && !isReactNative) return null;
-    try {
-      const eff = mode || (customerSlug ? String(customerSlug).toUpperCase() : '');
-      const dbCount = dbSensorBases ? (dbSensorBases.size || 0) : 0;
-      const samplePower = Object.keys(powerLabels || {}).slice(0,6).join(', ');
-      return (
-        <View style={{ position: 'absolute', left: 8, right: 8, top: (Constants.statusBarHeight || 20) + 8, backgroundColor: 'rgba(255,255,255,0.92)', padding: 8, borderRadius: 8, borderWidth: 1, borderColor: '#ddd', zIndex: 9999 }}>
-          <Text style={{ fontSize: 12, fontWeight: '700' }}>DEBUG</Text>
-          <Text style={{ fontSize: 11 }}>mode: {String(mode)}</Text>
-          <Text style={{ fontSize: 11 }}>customerSlug: {String(customerSlug)}</Text>
-            <Text style={{ fontSize: 11 }}>customerId: {String(customerId)}</Text>
-            {meDebug ? <Text style={{ fontSize: 10, color: '#444' }} numberOfLines={3}>me: {JSON.stringify(meDebug)}</Text> : null}
-          <Text style={{ fontSize: 11 }}>effectiveMode: {String(eff)}</Text>
-          <Text style={{ fontSize: 11 }}>deviceList: {deviceList ? deviceList.length : 0}  filtered: {filteredDevices ? filteredDevices.length : 0}</Text>
-          <Text style={{ fontSize: 11 }}>dbSensorBases: {dbCount}</Text>
-          <Text style={{ fontSize: 11 }}>powerLabels sample: {samplePower || 'none'}</Text>
-        </View>
-      );
-    } catch (e) { return null; }
-  };
+  // (In-app debug overlay removed after diagnosis.)
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* In-app debug panel for RN / DEBUG mode */}
-      <InAppDebug />
+  {/* In-app debug panel for RN / DEBUG mode (removed) */}
       {DEBUG && (
         <DebugOverlay
           mode={mode}

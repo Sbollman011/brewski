@@ -346,35 +346,23 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     if (!initial) return;
     setLoadingPower(true);
     try {
-      // 1. Fetch all topics for this customer (simulate via /api/latest, scan all sensors for POWER keys)
-      const res = await doFetch('/api/latest');
-      const sensors = (res && res.sensors) ? res.sensors : [];
-      // Get all customer slugs for mapping
+      // We'll primarily fetch power-labels from the server and surface them
+      // in the editor. Relying on `/api/latest` for STATE rows fails when the
+      // caller (admin) is viewing another customer's page and the public
+      // snapshot is scoped to the logged-in user's tenant. Instead derive
+      // editable rows from stored power-labels (which are global/admin-scoped)
+      // and show any STATE topics we can discover.
+      // Get all customer slugs for mapping (best-effort)
       let customerSlugs = [];
       try {
         const custRes = await doFetch('/admin/api/customers');
         if (custRes && custRes.customers) customerSlugs = custRes.customers.map(c => c.slug);
       } catch (e) {}
 
-      // Only process sensors with key ending in /STATE and belonging to this customer (by slug)
-      // We intentionally show POWER rows for the selected customer regardless of the current user's admin role.
-      let powerRows = sensors.map(row => {
-        let powerKeys = {};
-        let topic = row.key || '';
-        if (!/\/STATE$/i.test(topic)) return null;
-        try {
-          const raw = typeof row.last_raw === 'string' ? JSON.parse(row.last_raw) : row.last_raw;
-          Object.keys(raw).forEach(k => {
-            if (/^POWER(\d*)$/i.test(k)) powerKeys[k] = raw[k];
-          });
-        } catch (e) {}
-        // Extract company_slug (level 2 of topic)
-        const topicParts = topic.split('/');
-        const slug = topicParts.length >= 2 ? topicParts[1] : 'BREW';
-        return { topic, powerKeys, assignedCustomer: slug };
-      }).filter(r => r && Object.keys(r.powerKeys).length > 0 && r.assignedCustomer === initial.slug);
-
-  // 2. Fetch all power labels for this customer
+      // 1) Fetch all power labels for this customer (preferred). We'll try admin
+      // and public endpoints using existing attempts below and then build rows
+      // from the returned labels so admins can edit labels even when /api/latest
+      // doesn't include the customer's STATE topics.
       // For admins editing a specific customer, request labels for that customer.
       // Support either numeric customer_id or customer_slug. Prefer same-origin
       // fetches (reduces CORS/tunnel exposure), then try admin endpoint
@@ -444,10 +432,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
         labelRes.labels.forEach(l => {
           const key = `${l.topic}|${l.power_key}`;
           labelMap[key] = l.label;
-          // Add uppercase-normalized variant
           labelMap[key.toUpperCase()] = l.label;
-          // Expand into canonical variants so lookups succeed regardless of
-          // how the topic is formatted in other parts of the app.
           try {
             const candidates = canonicalCandidatesForTopic(l.topic);
             candidates.forEach(t => {
@@ -455,6 +440,8 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
               const k2 = `${t}|${l.power_key.toUpperCase()}`;
               if (!labelMap[k1]) labelMap[k1] = l.label;
               if (!labelMap[k2]) labelMap[k2] = l.label;
+              if (!labelMap[`${t.toUpperCase()}|${l.power_key}`]) labelMap[`${t.toUpperCase()}|${l.power_key}`] = l.label;
+              if (!labelMap[`${t.toUpperCase()}|${l.power_key.toUpperCase()}`]) labelMap[`${t.toUpperCase()}|${l.power_key.toUpperCase()}`] = l.label;
             });
           } catch (e) {}
         });
@@ -462,33 +449,47 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
         if (DEBUG) console.log('AdminPortal: No power labels received or invalid response:', labelRes);
       }
 
-      // 3. Merge labels into powerRows
-      // Use the same canonical candidate expansion as lookupPowerLabel so
-      // labels resolve the same way the Dashboard does (tele/, case, RAIL/BREW, etc.).
-      const merged = powerRows.map(r => {
-        const labelsForRow = {};
-        const topicCandidates = canonicalCandidatesForTopic(r.topic);
-        Object.keys(r.powerKeys).forEach(pk => {
-          let found = '';
-          const upKey = pk.toUpperCase();
-          // try each candidate topic and both key casings
-          for (const t of topicCandidates) {
-            const k1 = `${t}|${pk}`;
-            const k2 = `${t}|${upKey}`;
-            if (labelMap[k1] && String(labelMap[k1]).trim()) { found = String(labelMap[k1]).trim(); break; }
-            if (labelMap[k2] && String(labelMap[k2]).trim()) { found = String(labelMap[k2]).trim(); break; }
-          }
-          // fallback to raw topic form
-          if (!found) {
-            const raw1 = `${r.topic}|${pk}`;
-            const raw2 = `${r.topic}|${pk.toUpperCase()}`;
-            if (labelMap[raw1] && String(labelMap[raw1]).trim()) found = String(labelMap[raw1]).trim();
-            else if (labelMap[raw2] && String(labelMap[raw2]).trim()) found = String(labelMap[raw2]).trim();
-          }
-          labelsForRow[pk] = found || '';
-        });
-        return { ...r, labels: labelsForRow };
-      });
+      // If the sensors snapshot didn't include STATE topics for this customer
+      // (common when admin is viewing another tenant), derive editable rows
+      // from the label records themselves so admins can edit labels for any
+      // customer. Group labels by topic and expose the power_key slots.
+      const topicToKeys = {};
+      if (labelRes && Array.isArray(labelRes.labels)) {
+        // prepare case-insensitive known slugs for robust matching
+        const knownSlugsLower = (customerSlugs || []).map(s => String(s || '').toLowerCase());
+        const initialSlugLower = initial && initial.slug ? String(initial.slug).toLowerCase() : '';
+        for (const l of labelRes.labels) {
+          try {
+            if (!l || !l.topic) continue;
+            const t = l.topic;
+            // only consider STATE topics (where labels are meaningful)
+            if (!/\/STATE$/i.test(t)) continue;
+            // determine assigned customer from topic (level 2)
+            const parts = t.split('/');
+            let slug = parts.length >= 2 ? parts[1] : 'BREW';
+            const slugLower = String(slug || '').toLowerCase();
+
+            // If the second-level token doesn't match any known customer slug
+            // and we're editing the BREW customer, treat it as BREW so that
+            // non-standard topics (the BREW customer's edge case) surface
+            // in the editor. This avoids losing labels when the org token is
+            // missing or malformed.
+            if (knownSlugsLower.length > 0 && knownSlugsLower.indexOf(slugLower) === -1) {
+              if (initialSlugLower === 'brew') {
+                slug = 'BREW';
+              }
+            }
+
+            // final comparison should be case-insensitive
+            if (String(slug || '').toLowerCase() !== initialSlugLower) continue;
+            if (!topicToKeys[t]) topicToKeys[t] = {};
+            topicToKeys[t][l.power_key] = '';
+          } catch (e) {}
+        }
+      }
+
+      // Build powerRows from topicToKeys
+      const merged = Object.keys(topicToKeys).map(topic => ({ topic, powerKeys: topicToKeys[topic], assignedCustomer: initial.slug, labels: Object.keys(topicToKeys[topic]).reduce((acc, pk) => ({ ...acc, [pk]: labelMap[`${topic}|${pk}`] || labelMap[`${topic}|${pk.toUpperCase()}`] || '' }), {}) }));
       setPowerStates(merged);
       setPowerLabels(labelMap);
     } catch (e) { setPowerStates([]); setPowerLabels({}); }
