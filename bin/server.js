@@ -11,6 +11,7 @@ function main() {
   // Load persisted MQTT latest values if available
   try { mqttClient.loadPersisted && mqttClient.loadPersisted(); } catch (e) {}
 
+
   mqttClient.on('connect', info => {
     console.log('[mqtt] connected via', info.connectionName, info.brokerUrl);
   });
@@ -19,6 +20,9 @@ function main() {
     console.error('[mqtt] fatal error', err && err.message ? err.message : err);
   });
   mqttClient.start();
+
+  // Start power state ingestion after mqttClient is ready (no circular dependency)
+  try { require('../server/power_state_ingestor'); } catch (e) { console.error('[server.js] Failed to start power_state_ingestor:', e && e.message); }
 
   // Start HTTP server first (so WS upgrades can attach)
   const http = startHttpServer({});

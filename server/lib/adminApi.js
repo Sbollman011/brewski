@@ -154,8 +154,111 @@ function handleAdminApi(req, res, url) {
         res.end(JSON.stringify({ error: 'invalid_token' }));
         return true;
       }
-        req.user = { id: claims.sub, username: claims.username };
-      }
+      req.user = { id: claims.sub, username: claims.username };
+    }
+
+    // --- POWER LABELS ENDPOINTS ---
+    // GET /admin/api/power-labels?topic=...&customer_id=...  (list labels, admins can specify customer_id or see all)
+    if (url.pathname === '/admin/api/power-labels' && req.method === 'GET') {
+      try {
+        const { findUserById } = require('./auth');
+        const me = findUserById(req.user.id);
+        if (!me) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+        const Database = require('better-sqlite3');
+        const path = require('path');
+        const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+        const db = new Database(DB_PATH);
+        const topic = url.searchParams.get('topic');
+        const requestedCustomerId = url.searchParams.get('customer_id');
+        
+        let rows;
+        const isAdmin = Number(me.is_admin) === 1;
+        
+        if (isAdmin && !requestedCustomerId) {
+          // Admin requesting all labels across all customers
+          if (topic) {
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE topic = ? ORDER BY customer_id, topic, power_key').all(topic);
+          } else {
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels ORDER BY customer_id, topic, power_key').all();
+          }
+        } else if (isAdmin && requestedCustomerId) {
+          // Admin requesting labels for specific customer
+          const customerId = Number(requestedCustomerId);
+          if (topic) {
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(customerId, topic);
+          } else {
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(customerId);
+          }
+        } else {
+          // Regular user - only their own customer's labels
+          if (!me.customer_id) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
+          if (topic) {
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(me.customer_id, topic);
+          } else {
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(me.customer_id);
+          }
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, labels: rows }));
+      } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+      return true;
+    }
+
+    // POST /admin/api/power-labels  (create or update a label)
+    if (url.pathname === '/admin/api/power-labels' && req.method === 'POST') {
+      return parseBodyJson(req, res, (err, obj) => {
+        if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+        const { topic, power_key, label, customer_id } = obj || {};
+        if (!topic || !power_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+        try {
+          const { findUserById } = require('./auth');
+          const me = findUserById(req.user.id);
+          if (!me) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
+          const Database = require('better-sqlite3');
+          const path = require('path');
+          const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+          const db = new Database(DB_PATH);
+          const now = Date.now();
+          
+          // Determine target customer ID
+          let targetCustomerId;
+          if (Number(me.is_admin) === 1 && customer_id) {
+            // Admin can specify customer_id
+            targetCustomerId = Number(customer_id);
+          } else {
+            // Regular users use their own customer_id
+            if (!me.customer_id) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
+            targetCustomerId = me.customer_id;
+          }
+          
+          // Upsert (insert or update)
+          db.prepare('INSERT INTO power_labels (customer_id, topic, power_key, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(customer_id, topic, power_key) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at').run(targetCustomerId, topic, power_key, label, now, now);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+      });
+    }
+
+    // DELETE /admin/api/power-labels  (delete a label mapping)
+    if (url.pathname === '/admin/api/power-labels' && req.method === 'DELETE') {
+      return parseBodyJson(req, res, (err, obj) => {
+        if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
+        const { topic, power_key } = obj || {};
+        if (!topic || !power_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+        try {
+          const { findUserById } = require('./auth');
+          const me = findUserById(req.user.id);
+          if (!me || !me.customer_id) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
+          const Database = require('better-sqlite3');
+          const path = require('path');
+          const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+          const db = new Database(DB_PATH);
+          db.prepare('DELETE FROM power_labels WHERE customer_id = ? AND topic = ? AND power_key = ?').run(me.customer_id, topic, power_key);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+      });
+    }
 
       // If the route is /admin/api/me return current user info
       if (url.pathname === '/admin/api/me' && req.method === 'GET') {

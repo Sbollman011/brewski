@@ -1,4 +1,11 @@
 // Future version of mqtt-client: snapshot for upcoming multi-device / refined topic strategy.
+
+// Message handler registry for external modules (e.g., power_state_ingestor)
+const _externalMessageHandlers = [];
+function registerMessageHandler(fn) {
+  if (typeof fn === 'function') _externalMessageHandlers.push(fn);
+}
+// Power state ingestor: require from main server entry point, not here, to avoid circular dependency.
 // This file is NOT loaded in production yet. Keep original mqtt-client.js unchanged.
 // Differences you can stage here later:
 //  - Ability to switch subscription set dynamically (setTopics)
@@ -209,6 +216,16 @@ class NextMqttClient extends EventEmitter {
             }
           }
         } catch (e) { /* swallow ingestion errors */ }
+
+        // Call external message handlers
+        for (const fn of _externalMessageHandlers) {
+          try {
+            fn({ topic, payload, packet });
+          } catch (e) {
+            console.error('[mqtt-client] External message handler error:', e && e.message);
+          }
+        }
+
         this.emit('message', { topic, payload, seq: this.totalMessages, retained });
       } catch (e) { console.error('next mqtt message error', e && e.stack ? e.stack : e); }
     });
@@ -327,4 +344,6 @@ class NextMqttClient extends EventEmitter {
   }
 }
 
-module.exports = new NextMqttClient();
+const clientInstance = new NextMqttClient();
+clientInstance.registerMessageHandler = registerMessageHandler;
+module.exports = clientInstance;

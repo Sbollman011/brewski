@@ -1,7 +1,7 @@
 const path = require('path');
 
 // CORS whitelist
-const allowedOrigins = (process.env.APP_ORIGINS || 'https://brewingremote.com,https://localhost:19006')
+const allowedOrigins = (process.env.APP_ORIGINS || 'https://api.brewingremote.com,https://brewingremote.com,https://localhost:19006')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 // Rate limiter config
@@ -32,11 +32,27 @@ function setSecurityHeaders(req, res, server) {
   if (!res || typeof res.setHeader !== 'function') return;
   try {
     const origin = req && req.headers && req.headers.origin;
-    if (origin && allowedOrigins.includes(origin)) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-      // Allow cookies / Authorization headers when needed (JWT / legacy tokens)
-      res.setHeader('Access-Control-Allow-Credentials', 'true');
+    if (origin) {
+      // allow explicit list OR any subdomain of brewingremote.com OR localhost/127.0.0.1
+      let originAllowed = false;
+      try {
+        const parsed = new URL(origin);
+        const host = (parsed.hostname || '').toLowerCase();
+        if (allowedOrigins.includes(origin)) originAllowed = true;
+        if (host === 'brewingremote.com' || host.endsWith('.brewingremote.com')) originAllowed = true;
+        if (host === 'localhost' || host === '127.0.0.1') originAllowed = true;
+      } catch (e) {
+        // If origin isn't a valid URL string, fall back to direct comparison
+        if (allowedOrigins.includes(origin)) originAllowed = true;
+      }
+      if (originAllowed) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Vary', 'Origin');
+        // Allow cookies / Authorization headers when needed (JWT / legacy tokens)
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        // Allow common headers used by the SPA
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept');
+      }
     }
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('X-Frame-Options', 'DENY');

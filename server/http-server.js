@@ -99,6 +99,60 @@ function startHttpServer(opts = {}) {
         return;
       }
 
+      if (url.pathname === '/api/power-labels' && req.method === 'GET') {
+        setSecurityHeadersLocal();
+        try {
+          // Auth: Bearer JWT or bridge token
+          const authHeader = (req.headers['authorization'] || '').toString();
+          const parts = authHeader.split(' ');
+          let token = null;
+          if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
+          if (!token) token = url.searchParams.get('token');
+          const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
+          let user = null;
+          if (token) {
+            if (BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
+              user = { id: 'bridge', customer_id: 1, is_admin: 1 };
+            } else {
+              try {
+                const { verifyToken, findUserById } = require('./lib/auth');
+                const claims = verifyToken(token);
+                if (claims) {
+                  const u = findUserById(claims.sub);
+                  if (u) user = u;
+                }
+              } catch (e) {}
+            }
+          }
+          if (!user) {
+            res.writeHead(401, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+            return;
+          }
+          const customerId = Number(user.customer_id || 1);
+          const Database = require('better-sqlite3');
+          const dbPath = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, 'brewski.sqlite3');
+          const db = new Database(dbPath);
+          const topic = url.searchParams.get('topic');
+          let rows;
+          if (topic) {
+            rows = db.prepare('SELECT id, topic, power_key, label FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(customerId, topic);
+          } else {
+            rows = db.prepare('SELECT id, topic, power_key, label FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(customerId);
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
+          res.end(JSON.stringify({ 
+            ok: true, 
+            labels: rows
+          }));
+          try { db.close(); } catch (e) {}
+        } catch (e) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'server_error', detail: e && e.message }));
+        }
+        return;
+      }
+
       if (url.pathname === '/info') {
         const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : process.env.BRIDGE_TOKEN || null;
         const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');
@@ -402,6 +456,13 @@ function startHttpServer(opts = {}) {
   }
 
   server.on('error', err => console.error('http-server error:', err && err.message ? err.message : err));
+
+  // Increase keep-alive and headers timeouts to be more forgiving for reverse proxies
+  try {
+    // 60s keep-alive, headers timeout slightly larger than keepAlive
+    server.keepAliveTimeout = Number(process.env.SERVER_KEEPALIVE_MS || 60 * 1000);
+    server.headersTimeout = Number(process.env.SERVER_HEADERS_TIMEOUT_MS || 65 * 1000);
+  } catch (e) { console.warn('Unable to set server timeouts', e && e.message); }
 
   server.listen(port, host, () => console.log('http-server listening on', host + ':' + port, server._isHttps ? '(HTTPS)' : '(HTTP)'));
 

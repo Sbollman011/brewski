@@ -5,6 +5,10 @@ import Header from '../components/Header';
 const PLACEHOLDER_COLOR = '#555';
 import { apiFetch } from '../src/api';
 
+// Toggle verbose debug logging for local troubleshooting. Set to true only when
+// actively debugging; keep false in normal use to avoid noisy console output.
+const DEBUG = false;
+
 const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
   const API_HOST = 'api.brewingremote.com';
   const token = typeof tokenProvider === 'function' ? tokenProvider() : tokenProvider;
@@ -14,21 +18,46 @@ const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
   const method = opts.method || 'GET';
   const body = opts.body && method !== 'GET' ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : undefined;
 
-  // Always build absolute URL for /admin/api when not already absolute to avoid HTML SPA responses.
+  // Build URL for admin paths. In browser contexts prefer same-origin relative paths
+  // to avoid cross-origin requests and CORS issues. For native (no `window`) use the
+  // configured API_HOST absolute URL.
   let finalUrl = path;
-  if (typeof path === 'string' && path.startsWith('/admin/api')) {
-    finalUrl = `https://${API_HOST}${path}`;
+  if (typeof path === 'string' && (path.startsWith('/admin/api') || path.startsWith('/api/'))) {
+    if (typeof window !== 'undefined') {
+      // Browser: if the page is served from the API host already, use relative path.
+      // Otherwise, call the API host directly so requests reach the real server.
+      try {
+        const pageHost = (window.location && window.location.hostname) ? window.location.hostname : null;
+        if (pageHost && pageHost.toLowerCase() === API_HOST.toLowerCase()) {
+          finalUrl = path; // same host
+        } else {
+          finalUrl = `https://${API_HOST}${path}`; // call API host directly (cross-origin)
+        }
+      } catch (e) {
+        finalUrl = `https://${API_HOST}${path}`;
+      }
+    } else {
+      // Native/Server: build absolute URL to the API host
+      finalUrl = `https://${API_HOST}${path}`;
+    }
   } else if (typeof path === 'string' && !/^https?:/i.test(path)) {
-    // Non admin relative path – leave as-is (same-origin) on web, but on native prefix.
+    // Non-admin relative path – leave as-is (same-origin) on web. On native, prefix the API host.
     if (typeof window === 'undefined') {
       finalUrl = `https://${API_HOST}${path.startsWith('/') ? path : '/' + path}`;
     }
   }
 
-  const res = await fetch(finalUrl, { method, headers, body });
+  // Use CORS mode when calling an absolute API host from a browser to ensure proper preflight
+  const fetchOpts = { method, headers, body };
+  try {
+    if (typeof window !== 'undefined' && typeof finalUrl === 'string' && finalUrl.toLowerCase().indexOf(API_HOST.toLowerCase()) !== -1) {
+      fetchOpts.mode = 'cors';
+    }
+  } catch (e) {}
+  const res = await fetch(finalUrl, fetchOpts);
   if (res.status === 401) {
-    if (token) {
-      // Helpful diagnostic only if we *thought* we had a token
+    if (token && DEBUG) {
+      // Helpful diagnostic only when verbose debugging is enabled
       console.warn('doFetch 401 with token present, path=', path);
     }
     let bodyTxt = '';
@@ -39,6 +68,7 @@ const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
   }
   if (!res.ok) {
     const txt = await res.text().catch(() => '');
+    if (DEBUG) console.error('doFetch non-ok response', { url: finalUrl, status: res.status, body: txt });
     throw new Error(`HTTP ${res.status} ${txt}`);
   }
   try { return await res.json(); } catch (e) { return {}; }
@@ -113,7 +143,7 @@ export default function AdminPortal({ currentUser, loadingUser, token }) {
         setTotal(res.total || res.customers.length);
       }
     } catch (e) {
-      console.error('loadPage error', e && e.message);
+      if (DEBUG) console.error('loadPage error', e && e.message);
       if (e && e.status === 401) {
         // Only clear token if we expected admin access
         try { localStorage.removeItem('brewski_jwt'); } catch (err) {}
@@ -232,6 +262,289 @@ function ConfirmModal({ visible, title, message, onCancel, onConfirm }) {
 }
 
 function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }) {
+  // Power label state
+  const [powerStates, setPowerStates] = useState([]); // [{ topic, powerKeys: { POWER1: 'ON', ... }, labels: { POWER1: 'Pump', ... } }]
+  const [powerLabels, setPowerLabels] = useState({}); // { topic|powerKey: label }
+  const [loadingPower, setLoadingPower] = useState(false);
+
+  // Produce a set of canonical candidate keys for a topic so label lookups
+  // behave the same as the Dashboard canonicalization. Return an array of
+  // topic strings (without the "|POWERx" suffix). Consumers will append
+  // the power key as needed.
+  const canonicalCandidatesForTopic = (topic) => {
+    if (!topic) return [];
+    const candidates = new Set();
+    try {
+      candidates.add(topic);
+      candidates.add(topic.toUpperCase());
+
+      // tele/<cust>/<device>/STATE -> tele/<device>/STATE (legacy)
+      const m = topic.match(/^tele\/([^/]+)\/([^/]+)\/STATE$/i);
+      if (m) {
+        const device = m[2];
+        candidates.add(`tele/${device}/STATE`);
+        candidates.add(`tele/${device}/STATE`.toUpperCase());
+      }
+
+      // Swap common customer tokens RAIL <-> BREW
+      if (/\/RAIL\//i.test(topic)) {
+        candidates.add(topic.replace(/\/RAIL\//i, '/BREW/'));
+        candidates.add(topic.replace(/\/RAIL\//i, '/BREW/').toUpperCase());
+      } else if (/\/BREW\//i.test(topic)) {
+        candidates.add(topic.replace(/\/BREW\//i, '/RAIL/'));
+        candidates.add(topic.replace(/\/BREW\//i, '/RAIL/').toUpperCase());
+      }
+
+      // Try topic without leading tele/
+      if (/^tele\//i.test(topic)) {
+        const noTele = topic.replace(/^tele\//i, '');
+        candidates.add(noTele);
+        candidates.add(noTele.toUpperCase());
+      }
+    } catch (e) {
+      // swallow
+    }
+    return Array.from(candidates);
+  };
+
+  // Flexible lookup for label variants — topics may be stored with/without "tele/",
+  // with different customer prefixes (RAIL vs BREW), or with different case. Try a
+  // set of likely permutations and return the first non-empty label found.
+  const lookupPowerLabel = (topic, powerKey) => {
+    if (!topic || !powerKey) return '';
+    const upKey = powerKey.toUpperCase();
+    // Build candidates by combining canonical topic variants with both key cases
+    const topicCandidates = canonicalCandidatesForTopic(topic);
+    for (const t of topicCandidates) {
+      const rawKey = `${t}|${powerKey}`;
+      const upKeyRaw = `${t}|${upKey}`;
+      if (powerLabels[rawKey] && String(powerLabels[rawKey]).trim()) return String(powerLabels[rawKey]).trim();
+      if (powerLabels[upKeyRaw] && String(powerLabels[upKeyRaw]).trim()) return String(powerLabels[upKeyRaw]).trim();
+    }
+    // As a last resort, try original topic with both key casings
+    const trial1 = `${topic}|${powerKey}`;
+    const trial2 = `${topic}|${upKey}`;
+    if (powerLabels[trial1] && String(powerLabels[trial1]).trim()) return String(powerLabels[trial1]).trim();
+    if (powerLabels[trial2] && String(powerLabels[trial2]).trim()) return String(powerLabels[trial2]).trim();
+    return '';
+  };
+
+  // Fetch latest STATE topics and power labels
+  async function loadPowerLabelsAndStates() {
+    if (!initial) return;
+    setLoadingPower(true);
+    try {
+      // 1. Fetch all topics for this customer (simulate via /api/latest, scan all sensors for POWER keys)
+      const res = await doFetch('/api/latest');
+      const sensors = (res && res.sensors) ? res.sensors : [];
+      // Get all customer slugs for mapping
+      let customerSlugs = [];
+      try {
+        const custRes = await doFetch('/admin/api/customers');
+        if (custRes && custRes.customers) customerSlugs = custRes.customers.map(c => c.slug);
+      } catch (e) {}
+
+      // Only process sensors with key ending in /STATE and belonging to this customer (by slug)
+      // We intentionally show POWER rows for the selected customer regardless of the current user's admin role.
+      let powerRows = sensors.map(row => {
+        let powerKeys = {};
+        let topic = row.key || '';
+        if (!/\/STATE$/i.test(topic)) return null;
+        try {
+          const raw = typeof row.last_raw === 'string' ? JSON.parse(row.last_raw) : row.last_raw;
+          Object.keys(raw).forEach(k => {
+            if (/^POWER(\d*)$/i.test(k)) powerKeys[k] = raw[k];
+          });
+        } catch (e) {}
+        // Extract company_slug (level 2 of topic)
+        const topicParts = topic.split('/');
+        const slug = topicParts.length >= 2 ? topicParts[1] : 'BREW';
+        return { topic, powerKeys, assignedCustomer: slug };
+      }).filter(r => r && Object.keys(r.powerKeys).length > 0 && r.assignedCustomer === initial.slug);
+
+  // 2. Fetch all power labels for this customer
+      // For admins editing a specific customer, request labels for that customer.
+      // Support either numeric customer_id or customer_slug. Try admin endpoint
+      // first, then public /api, and finally retry using same-origin relative
+      // fetch if cross-origin calls fail (helps when proxy/CORS vary between deploys).
+      if (DEBUG) console.log(`AdminPortal: Fetching power labels for customer id=${initial.id} slug=${initial.slug}`);
+      let labelRes = null;
+      const tryAdmin = async (q) => {
+        try {
+          const path = q ? `/admin/api/power-labels?${q}` : `/admin/api/power-labels`;
+          return await doFetch(path);
+        } catch (e) { throw e; }
+      };
+      const tryPublic = async (q) => {
+        try {
+          const path = q ? `/api/power-labels?${q}` : `/api/power-labels`;
+          return await doFetch(path);
+        } catch (e) { throw e; }
+      };
+
+      const qById = initial.id ? `customer_id=${encodeURIComponent(initial.id)}` : null;
+      const qBySlug = initial.slug ? `customer_slug=${encodeURIComponent(initial.slug)}` : null;
+
+  // Attempt order:
+  // 1) admin with no filter (admins can see all labels) — helps admin editors see labels across customers
+  // 2) admin by id, admin by slug
+  // 3) public by id, public by slug
+  const attempts = [];
+  attempts.push(() => tryAdmin(null));
+  if (qById) attempts.push(() => tryAdmin(qById));
+  if (qBySlug) attempts.push(() => tryAdmin(qBySlug));
+  if (qById) attempts.push(() => tryPublic(qById));
+  if (qBySlug) attempts.push(() => tryPublic(qBySlug));
+
+      for (const fn of attempts) {
+        try {
+          labelRes = await fn();
+          if (labelRes) break;
+        } catch (e) {
+          if (DEBUG) console.warn('AdminPortal: power-label attempt failed', e && e.message);
+          labelRes = null;
+        }
+      }
+
+      // If still null, try same-origin fetches directly (bypass doFetch host selection)
+      if (!labelRes && typeof window !== 'undefined') {
+        try {
+          if (qById) {
+            const r = await window.fetch(`/admin/api/power-labels?${qById}`, { credentials: 'same-origin' });
+            if (r && r.ok) labelRes = await r.json();
+          }
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin?id fetch failed', e && e.message); }
+        try {
+          if (!labelRes && qBySlug) {
+            const r2 = await window.fetch(`/admin/api/power-labels?${qBySlug}`, { credentials: 'same-origin' });
+            if (r2 && r2.ok) labelRes = await r2.json();
+          }
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin?slug fetch failed', e && e.message); }
+      }
+      const labelMap = {};
+      if (labelRes && labelRes.labels) {
+        if (DEBUG) console.log(`AdminPortal: Received ${labelRes.labels.length} power labels`, labelRes.labels);
+        labelRes.labels.forEach(l => {
+          const key = `${l.topic}|${l.power_key}`;
+          labelMap[key] = l.label;
+          // Add uppercase-normalized variant
+          labelMap[key.toUpperCase()] = l.label;
+          // Expand into canonical variants so lookups succeed regardless of
+          // how the topic is formatted in other parts of the app.
+          try {
+            const candidates = canonicalCandidatesForTopic(l.topic);
+            candidates.forEach(t => {
+              const k1 = `${t}|${l.power_key}`;
+              const k2 = `${t}|${l.power_key.toUpperCase()}`;
+              if (!labelMap[k1]) labelMap[k1] = l.label;
+              if (!labelMap[k2]) labelMap[k2] = l.label;
+            });
+          } catch (e) {}
+        });
+      } else {
+        if (DEBUG) console.log('AdminPortal: No power labels received or invalid response:', labelRes);
+      }
+
+      // 3. Merge labels into powerRows
+      // Use the same canonical candidate expansion as lookupPowerLabel so
+      // labels resolve the same way the Dashboard does (tele/, case, RAIL/BREW, etc.).
+      const merged = powerRows.map(r => {
+        const labelsForRow = {};
+        const topicCandidates = canonicalCandidatesForTopic(r.topic);
+        Object.keys(r.powerKeys).forEach(pk => {
+          let found = '';
+          const upKey = pk.toUpperCase();
+          // try each candidate topic and both key casings
+          for (const t of topicCandidates) {
+            const k1 = `${t}|${pk}`;
+            const k2 = `${t}|${upKey}`;
+            if (labelMap[k1] && String(labelMap[k1]).trim()) { found = String(labelMap[k1]).trim(); break; }
+            if (labelMap[k2] && String(labelMap[k2]).trim()) { found = String(labelMap[k2]).trim(); break; }
+          }
+          // fallback to raw topic form
+          if (!found) {
+            const raw1 = `${r.topic}|${pk}`;
+            const raw2 = `${r.topic}|${pk.toUpperCase()}`;
+            if (labelMap[raw1] && String(labelMap[raw1]).trim()) found = String(labelMap[raw1]).trim();
+            else if (labelMap[raw2] && String(labelMap[raw2]).trim()) found = String(labelMap[raw2]).trim();
+          }
+          labelsForRow[pk] = found || '';
+        });
+        return { ...r, labels: labelsForRow };
+      });
+      setPowerStates(merged);
+      setPowerLabels(labelMap);
+    } catch (e) { setPowerStates([]); setPowerLabels({}); }
+    setLoadingPower(false);
+  }
+
+  // Save a label
+  async function savePowerLabel(topic, powerKey, label) {
+    try {
+      // Prefer admin API; fall back to public API if admin is not accessible to this caller
+      const bodyById = initial && initial.id ? { topic, power_key: powerKey, label, customer_id: initial.id } : null;
+      const bodyBySlug = initial && initial.slug ? { topic, power_key: powerKey, label, customer_slug: initial.slug } : null;
+      let saved = false;
+      const tryPost = async (path, body) => {
+        try { await doFetch(path, { method: 'POST', body }); return true; } catch (e) { if (DEBUG) console.warn('AdminPortal: post failed', path, e && e.message); return false; }
+      };
+
+      if (bodyById) saved = await tryPost('/admin/api/power-labels', bodyById);
+      if (!saved && bodyBySlug) saved = await tryPost('/admin/api/power-labels', bodyBySlug);
+      if (!saved && bodyById) saved = await tryPost('/api/power-labels', bodyById);
+      if (!saved && bodyBySlug) saved = await tryPost('/api/power-labels', bodyBySlug);
+
+      // Final attempt: try same-origin relative POSTs when running in browser
+      if (!saved && typeof window !== 'undefined') {
+        try {
+          if (bodyById) {
+            const r = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyById), credentials: 'same-origin' });
+            if (r && r.ok) saved = true;
+          }
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin post failed', e && e.message); }
+        try {
+          if (!saved && bodyBySlug) {
+            const r2 = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyBySlug), credentials: 'same-origin' });
+            if (r2 && r2.ok) saved = true;
+          }
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin slug post failed', e && e.message); }
+      }
+
+      if (!saved) throw new Error('save failed');
+      // Update local cache under canonical variants so other views (Dashboard)
+      // can immediately pick up the label regardless of stored topic formatting.
+      setPowerLabels(l => {
+        const next = { ...l };
+        const upKey = powerKey.toUpperCase();
+        // expand into all canonical topic candidates
+        try {
+          const candidates = canonicalCandidatesForTopic(topic);
+          candidates.forEach(t => {
+            next[`${t}|${powerKey}`] = label;
+            next[`${t}|${upKey}`] = label;
+            // Uppercased topic variant as well
+            next[`${t.toUpperCase()}|${powerKey}`] = label;
+            next[`${t.toUpperCase()}|${upKey}`] = label;
+          });
+        } catch (e) {
+          // fallback to a few common variants
+          next[`${topic}|${powerKey}`] = label;
+          next[`${topic}|${upKey}`] = label;
+          next[`${topic.toUpperCase()}|${powerKey}`] = label;
+          next[`${topic.toUpperCase()}|${upKey}`] = label;
+        }
+        return next;
+      });
+      // Refresh authoritative labels from server so UI stays accurate and in-sync.
+      try { await loadPowerLabelsAndStates(); } catch (e) { /* best-effort */ }
+    } catch (e) { Alert.alert('Save failed', String(e && e.message)); }
+  }
+
+  useEffect(() => { loadUsers(); loadTopics(); loadPowerLabelsAndStates(); }, []);
+  // Also reload power labels/states whenever the selected customer changes
+  useEffect(() => {
+    if (initial) loadPowerLabelsAndStates();
+  }, [initial && initial.id, initial && initial.slug]);
   const [slug, setSlug] = useState(initial ? initial.slug : '');
   const [name, setName] = useState(initial ? initial.name : '');
   // New: support two host fields; fall back to legacy controller_ip if present
@@ -255,7 +568,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     try {
       const res = await doFetch(`/admin/api/customers/${initial.id}/users`);
       if (res && res.users) setUsers(res.users);
-    } catch (e) { console.error('loadUsers', e && e.message); }
+    } catch (e) { if (DEBUG) console.error('loadUsers', e && e.message); }
   }
 
   async function createUser() {
@@ -271,9 +584,20 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   async function loadTopics() {
     if (!initial || !initial.id) return;
     try {
-      const res = await doFetch(`/admin/api/customers/${initial.id}/topics`);
+      // If initial.id looks numeric, use the per-customer path. Otherwise fallback
+      // to the generic topics endpoint and filter by customer_slug to avoid
+      // POSTing/GETting to /admin/api/customers/default/topics which the server
+      // rejects with 400 when 'default' is not a numeric id.
+      let res;
+      if (initial && initial.id && Number(initial.id) && !Number.isNaN(Number(initial.id))) {
+        res = await doFetch(`/admin/api/customers/${initial.id}/topics`);
+      } else {
+        // use generic endpoint and pass slug as query param
+        const slug = initial && initial.slug ? encodeURIComponent(initial.slug) : '';
+        res = await doFetch(`/admin/api/customers/topics?customer_slug=${slug}`);
+      }
       if (res && res.topics) setTopics(res.topics);
-    } catch (e) { console.error('loadTopics', e && e.message); setTopics([]); }
+    } catch (e) { if (DEBUG) console.error('loadTopics', e && e.message); setTopics([]); }
   }
 
 
@@ -281,10 +605,25 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   async function createTopic() {
     if (!initial || !initial.id) return;
     try {
-      await doFetch(`/admin/api/customers/${initial.id}/topics`, { method: 'POST', body: { topic_key: newTopicKey } });
+      // Prefer per-customer path when we have a numeric id. Otherwise POST to
+      // the generic topics endpoint and include customer_slug so server can
+      // associate the topic correctly (avoids 400 for slug-like ids such as 'default').
+      let attemptedPath, attemptedBody;
+      if (initial && initial.id && Number(initial.id) && !Number.isNaN(Number(initial.id))) {
+        attemptedPath = `/admin/api/customers/${initial.id}/topics`;
+        attemptedBody = { topic_key: newTopicKey };
+        await doFetch(attemptedPath, { method: 'POST', body: attemptedBody });
+      } else {
+        attemptedPath = `/admin/api/customers/topics`;
+        attemptedBody = { topic_key: newTopicKey, customer_slug: initial && initial.slug ? initial.slug : undefined };
+        await doFetch(attemptedPath, { method: 'POST', body: attemptedBody });
+      }
       setNewTopicKey('');
       loadTopics();
-    } catch (e) { Alert.alert('Create topic failed', String(e && e.message)); }
+    } catch (e) {
+      try { console.warn('AdminPortal.createTopic failed', { attemptedPath, attemptedBody, error: (e && e.message) || e }); } catch (er) {}
+      Alert.alert('Create topic failed', String(e && e.message));
+    }
   }
 
   useEffect(() => { loadUsers(); loadTopics(); }, []);
@@ -296,10 +635,10 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     setConfirm({
       title: 'Delete User',
       message: 'Are you sure you want to delete this user?',
-      onConfirm: async () => {
+          onConfirm: async () => {
         try {
           const res = await doFetch(`/admin/api/users/${userId}`, { method: 'DELETE' });
-          console.log('deleteUser response', res);
+          if (DEBUG) console.log('deleteUser response', res);
           loadUsers();
           try { Alert.alert('Deleted', 'User deleted'); } catch (e) { if (typeof window !== 'undefined') window.alert('User deleted'); }
         } catch (e) { Alert.alert('Delete failed', String(e && e.message)); }
@@ -315,10 +654,17 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     setConfirm({
       title: 'Delete Topic',
       message: 'Are you sure you want to delete this topic?',
-      onConfirm: async () => {
+          onConfirm: async () => {
         try {
-          const res = await doFetch(`/admin/api/customers/${initial.id}/topics/${topicId}`, { method: 'DELETE' });
-          console.log('deleteTopic response', res);
+          // Use per-customer delete when id is numeric; otherwise attempt
+          // generic delete path to avoid malformed URLs like /admin/api/customers/default/topics/...
+          let res;
+          if (initial && initial.id && Number(initial.id) && !Number.isNaN(Number(initial.id))) {
+            res = await doFetch(`/admin/api/customers/${initial.id}/topics/${topicId}`, { method: 'DELETE' });
+          } else {
+            res = await doFetch(`/admin/api/customers/topics/${topicId}`, { method: 'DELETE' });
+          }
+          if (DEBUG) console.log('deleteTopic response', res);
           loadTopics();
           try { Alert.alert('Deleted', 'Topic deleted'); } catch (e) { if (typeof window !== 'undefined') window.alert('Topic deleted'); }
         } catch (e) { Alert.alert('Delete failed', String(e && e.message)); }
@@ -337,7 +683,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           onConfirm: async () => {
         try {
           const res = await doFetch(`/admin/api/customers/${initial.id}`, { method: 'DELETE' });
-          console.log('deleteCustomer response', res);
+            if (DEBUG) console.log('deleteCustomer response', res);
           if (onDeleted) onDeleted();
           else if (onCancel) onCancel();
           try { Alert.alert('Deleted', 'Customer deleted'); } catch (e) { if (typeof window !== 'undefined') window.alert('Customer deleted'); }
@@ -361,18 +707,22 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   return (
     <View style={{ flex: 1, backgroundColor: '#fafafa' }}>
       {showNav && (
-        <Header
-          title={initial ? 'Edit Customer' : 'Create Customer'}
-          token={token}
-          hideControls={true} // no side menu in edit view
-          onLogoutPress={() => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (e) {} if (onCancel) onCancel(); }}
-          onLoginPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }}
-        />
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 8, marginLeft: 8 }}>
+          <TouchableOpacity onPress={onCancel} accessibilityLabel="Back to Customers" style={{ marginRight: 12, padding: 4 }}>
+            <Text style={{ fontSize: 24, color: '#1b5e20', fontWeight: '700' }}>{'←'}</Text>
+          </TouchableOpacity>
+          <Header
+            title={initial ? 'Edit Customer' : 'Create Customer'}
+            token={token}
+            hideControls={true}
+            onLogoutPress={() => { try { localStorage.removeItem('brewski_jwt'); if (typeof window !== 'undefined') window.dispatchEvent(new Event('brewski:logout')); } catch (e) {} if (onCancel) onCancel(); }}
+            onLoginPress={() => { try { if (typeof window !== 'undefined') window.location.href = '/'; } catch (e) {} }}
+          />
+        </View>
       )}
       <ScrollView
         contentContainerStyle={styles.editorScroll}
         keyboardShouldPersistTaps="handled"
-        // Side menu removed; always expose content to accessibility services
         accessibilityElementsHidden={false}
         importantForAccessibility='auto'
       >
@@ -384,12 +734,13 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           <TextInput value={controller_host2} onChangeText={setControllerHost2} placeholder="Host (secondary, optional)" placeholderTextColor={PLACEHOLDER_COLOR} style={styles.input} />
           <Text style={styles.inlineHint}>Ports are managed internally; leave blank.</Text>
           <TextInput value={metadata} onChangeText={setMetadata} placeholder="Metadata (JSON)" placeholderTextColor={PLACEHOLDER_COLOR} style={[styles.input, styles.metadataInput]} multiline textAlignVertical="top" />
-          <View style={styles.actionRow}>
-            <TouchableOpacity onPress={onCancel} style={[styles.btn, styles.btnSecondary]}><Text style={styles.btnSecondaryText}>Cancel</Text></TouchableOpacity>
-            <TouchableOpacity onPress={save} style={[styles.btn, styles.btnPrimary]}><Text style={styles.btnPrimaryText}>Save</Text></TouchableOpacity>
-          </View>
         </View>
-        {initial && initial.id ? (
+        {/* Move Save/Cancel to bottom, add Back button */}
+        <View style={[styles.actionRow, { marginTop: 24, marginBottom: 8 }] }>
+          <TouchableOpacity onPress={onCancel} style={[styles.btn, styles.btnSecondary]}><Text style={styles.btnSecondaryText}>Cancel</Text></TouchableOpacity>
+          <TouchableOpacity onPress={save} style={[styles.btn, styles.btnPrimary]}><Text style={styles.btnPrimaryText}>Save</Text></TouchableOpacity>
+        </View>
+  {initial && initial.id ? (
           <View style={styles.sectionBlock}>
             <Text style={styles.sectionTitle}>Users ({users.length})</Text>
             <View style={styles.tableHeader}>
@@ -460,6 +811,35 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
                 <TouchableOpacity onPress={createTopic} style={[styles.btn, styles.btnPrimarySmall]}><Text style={styles.btnPrimaryText}>Add Topic</Text></TouchableOpacity>
               </View>
             </View>
+            <View style={styles.subSection}>
+              <Text style={styles.sectionTitle}>Power Labels</Text>
+              {loadingPower && <ActivityIndicator style={{ marginVertical: 8 }} />}
+              {!loadingPower && powerStates.length === 0 && <Text style={styles.emptyText}>No STATE topics with POWER keys found.</Text>}
+              {!loadingPower && powerStates.length > 0 && powerStates.map((row, idx) => (
+                <View key={row.topic} style={{ marginBottom: 16, backgroundColor: '#fff', borderRadius: 6, padding: 10, borderWidth: 1, borderColor: '#eee' }}>
+                  <Text style={{ fontWeight: '700', marginBottom: 4 }}>{row.topic}</Text>
+                  {Object.keys(row.powerKeys).map(pk => (
+                    <View key={pk} style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 6 }}>
+                      <Text style={{ width: 80 }}>{pk}: <Text style={{ color: '#1b5e20' }}>{row.powerKeys[pk]}</Text></Text>
+                      <TextInput
+                        value={lookupPowerLabel(row.topic, pk) || ''}
+                        onChangeText={txt => setPowerLabels(l => ({ ...l, [`${row.topic}|${pk}`]: txt }))}
+                        placeholder="Label"
+                        placeholderTextColor={PLACEHOLDER_COLOR}
+                        style={[styles.input, { flex: 1, marginLeft: 8, minWidth: 80 }]}
+                      />
+                      <TouchableOpacity
+                        onPress={() => savePowerLabel(row.topic, pk, powerLabels[`${row.topic}|${pk}`] || '')}
+                        style={{ marginLeft: 8, backgroundColor: '#1b5e20', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6 }}
+                        accessibilityLabel={`Save label for ${pk}`}
+                      >
+                        <Text style={{ color: '#fff', fontWeight: '600' }}>Save</Text>
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </View>
+              ))}
+            </View>
             <View style={styles.dangerZone}>
               <Text style={styles.dangerTitle}>Danger Zone</Text>
               <Text style={styles.dangerDesc}>Delete this customer and ALL associated users and topics. This cannot be undone.</Text>
@@ -489,11 +869,11 @@ function ManagerPanel({ user, doFetch, onPermissionDenied }) {
     try {
       const ures = await doFetch(`/admin/api/customers/${user.customer_id}/users`);
       if (ures && ures.users) setUsers(ures.users);
-    } catch (e) { console.error('manager load users', e && e.message); }
+    } catch (e) { if (DEBUG) console.error('manager load users', e && e.message); }
     try {
       const cres = await doFetch(`/admin/api/customers/${user.customer_id}`);
       if (cres && cres.customer) setCustomer(cres.customer);
-    } catch (e) { console.error('manager load customer', e && e.message); }
+    } catch (e) { if (DEBUG) console.error('manager load customer', e && e.message); }
   }
 
   useEffect(() => { load(); }, []);
