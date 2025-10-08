@@ -1,5 +1,42 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView } from 'react-native';
+// Avoid top-level react-native imports so web bundlers don't pull RN internals
+// into the web bundle. Use a guarded require at runtime and provide simple
+// web-friendly fallbacks when not running in React Native.
+let View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView;
+try {
+  if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative' && typeof require === 'function') {
+    const rn = require('react-native');
+    View = rn.View; Text = rn.Text; FlatList = rn.FlatList; TextInput = rn.TextInput; Button = rn.Button;
+    TouchableOpacity = rn.TouchableOpacity; Modal = rn.Modal; ActivityIndicator = rn.ActivityIndicator;
+    StyleSheet = rn.StyleSheet; Alert = rn.Alert; Platform = rn.Platform; ScrollView = rn.ScrollView;
+  } else {
+    View = (p) => React.createElement('div', p);
+    Text = (p) => React.createElement('span', p);
+    FlatList = (p) => React.createElement('div', p);
+    TextInput = (p) => React.createElement('input', p);
+    Button = (p) => React.createElement('button', p);
+    TouchableOpacity = (p) => React.createElement('button', p);
+    Modal = (p) => React.createElement('div', p);
+    ActivityIndicator = (p) => React.createElement('div', p);
+    StyleSheet = { create: (o) => o };
+    Alert = { alert: (m) => window && window.alert && window.alert(m) };
+    Platform = { OS: (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') ? 'android' : 'web' };
+    ScrollView = (p) => React.createElement('div', p);
+  }
+} catch (e) {
+  View = (p) => React.createElement('div', p);
+  Text = (p) => React.createElement('span', p);
+  FlatList = (p) => React.createElement('div', p);
+  TextInput = (p) => React.createElement('input', p);
+  Button = (p) => React.createElement('button', p);
+  TouchableOpacity = (p) => React.createElement('button', p);
+  Modal = (p) => React.createElement('div', p);
+  ActivityIndicator = (p) => React.createElement('div', p);
+  StyleSheet = { create: (o) => o };
+  Alert = { alert: (m) => window && window.alert && window.alert(m) };
+  Platform = { OS: 'web' };
+  ScrollView = (p) => React.createElement('div', p);
+}
 import Header from '../components/Header';
 // Accessible placeholder color (sufficient contrast on light backgrounds on mobile & web)
 const PLACEHOLDER_COLOR = '#555';

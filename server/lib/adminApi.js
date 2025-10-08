@@ -13,6 +13,7 @@ function safeSend(res, status, body, contentType) {
   }
 }
 const { createUser, findUserByUsername, verifyPassword, signToken, verifyToken, findUserById, updateUserById, updateUserFieldsByUsername } = require('./auth');
+const { ingestNumeric } = require('./ingest');
 
 function parseBodyJson(req, res, cb) {
   let body = '';
@@ -294,6 +295,71 @@ function handleAdminApi(req, res, url) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
+      });
+      return true;
+    }
+
+    // POST /admin/api/telemetry  (accept a snapshot of sensors to persist latest values)
+    // Body: { customer_id?: number, customer_slug?: string, sensors: [ { key, value, ts?, raw?, type?, unit? } ] }
+    if (url.pathname === '/admin/api/telemetry' && req.method === 'POST') {
+      parseBodyJson(req, res, (err, obj) => {
+        if (err) { safeSend(res, 400, { error: 'bad_json' }); return; }
+        try {
+          const payload = obj || {};
+          const sensors = Array.isArray(payload.sensors) ? payload.sensors : [];
+          const { findUserById } = require('./auth');
+          const me = findUserById(req.user && req.user.id ? req.user.id : null);
+          if (!me) { safeSend(res, 401, { error: 'unauthorized' }); return; }
+
+          const Database = require('better-sqlite3');
+          const path = require('path');
+          const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
+          const db = new Database(DB_PATH);
+
+          let targetCustomerId = null;
+          if (Number(me.is_admin) === 1 && payload.customer_id) {
+            targetCustomerId = Number(payload.customer_id);
+          } else if (Number(me.is_admin) === 1 && payload.customer_slug) {
+            const row = db.prepare('SELECT id FROM customers WHERE slug = ?').get(payload.customer_slug);
+            if (row) targetCustomerId = row.id;
+          } else {
+            if (!me.customer_id) { safeSend(res, 401, { error: 'unauthorized' }); return; }
+            targetCustomerId = me.customer_id;
+          }
+          if (!targetCustomerId) { safeSend(res, 400, { error: 'missing_customer' }); return; }
+
+          const now = Date.now();
+          let persisted = 0;
+          for (let i = 0; i < sensors.length; i++) {
+            const s = sensors[i] || {};
+            if (!s.key) continue;
+            let value = s.value;
+            if (typeof value === 'string') {
+              if (value === 'ON') value = 1;
+              else if (value === 'OFF') value = 0;
+              else value = Number(value);
+            }
+            if (typeof value !== 'number' || Number.isNaN(value)) continue;
+            try {
+              ingestNumeric({
+                customerId: targetCustomerId,
+                key: s.key,
+                value: value,
+                raw: typeof s.raw === 'string' ? s.raw : JSON.stringify(s.raw || {}),
+                ts: s.ts || now,
+                type: s.type || null,
+                unit: s.unit || null,
+                topicKey: s.key
+              });
+              persisted++;
+            } catch (e) {
+              try { console.warn('telemetry persist error', e && e.message); } catch (ee) {}
+            }
+          }
+          safeSend(res, 200, { ok: true, persisted });
+        } catch (e) {
+          safeSend(res, 500, { error: 'server_error', detail: String(e && e.message) });
+        }
       });
       return true;
     }
