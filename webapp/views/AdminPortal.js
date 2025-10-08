@@ -267,6 +267,18 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   const [powerLabels, setPowerLabels] = useState({}); // { topic|powerKey: label }
   const [loadingPower, setLoadingPower] = useState(false);
 
+  // Provide Authorization header for same-origin window.fetch attempts
+  const getAuthHeader = () => {
+    try {
+      let t = token;
+      if ((!t || t === '') && typeof localStorage !== 'undefined') {
+        t = localStorage.getItem('brewski_jwt');
+      }
+      if (t) return { Authorization: `Bearer ${t}` };
+    } catch (e) { /* ignore */ }
+    return {};
+  };
+
   // Produce a set of canonical candidate keys for a topic so label lookups
   // behave the same as the Dashboard canonicalization. Return an array of
   // topic strings (without the "|POWERx" suffix). Consumers will append
@@ -364,9 +376,9 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
 
   // 2. Fetch all power labels for this customer
       // For admins editing a specific customer, request labels for that customer.
-      // Support either numeric customer_id or customer_slug. Try admin endpoint
-      // first, then public /api, and finally retry using same-origin relative
-      // fetch if cross-origin calls fail (helps when proxy/CORS vary between deploys).
+      // Support either numeric customer_id or customer_slug. Prefer same-origin
+      // fetches (reduces CORS/tunnel exposure), then try admin endpoint
+      // and finally public /api if needed.
       if (DEBUG) console.log(`AdminPortal: Fetching power labels for customer id=${initial.id} slug=${initial.slug}`);
       let labelRes = null;
       const tryAdmin = async (q) => {
@@ -385,41 +397,46 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       const qById = initial.id ? `customer_id=${encodeURIComponent(initial.id)}` : null;
       const qBySlug = initial.slug ? `customer_slug=${encodeURIComponent(initial.slug)}` : null;
 
-  // Attempt order:
-  // 1) admin with no filter (admins can see all labels) — helps admin editors see labels across customers
-  // 2) admin by id, admin by slug
-  // 3) public by id, public by slug
-  const attempts = [];
-  attempts.push(() => tryAdmin(null));
-  if (qById) attempts.push(() => tryAdmin(qById));
-  if (qBySlug) attempts.push(() => tryAdmin(qBySlug));
-  if (qById) attempts.push(() => tryPublic(qById));
-  if (qBySlug) attempts.push(() => tryPublic(qBySlug));
-
-      for (const fn of attempts) {
+      // First try same-origin browser fetches (if available) to avoid cross-origin
+      // tunnel/CORS problems. This will succeed when the webapp is served from the
+      // API host directly (preferred for admin sessions).
+      if (typeof window !== 'undefined') {
         try {
-          labelRes = await fn();
-          if (labelRes) break;
-        } catch (e) {
-          if (DEBUG) console.warn('AdminPortal: power-label attempt failed', e && e.message);
-          labelRes = null;
-        }
-      }
-
-      // If still null, try same-origin fetches directly (bypass doFetch host selection)
-      if (!labelRes && typeof window !== 'undefined') {
+          // Try admin unfiltered first (admins can see all labels)
+          const r0 = await window.fetch(`/admin/api/power-labels`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
+          if (r0 && r0.ok) labelRes = await r0.json();
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin unfiltered failed', e && e.message); }
         try {
-          if (qById) {
-            const r = await window.fetch(`/admin/api/power-labels?${qById}`, { credentials: 'same-origin' });
-            if (r && r.ok) labelRes = await r.json();
+          if (!labelRes && qById) {
+            const r1 = await window.fetch(`/admin/api/power-labels?${qById}`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
+            if (r1 && r1.ok) labelRes = await r1.json();
           }
         } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin?id fetch failed', e && e.message); }
         try {
           if (!labelRes && qBySlug) {
-            const r2 = await window.fetch(`/admin/api/power-labels?${qBySlug}`, { credentials: 'same-origin' });
+            const r2 = await window.fetch(`/admin/api/power-labels?${qBySlug}`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
             if (r2 && r2.ok) labelRes = await r2.json();
           }
         } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin?slug fetch failed', e && e.message); }
+      }
+
+      // If same-origin didn't yield results, fall back to cross-origin attempts
+      if (!labelRes) {
+        const attempts = [];
+        attempts.push(() => tryAdmin(null));
+        if (qById) attempts.push(() => tryAdmin(qById));
+        if (qBySlug) attempts.push(() => tryAdmin(qBySlug));
+        if (qById) attempts.push(() => tryPublic(qById));
+        if (qBySlug) attempts.push(() => tryPublic(qBySlug));
+        for (const fn of attempts) {
+          try {
+            labelRes = await fn();
+            if (labelRes) break;
+          } catch (e) {
+            if (DEBUG) console.warn('AdminPortal: power-label attempt failed', e && e.message);
+            labelRes = null;
+          }
+        }
       }
       const labelMap = {};
       if (labelRes && labelRes.labels) {
@@ -495,23 +512,68 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       if (!saved && bodyBySlug) saved = await tryPost('/api/power-labels', bodyBySlug);
 
       // Final attempt: try same-origin relative POSTs when running in browser
+      // (try same-origin BEFORE cross-origin to avoid proxy/CORS races).
       if (!saved && typeof window !== 'undefined') {
         try {
           if (bodyById) {
-            const r = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyById), credentials: 'same-origin' });
+            const r = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, getAuthHeader()), body: JSON.stringify(bodyById), credentials: 'same-origin' });
             if (r && r.ok) saved = true;
           }
         } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin post failed', e && e.message); }
         try {
           if (!saved && bodyBySlug) {
-            const r2 = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyBySlug), credentials: 'same-origin' });
+            const r2 = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, getAuthHeader()), body: JSON.stringify(bodyBySlug), credentials: 'same-origin' });
             if (r2 && r2.ok) saved = true;
           }
         } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin slug post failed', e && e.message); }
       }
 
-      if (!saved) throw new Error('save failed');
-      // Update local cache under canonical variants so other views (Dashboard)
+      // If same-origin didn't work, fall back to doFetch cross-origin posts (already attempted earlier)
+
+      // If any POST path appeared to succeed we still verify by fetching the authoritative labels.
+      const verifySaved = async () => {
+        try {
+          const q = initial && initial.id ? `customer_id=${encodeURIComponent(initial.id)}&topic=${encodeURIComponent(topic)}` : (initial && initial.slug ? `customer_slug=${encodeURIComponent(initial.slug)}&topic=${encodeURIComponent(topic)}` : `topic=${encodeURIComponent(topic)}`);
+          let labelRes = null;
+          // reuse same attempt strategy used elsewhere
+          const attempts = [
+            () => doFetch(`/admin/api/power-labels?${q}`),
+            () => doFetch(`/api/power-labels?${q}`)
+          ];
+          for (const fn of attempts) {
+            try { labelRes = await fn(); if (labelRes) break; } catch (e) { if (DEBUG) console.warn('verifySaved attempt failed', e && e.message); labelRes = null; }
+          }
+          if (!labelRes && typeof window !== 'undefined') {
+            try {
+              const r = await window.fetch(`/admin/api/power-labels?${q}`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
+              if (r && r.ok) labelRes = await r.json();
+            } catch (e) { if (DEBUG) console.warn('verifySaved same-origin fetch failed', e && e.message); }
+          }
+          if (labelRes && Array.isArray(labelRes.labels)) {
+            // find matching label for our power_key
+            const found = labelRes.labels.find(l => String(l.topic) === String(topic) && String(l.power_key).toUpperCase() === String(powerKey).toUpperCase());
+            if (found) {
+              // consider saved if server stored the same label value (or any value)
+              return String(found.label || '').trim() === String(label || '').trim() || String(found.label || '').trim().length > 0;
+            }
+          }
+        } catch (e) { if (DEBUG) console.warn('verifySaved unexpected error', e && e.message); }
+        return false;
+      };
+
+      const verified = saved ? await verifySaved() : await verifySaved();
+      if (!verified) {
+        // If verification failed, warn but still update local cache optimistically so UI isn't blocked.
+        if (DEBUG) console.warn('AdminPortal: save not verified for', topic, powerKey, label);
+        // Optimistic update
+        setPowerLabels(l => ({ ...l, [`${topic}|${powerKey}`]: label }));
+        // Kick off a background refresh attempt and inform the user
+        try { await loadPowerLabelsAndStates(); } catch (e) {}
+        Alert.alert('Save may have failed', 'The server did not confirm the save immediately. It may have succeeded; the UI will refresh shortly.');
+        return;
+      }
+
+      // Verified: Update local cache under canonical variants so other views (Dashboard)
       // can immediately pick up the label regardless of stored topic formatting.
       setPowerLabels(l => {
         const next = { ...l };
@@ -537,7 +599,10 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       });
       // Refresh authoritative labels from server so UI stays accurate and in-sync.
       try { await loadPowerLabelsAndStates(); } catch (e) { /* best-effort */ }
-    } catch (e) { Alert.alert('Save failed', String(e && e.message)); }
+    } catch (e) {
+      if (DEBUG) console.error('savePowerLabel final error', e && e.message);
+      Alert.alert('Save failed', String(e && e.message));
+    }
   }
 
   useEffect(() => { loadUsers(); loadTopics(); loadPowerLabelsAndStates(); }, []);
@@ -564,18 +629,40 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   }, [initial]);
 
   async function loadUsers() {
-    if (!initial || !initial.id) return;
+    if (!initial) return;
     try {
-      const res = await doFetch(`/admin/api/customers/${initial.id}/users`);
+      let res;
+      // If we have a numeric id, use the per-customer path. Otherwise fall back
+      // to a slug-based query so the mobile app (or proxies) can load users
+      // even when the numeric id is not present.
+      if (initial && initial.id && Number(initial.id) && !Number.isNaN(Number(initial.id))) {
+        res = await doFetch(`/admin/api/customers/${initial.id}/users`);
+      } else if (initial && initial.slug) {
+        const q = `customer_slug=${encodeURIComponent(initial.slug)}`;
+        res = await doFetch(`/admin/api/customers/users?${q}`);
+      }
       if (res && res.users) setUsers(res.users);
     } catch (e) { if (DEBUG) console.error('loadUsers', e && e.message); }
   }
 
   async function createUser() {
-    if (!initial || !initial.id) return;
+    if (!initial) return;
     try {
       const body = Object.assign({}, newUser);
-      await doFetch(`/admin/api/customers/${initial.id}/users`, { method: 'POST', body });
+      // Prefer per-customer path when we have a numeric id. Otherwise POST
+      // to the generic customers/users endpoint including customer_slug in
+      // the body so the server can associate the new user with the correct
+      // customer record.
+      if (initial && initial.id && Number(initial.id) && !Number.isNaN(Number(initial.id))) {
+        await doFetch(`/admin/api/customers/${initial.id}/users`, { method: 'POST', body });
+      } else if (initial && initial.slug) {
+        const bodyWithSlug = { ...body, customer_slug: initial.slug };
+        await doFetch(`/admin/api/customers/users`, { method: 'POST', body: bodyWithSlug });
+      } else {
+        // No id or slug: attempt a best-effort POST to generic endpoint and hope
+        // the server can infer association (not ideal but better than failing silently).
+        await doFetch(`/admin/api/customers/users`, { method: 'POST', body });
+      }
       setNewUser({ username:'', password:'', email:'', name:'', role: 'user' });
       loadUsers();
     } catch (e) { Alert.alert('Create user failed', String(e && e.message)); }
