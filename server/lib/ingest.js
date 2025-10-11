@@ -31,8 +31,25 @@ function ensureSensor(customerId, key, opts = {}) {
   const now = Date.now();
   const { type = null, unit = null, topicKey = null } = opts;
   // Attempt fetch
+  // First try exact match
   let row = prep('selSensor', 'SELECT id, last_ts, last_value FROM sensors WHERE customer_id=? AND key=?').get(customerId, key);
   if (row) return row;
+  // Try case-insensitive match on key
+  try {
+    row = prep('selSensor_ci', 'SELECT id, last_ts, last_value FROM sensors WHERE customer_id=? AND UPPER(key)=?').get(customerId, String(key).toUpperCase());
+    if (row) return row;
+  } catch (e) { /* ignore if UPPER(key) not supported or column missing */ }
+  // Try matching on topic_key if provided (newer schema)
+  if (topicKey) {
+    try {
+      row = prep('selSensor_by_topic', 'SELECT id, last_ts, last_value FROM sensors WHERE customer_id=? AND topic_key = ?').get(customerId, topicKey);
+      if (row) return row;
+    } catch (e) { /* ignore if topic_key not present */ }
+    try {
+      row = prep('selSensor_by_topic_ci', 'SELECT id, last_ts, last_value FROM sensors WHERE customer_id=? AND UPPER(topic_key) = ?').get(customerId, String(topicKey).toUpperCase());
+      if (row) return row;
+    } catch (e) { /* ignore */ }
+  }
   // Create (ignore errors if conflict due to race)
   try {
     prep('insSensor', 'INSERT INTO sensors (customer_id, key, topic_key, type, unit, created_at) VALUES (?,?,?,?,?,?)')

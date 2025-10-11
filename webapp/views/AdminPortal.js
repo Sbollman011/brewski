@@ -1,42 +1,5 @@
 import React, { useEffect, useState } from 'react';
-// Avoid top-level react-native imports so web bundlers don't pull RN internals
-// into the web bundle. Use a guarded require at runtime and provide simple
-// web-friendly fallbacks when not running in React Native.
-let View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView;
-try {
-  if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative' && typeof require === 'function') {
-    const rn = require('react-native');
-    View = rn.View; Text = rn.Text; FlatList = rn.FlatList; TextInput = rn.TextInput; Button = rn.Button;
-    TouchableOpacity = rn.TouchableOpacity; Modal = rn.Modal; ActivityIndicator = rn.ActivityIndicator;
-    StyleSheet = rn.StyleSheet; Alert = rn.Alert; Platform = rn.Platform; ScrollView = rn.ScrollView;
-  } else {
-    View = (p) => React.createElement('div', p);
-    Text = (p) => React.createElement('span', p);
-    FlatList = (p) => React.createElement('div', p);
-    TextInput = (p) => React.createElement('input', p);
-    Button = (p) => React.createElement('button', p);
-    TouchableOpacity = (p) => React.createElement('button', p);
-    Modal = (p) => React.createElement('div', p);
-    ActivityIndicator = (p) => React.createElement('div', p);
-    StyleSheet = { create: (o) => o };
-    Alert = { alert: (m) => window && window.alert && window.alert(m) };
-    Platform = { OS: (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') ? 'android' : 'web' };
-    ScrollView = (p) => React.createElement('div', p);
-  }
-} catch (e) {
-  View = (p) => React.createElement('div', p);
-  Text = (p) => React.createElement('span', p);
-  FlatList = (p) => React.createElement('div', p);
-  TextInput = (p) => React.createElement('input', p);
-  Button = (p) => React.createElement('button', p);
-  TouchableOpacity = (p) => React.createElement('button', p);
-  Modal = (p) => React.createElement('div', p);
-  ActivityIndicator = (p) => React.createElement('div', p);
-  StyleSheet = { create: (o) => o };
-  Alert = { alert: (m) => window && window.alert && window.alert(m) };
-  Platform = { OS: 'web' };
-  ScrollView = (p) => React.createElement('div', p);
-}
+import { View, Text, FlatList, TextInput, Button, TouchableOpacity, Modal, ActivityIndicator, StyleSheet, Alert, Platform, ScrollView } from 'react-native';
 import Header from '../components/Header';
 // Accessible placeholder color (sufficient contrast on light backgrounds on mobile & web)
 const PLACEHOLDER_COLOR = '#555';
@@ -55,28 +18,14 @@ const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
   const method = opts.method || 'GET';
   const body = opts.body && method !== 'GET' ? (typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body)) : undefined;
 
-  // Build URL for admin paths. In browser contexts prefer same-origin relative paths
-  // to avoid cross-origin requests and CORS issues. For native (no `window`) use the
-  // configured API_HOST absolute URL.
+  // Build URL for admin paths. Always call the canonical API host to avoid
+  // accidentally hitting the web host (which serves HTML) — some environments
+  // return the SPA shell for admin paths when same-origin is used. Use the
+  // absolute api host for API calls to ensure JSON responses.
   let finalUrl = path;
   if (typeof path === 'string' && (path.startsWith('/admin/api') || path.startsWith('/api/'))) {
-    if (typeof window !== 'undefined') {
-      // Browser: if the page is served from the API host already, use relative path.
-      // Otherwise, call the API host directly so requests reach the real server.
-      try {
-        const pageHost = (window.location && window.location.hostname) ? window.location.hostname : null;
-        if (pageHost && pageHost.toLowerCase() === API_HOST.toLowerCase()) {
-          finalUrl = path; // same host
-        } else {
-          finalUrl = `https://${API_HOST}${path}`; // call API host directly (cross-origin)
-        }
-      } catch (e) {
-        finalUrl = `https://${API_HOST}${path}`;
-      }
-    } else {
-      // Native/Server: build absolute URL to the API host
-      finalUrl = `https://${API_HOST}${path}`;
-    }
+    // Always target the API host explicitly rather than relying on same-origin.
+    finalUrl = `https://${API_HOST}${path}`;
   } else if (typeof path === 'string' && !/^https?:/i.test(path)) {
     // Non-admin relative path – leave as-is (same-origin) on web. On native, prefix the API host.
     if (typeof window === 'undefined') {
@@ -302,6 +251,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   // Power label state
   const [powerStates, setPowerStates] = useState([]); // [{ topic, powerKeys: { POWER1: 'ON', ... }, labels: { POWER1: 'Pump', ... } }]
   const [powerLabels, setPowerLabels] = useState({}); // { topic|powerKey: label }
+  const [editedPowerLabels, setEditedPowerLabels] = useState({}); // local drafts while typing
   const [loadingPower, setLoadingPower] = useState(false);
 
   // Provide Authorization header for same-origin window.fetch attempts
@@ -378,6 +328,25 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     return '';
   };
 
+  // Canonicalize a topic for storage/readability before sending to the server.
+  // Matches server-side normalization: strip leading tele/ or stat/, ensure
+  // SITE/DEVICE/STATE format, and uppercase SITE and DEVICE for consistency.
+  const canonicalizeForStorage = (topic) => {
+    try {
+      if (!topic || typeof topic !== 'string') return topic;
+      let s = String(topic).trim();
+      s = s.replace(/^(tele|stat)\//i, '');
+      const parts = s.split('/').filter(Boolean);
+      let site = 'BREW';
+      let device = '';
+      if (parts.length >= 2) { site = parts[0]; device = parts[1]; }
+      else if (parts.length === 1) { device = parts[0]; }
+      site = String(site).toUpperCase();
+      device = String(device).toUpperCase();
+      return `${site}/${device}/STATE`;
+    } catch (e) { return topic; }
+  };
+
   // Fetch latest STATE topics and power labels
   async function loadPowerLabelsAndStates() {
     if (!initial) return;
@@ -422,28 +391,25 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       const qById = initial.id ? `customer_id=${encodeURIComponent(initial.id)}` : null;
       const qBySlug = initial.slug ? `customer_slug=${encodeURIComponent(initial.slug)}` : null;
 
-      // First try same-origin browser fetches (if available) to avoid cross-origin
-      // tunnel/CORS problems. This will succeed when the webapp is served from the
-      // API host directly (preferred for admin sessions).
-      if (typeof window !== 'undefined') {
-        try {
-          // Try admin unfiltered first (admins can see all labels)
-          const r0 = await window.fetch(`/admin/api/power-labels`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
-          if (r0 && r0.ok) labelRes = await r0.json();
-        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin unfiltered failed', e && e.message); }
-        try {
-          if (!labelRes && qById) {
-            const r1 = await window.fetch(`/admin/api/power-labels?${qById}`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
-            if (r1 && r1.ok) labelRes = await r1.json();
-          }
-        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin?id fetch failed', e && e.message); }
-        try {
-          if (!labelRes && qBySlug) {
-            const r2 = await window.fetch(`/admin/api/power-labels?${qBySlug}`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
-            if (r2 && r2.ok) labelRes = await r2.json();
-          }
-        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin?slug fetch failed', e && e.message); }
-      }
+      // First try customer-scoped fetches to avoid returning labels belonging
+      // to other tenants. Fetching the unfiltered admin list can confuse the
+      // UI (showing labels for other customers) and lead to delete/save
+      // operations targeting the wrong customer. Prefer scoped requests by
+      // `customer_id` or `customer_slug`, then fall back to an unfiltered
+      // admin list only if the scoped attempts fail.
+      try {
+        if (qById) {
+          try { labelRes = await doFetch(`/admin/api/power-labels?${qById}`); } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch admin?id fetch failed', e && e.message); }
+        }
+        if (!labelRes && qBySlug) {
+          try { labelRes = await doFetch(`/admin/api/power-labels?${qBySlug}`); } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch admin?slug fetch failed', e && e.message); }
+        }
+        // Last resort: unfiltered admin list (admins can see everything), but
+        // only use it if scoped queries did not return results.
+        if (!labelRes) {
+          try { labelRes = await doFetch(`/admin/api/power-labels`); } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch admin unfiltered failed', e && e.message); }
+        }
+      } catch (e) { if (DEBUG) console.warn('AdminPortal: admin power-labels primary attempts failed', e && e.message); }
 
       // If same-origin didn't yield results, fall back to cross-origin attempts
       if (!labelRes) {
@@ -490,45 +456,136 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       // (common when admin is viewing another tenant), derive editable rows
       // from the label records themselves so admins can edit labels for any
       // customer. Group labels by topic and expose the power_key slots.
+      // Build a merged topic->powerKey map BUT group by a canonical base so
+      // variants like `tele/RAIL/FOO/STATE`, `RAIL/FOO/STATE` and `tele/FOO/STATE`
+      // collapse into a single editable row. Pick a representative topic for
+      // the canonical group (prefer the full `tele/.../STATE` form) so saves
+      // keep the server's expected topic formatting.
       const topicToKeys = {};
       if (labelRes && Array.isArray(labelRes.labels)) {
-        // prepare case-insensitive known slugs for robust matching
         const knownSlugsLower = (customerSlugs || []).map(s => String(s || '').toLowerCase());
         const initialSlugLower = initial && initial.slug ? String(initial.slug).toLowerCase() : '';
+
+        const canonicalMap = {}; // canonicalBase -> { repTopic: string, powerKeys: Set }
+
+        const makeCanonical = (topic) => {
+          if (!topic || typeof topic !== 'string') return null;
+          const parts = topic.split('/').filter(Boolean);
+          try {
+            // tele/<slug>/<device>/STATE
+            if (parts.length >= 4 && parts[0].toLowerCase() === 'tele' && /state/i.test(parts[parts.length - 1])) {
+              return `${parts[1].toUpperCase()}/${parts[2]}`;
+            }
+            // tele/<device>/STATE (legacy no slug) -> attribute to current customer
+            if (parts.length === 3 && parts[0].toLowerCase() === 'tele' && /state/i.test(parts[2])) {
+              const device = parts[1];
+              const slug = initial && initial.slug ? initial.slug.toUpperCase() : 'BREW';
+              return `${slug}/${device}`;
+            }
+            // <slug>/<device>/STATE
+            if (parts.length >= 3 && /state/i.test(parts[parts.length - 1])) {
+              return `${parts[0].toUpperCase()}/${parts[1]}`;
+            }
+            // fallback: strip tele/ and trailing /STATE when present
+            let t = topic.replace(/^tele\//i, '').replace(/\/STATE$/i, '');
+            // if it's just a device (e.g. "FERM2"), attribute to current slug
+            const tparts = t.split('/').filter(Boolean);
+            if (tparts.length === 1) {
+              const slug = initial && initial.slug ? initial.slug.toUpperCase() : 'BREW';
+              return `${slug}/${tparts[0]}`;
+            }
+            return `${tparts[0].toUpperCase()}/${tparts[1] || ''}`;
+          } catch (e) { return null; }
+        };
+
         for (const l of labelRes.labels) {
           try {
             if (!l || !l.topic) continue;
             const t = l.topic;
             // only consider STATE topics (where labels are meaningful)
             if (!/\/STATE$/i.test(t)) continue;
-            // determine assigned customer from topic (level 2)
+
+            // determine whether this topic belongs to the customer being edited
             const parts = t.split('/');
-            let slug = parts.length >= 2 ? parts[1] : 'BREW';
-            const slugLower = String(slug || '').toLowerCase();
+            let slugCandidate = parts.length >= 2 ? parts[1] : '';
+            // If topic starts without tele (e.g. RAIL/FOO/STATE) slugCandidate is parts[0]
+            if (parts[0] && parts[0].toLowerCase() !== 'tele') slugCandidate = parts[0];
+            const slugLower = String(slugCandidate || '').toLowerCase();
 
-            // If the second-level token doesn't match any known customer slug
-            // and we're editing the BREW customer, treat it as BREW so that
-            // non-standard topics (the BREW customer's edge case) surface
-            // in the editor. This avoids losing labels when the org token is
-            // missing or malformed.
-            if (knownSlugsLower.length > 0 && knownSlugsLower.indexOf(slugLower) === -1) {
-              if (initialSlugLower === 'brew') {
-                slug = 'BREW';
-              }
+            if (knownSlugsLower.length > 0 && slugLower && knownSlugsLower.indexOf(slugLower) === -1) {
+              // non-matching slug token — if editing BREW, treat it as BREW so we
+              // surface orphaned legacy topics; otherwise skip
+              if (initialSlugLower !== 'brew') continue;
             }
+            // Final check: topic must resolve to this initial slug (case-insensitive)
+            // Accept legacy tele/<device>/STATE by mapping to current initial slug.
+            const canonical = makeCanonical(t);
+            if (!canonical) continue;
+            const canonicalSlug = (canonical.split('/')[0] || '').toLowerCase();
+            if (canonicalSlug !== initialSlugLower) continue;
 
-            // final comparison should be case-insensitive
-            if (String(slug || '').toLowerCase() !== initialSlugLower) continue;
-            if (!topicToKeys[t]) topicToKeys[t] = {};
-            topicToKeys[t][l.power_key] = '';
+            // Choose a representative topic for this canonical base (prefer tele/.../STATE)
+            if (!canonicalMap[canonical]) canonicalMap[canonical] = { repTopic: t, powerKeys: new Set() };
+            // Prefer repTopic that contains leading tele/ and full /STATE
+            const curRep = canonicalMap[canonical].repTopic;
+            if (!/^tele\//i.test(curRep) && /^tele\//i.test(t)) canonicalMap[canonical].repTopic = t;
+            // merge power key
+            canonicalMap[canonical].powerKeys.add(l.power_key);
           } catch (e) {}
         }
+
+        // convert canonical map into topic->keys using the canonical stored topic
+        // (canonicalizeForStorage) so UI lookups align with server-stored labels.
+        Object.keys(canonicalMap).forEach(c => {
+          const entry = canonicalMap[c];
+          const rep = entry.repTopic;
+          const storedRep = canonicalizeForStorage(rep) || rep; // ensure SITE/DEVICE/STATE
+          if (!topicToKeys[storedRep]) topicToKeys[storedRep] = {};
+          for (const pk of Array.from(entry.powerKeys)) topicToKeys[storedRep][pk] = '';
+        });
       }
 
-      // Build powerRows from topicToKeys
-      const merged = Object.keys(topicToKeys).map(topic => ({ topic, powerKeys: topicToKeys[topic], assignedCustomer: initial.slug, labels: Object.keys(topicToKeys[topic]).reduce((acc, pk) => ({ ...acc, [pk]: labelMap[`${topic}|${pk}`] || labelMap[`${topic}|${pk.toUpperCase()}`] || '' }), {}) }));
+      // Build powerRows from topicToKeys. For each representative topic, expand
+      // canonical candidates and pick the first available label from labelMap so
+      // we show canonicalized labels instead of raw duplicates.
+      const merged = Object.keys(topicToKeys).map(topic => {
+        const pks = topicToKeys[topic];
+        const labelsForTopic = {};
+        for (const pk of Object.keys(pks)) {
+          // search labelMap for canonical candidates
+          let found = '';
+          try {
+            const candidates = canonicalCandidatesForTopic(topic);
+            for (const c of candidates) {
+              const k1 = `${c}|${pk}`;
+              const k2 = `${c}|${pk.toUpperCase()}`;
+              if (labelMap[k1] !== undefined && String(labelMap[k1] || '').trim().length) { found = labelMap[k1]; break; }
+              if (labelMap[k2] !== undefined && String(labelMap[k2] || '').trim().length) { found = labelMap[k2]; break; }
+            }
+          } catch (e) {}
+          // fallback to raw topic keys
+          if (!found) found = labelMap[`${topic}|${pk}`] || labelMap[`${topic}|${pk.toUpperCase()}`] || '';
+          labelsForTopic[pk] = found;
+        }
+        return { topic, powerKeys: pks, assignedCustomer: initial.slug, labels: labelsForTopic };
+      });
       setPowerStates(merged);
       setPowerLabels(labelMap);
+      // Remove any local drafts that now match authoritative server labels
+      try {
+        setEditedPowerLabels(prev => {
+          const next = { ...prev };
+          for (const k of Object.keys(next)) {
+            try {
+              const serverVal = labelMap[k] !== undefined ? labelMap[k] : (labelMap[k.toUpperCase()] !== undefined ? labelMap[k.toUpperCase()] : undefined);
+              if (serverVal !== undefined && String(next[k] || '').trim() === String(serverVal || '').trim()) {
+                delete next[k];
+              }
+            } catch (e) {}
+          }
+          return next;
+        });
+      } catch (e) {}
     } catch (e) { setPowerStates([]); setPowerLabels({}); }
     setLoadingPower(false);
   }
@@ -537,8 +594,9 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   async function savePowerLabel(topic, powerKey, label) {
     try {
       // Prefer admin API; fall back to public API if admin is not accessible to this caller
-      const bodyById = initial && initial.id ? { topic, power_key: powerKey, label, customer_id: initial.id } : null;
-      const bodyBySlug = initial && initial.slug ? { topic, power_key: powerKey, label, customer_slug: initial.slug } : null;
+  const storedTopic = canonicalizeForStorage(topic);
+  const bodyById = initial && initial.id ? { topic: storedTopic, power_key: powerKey, label, customer_id: initial.id } : null;
+  const bodyBySlug = initial && initial.slug ? { topic: storedTopic, power_key: powerKey, label, customer_slug: initial.slug } : null;
       let saved = false;
       const tryPost = async (path, body) => {
         try { await doFetch(path, { method: 'POST', body }); return true; } catch (e) { if (DEBUG) console.warn('AdminPortal: post failed', path, e && e.message); return false; }
@@ -549,21 +607,16 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       if (!saved && bodyById) saved = await tryPost('/api/power-labels', bodyById);
       if (!saved && bodyBySlug) saved = await tryPost('/api/power-labels', bodyBySlug);
 
-      // Final attempt: try same-origin relative POSTs when running in browser
-      // (try same-origin BEFORE cross-origin to avoid proxy/CORS races).
-      if (!saved && typeof window !== 'undefined') {
+      // As a final attempt, use doFetch against the canonical API host which
+      // will attach Authorization via the token provider. Avoid window.fetch
+      // same-origin calls which may be routed to the web host and return HTML.
+      if (!saved) {
         try {
-          if (bodyById) {
-            const r = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, getAuthHeader()), body: JSON.stringify(bodyById), credentials: 'same-origin' });
-            if (r && r.ok) saved = true;
-          }
-        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin post failed', e && e.message); }
+          if (bodyById) saved = await doFetch('/admin/api/power-labels', { method: 'POST', body: bodyById });
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch admin post byId failed', e && e.message); }
         try {
-          if (!saved && bodyBySlug) {
-            const r2 = await window.fetch('/admin/api/power-labels', { method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, getAuthHeader()), body: JSON.stringify(bodyBySlug), credentials: 'same-origin' });
-            if (r2 && r2.ok) saved = true;
-          }
-        } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin admin slug post failed', e && e.message); }
+          if (!saved && bodyBySlug) saved = await doFetch('/admin/api/power-labels', { method: 'POST', body: bodyBySlug });
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch admin post bySlug failed', e && e.message); }
       }
 
       // If same-origin didn't work, fall back to doFetch cross-origin posts (already attempted earlier)
@@ -571,9 +624,10 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       // If any POST path appeared to succeed we still verify by fetching the authoritative labels.
       const verifySaved = async () => {
         try {
-          const q = initial && initial.id ? `customer_id=${encodeURIComponent(initial.id)}&topic=${encodeURIComponent(topic)}` : (initial && initial.slug ? `customer_slug=${encodeURIComponent(initial.slug)}&topic=${encodeURIComponent(topic)}` : `topic=${encodeURIComponent(topic)}`);
+          // Query by the canonical storedTopic (server now stores canonical topics)
+          const qTopic = encodeURIComponent(storedTopic);
+          const q = initial && initial.id ? `customer_id=${encodeURIComponent(initial.id)}&topic=${qTopic}` : (initial && initial.slug ? `customer_slug=${encodeURIComponent(initial.slug)}&topic=${qTopic}` : `topic=${qTopic}`);
           let labelRes = null;
-          // reuse same attempt strategy used elsewhere
           const attempts = [
             () => doFetch(`/admin/api/power-labels?${q}`),
             () => doFetch(`/api/power-labels?${q}`)
@@ -581,15 +635,12 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           for (const fn of attempts) {
             try { labelRes = await fn(); if (labelRes) break; } catch (e) { if (DEBUG) console.warn('verifySaved attempt failed', e && e.message); labelRes = null; }
           }
-          if (!labelRes && typeof window !== 'undefined') {
-            try {
-              const r = await window.fetch(`/admin/api/power-labels?${q}`, { credentials: 'same-origin', headers: Object.assign({ Accept: 'application/json' }, getAuthHeader()) });
-              if (r && r.ok) labelRes = await r.json();
-            } catch (e) { if (DEBUG) console.warn('verifySaved same-origin fetch failed', e && e.message); }
+          if (!labelRes) {
+            try { labelRes = await doFetch(`/admin/api/power-labels?${q}`); } catch (e) { if (DEBUG) console.warn('verifySaved doFetch attempt failed', e && e.message); }
           }
           if (labelRes && Array.isArray(labelRes.labels)) {
-            // find matching label for our power_key
-            const found = labelRes.labels.find(l => String(l.topic) === String(topic) && String(l.power_key).toUpperCase() === String(powerKey).toUpperCase());
+            // Server labels are returned with canonical topic; compare by canonical storedTopic
+            const found = labelRes.labels.find(l => String(l.topic) === String(storedTopic) && String(l.power_key).toUpperCase() === String(powerKey).toUpperCase());
             if (found) {
               // consider saved if server stored the same label value (or any value)
               return String(found.label || '').trim() === String(label || '').trim() || String(found.label || '').trim().length > 0;
@@ -616,15 +667,31 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       setPowerLabels(l => {
         const next = { ...l };
         const upKey = powerKey.toUpperCase();
-        // expand into all canonical topic candidates
+        // expand into all canonical topic candidates + tele variants + storedTopic literal
         try {
-          const candidates = canonicalCandidatesForTopic(topic);
+          const candidates = canonicalCandidatesForTopic(storedTopic);
+          // include explicit storedTopic and its uppercased form
+          if (candidates.indexOf(storedTopic) === -1) candidates.push(storedTopic);
+          if (candidates.indexOf(String(storedTopic).toUpperCase()) === -1) candidates.push(String(storedTopic).toUpperCase());
           candidates.forEach(t => {
+            // normal and uppercased topic variants
             next[`${t}|${powerKey}`] = label;
             next[`${t}|${upKey}`] = label;
-            // Uppercased topic variant as well
             next[`${t.toUpperCase()}|${powerKey}`] = label;
             next[`${t.toUpperCase()}|${upKey}`] = label;
+            // also add tele-prefixed STATE variants if topic looks like SITE/DEVICE/STATE or SITE/DEVICE
+            try {
+              const base = String(t).replace(/\/STATE$/i, '');
+              const parts = base.split('/').filter(Boolean);
+              if (parts.length >= 2) {
+                const tele1 = `tele/${parts[0]}/${parts[1]}/STATE`;
+                const tele2 = `tele/${parts[1]}/STATE`;
+                next[`${tele1}|${powerKey}`] = label;
+                next[`${tele1}|${upKey}`] = label;
+                next[`${tele2}|${powerKey}`] = label;
+                next[`${tele2}|${upKey}`] = label;
+              }
+            } catch (e) {}
           });
         } catch (e) {
           // fallback to a few common variants
@@ -637,17 +704,164 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       });
       // Refresh authoritative labels from server so UI stays accurate and in-sync.
       try { await loadPowerLabelsAndStates(); } catch (e) { /* best-effort */ }
+      // notify other parts of the SPA that power labels changed so dashboards refresh
+      try {
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          window.dispatchEvent(new CustomEvent('brewski:power-labels-synced', { detail: { topic, power_key: powerKey, label, ts: Date.now() } }));
+        }
+      } catch (e) {}
     } catch (e) {
       if (DEBUG) console.error('savePowerLabel final error', e && e.message);
       Alert.alert('Save failed', String(e && e.message));
     }
   }
 
+  // Save all edited power labels in one batch from the UI. This iterates the
+  // visible `powerStates` rows and persists any changed label entries found in
+  // the `powerLabels` cache. We perform best-effort POSTs and then refresh the
+  // authoritative labels via `loadPowerLabelsAndStates` once at the end.
+  async function saveAllPowerLabels() {
+    if (!powerStates || powerStates.length === 0) {
+      try { Alert.alert('Nothing to save', 'No power labels present to save.'); } catch (e) { if (typeof window !== 'undefined') window.alert('Nothing to save'); }
+      return;
+    }
+    setLoadingPower(true);
+    try {
+      const toSave = [];
+      for (const row of powerStates) {
+        if (!row || !row.topic || !row.powerKeys) continue;
+        for (const pk of Object.keys(row.powerKeys)) {
+          const uiKey = `${row.topic}|${pk}`;
+          // Prefer local draft edits for immediate UX
+          const candidate = (editedPowerLabels && editedPowerLabels[uiKey] !== undefined) ? editedPowerLabels[uiKey] : ((powerLabels && (powerLabels[uiKey] || powerLabels[`${uiKey.toUpperCase()}`])) || '');
+          const current = lookupPowerLabel(row.topic, pk) || '';
+          // Only persist when the UI value is non-empty and differs from the server-known label
+          if ((candidate || '').trim() && String(candidate).trim() !== String(current).trim()) {
+            toSave.push({ topic: row.topic, powerKey: pk, label: String(candidate).trim() });
+          }
+        }
+      }
+      if (toSave.length === 0) {
+        try { Alert.alert('No changes', 'No label changes detected to save.'); } catch (e) { if (typeof window !== 'undefined') window.alert('No label changes detected to save.'); }
+        setLoadingPower(false);
+        return;
+      }
+
+      // Helper to attempt POSTs similar to savePowerLabel logic but without per-item verification.
+      const tryPost = async (path, body) => {
+        try { await doFetch(path, { method: 'POST', body }); return true; } catch (e) { if (DEBUG) console.warn('AdminPortal: post failed', path, e && e.message); return false; }
+      };
+
+      let savedCount = 0;
+          for (const item of toSave) {
+            const { topic, powerKey, label } = item;
+            const stored = canonicalizeForStorage(topic);
+            const bodyById = initial && initial.id ? { topic: stored, power_key: powerKey, label, customer_id: initial.id } : null;
+            const bodyBySlug = initial && initial.slug ? { topic: stored, power_key: powerKey, label, customer_slug: initial.slug } : null;
+        let ok = false;
+        if (bodyById) ok = await tryPost('/admin/api/power-labels', bodyById);
+        if (!ok && bodyBySlug) ok = await tryPost('/admin/api/power-labels', bodyBySlug);
+        if (!ok && bodyById) ok = await tryPost('/api/power-labels', bodyById);
+        if (!ok && bodyBySlug) ok = await tryPost('/api/power-labels', bodyBySlug);
+
+        // Try doFetch canonical host as a last-resort
+        if (!ok) {
+          try {
+            if (bodyById) ok = await doFetch('/admin/api/power-labels', { method: 'POST', body: bodyById });
+          } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch admin post failed', e && e.message); }
+          try {
+            if (!ok && bodyBySlug) ok = await doFetch('/admin/api/power-labels', { method: 'POST', body: bodyBySlug });
+          } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch admin post bySlug failed', e && e.message); }
+        }
+
+        if (ok) savedCount++;
+      }
+
+      // Refresh authoritative labels once after the batch
+      try { await loadPowerLabelsAndStates(); } catch (e) { /* best-effort */ }
+      // Remove drafts for keys we attempted to save
+      try {
+        setEditedPowerLabels(prev => {
+          const next = { ...prev };
+          for (const item of toSave) {
+            const k = `${item.topic}|${item.powerKey}`;
+            if (next[k] !== undefined) delete next[k];
+            const up = `${k.toUpperCase()}`;
+            if (next[up] !== undefined) delete next[up];
+          }
+          return next;
+        });
+      } catch (e) {}
+      try { Alert.alert('Saved', `Saved ${savedCount} of ${toSave.length} changed labels.`); } catch (e) { if (typeof window !== 'undefined') window.alert(`Saved ${savedCount} of ${toSave.length} changed labels.`); }
+      // Optimistic: update local cache so new labels show immediately even if
+      // the server/edge hasn't returned the updated snapshot yet.
+      try {
+        setPowerLabels(prev => {
+          const next = { ...(prev || {}) };
+          for (const item of toSave) {
+            try {
+              const stored = canonicalizeForStorage(item.topic);
+              const upKey = String(item.powerKey).toUpperCase();
+              // Add canonical stored entries and tele variants
+              const addKey = (t, k) => { try { next[`${t}|${k}`] = item.label; next[`${t}|${String(k).toUpperCase()}`] = item.label; } catch (e) {} };
+              addKey(stored, item.powerKey);
+              addKey(stored.toUpperCase(), item.powerKey);
+              // Also add candidate variants so UI lookup (which uses many permutations)
+              const candidates = canonicalCandidatesForTopic(stored);
+              if (candidates.indexOf(stored) === -1) candidates.push(stored);
+              for (const c of candidates) {
+                addKey(c, item.powerKey);
+                addKey(String(c).toUpperCase(), item.powerKey);
+                // add tele variants
+                try {
+                  const base = String(c).replace(/\/STATE$/i, '');
+                  const parts = base.split('/').filter(Boolean);
+                  if (parts.length >= 2) {
+                    const tele1 = `tele/${parts[0]}/${parts[1]}/STATE`;
+                    const tele2 = `tele/${parts[1]}/STATE`;
+                    addKey(tele1, item.powerKey);
+                    addKey(tele2, item.powerKey);
+                  }
+                } catch (e) {}
+              }
+              // Also add base variant without trailing /STATE if present
+              try {
+                const base = String(stored).replace(/\/STATE$/i, '');
+                if (base && base !== stored) {
+                  addKey(base, item.powerKey);
+                  addKey(base.toUpperCase(), item.powerKey);
+                }
+              } catch (e) {}
+            } catch (e) {}
+          }
+          return next;
+        });
+      } catch (e) {}
+      // notify other parts of the SPA that power labels changed so dashboards refresh
+      try {
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          window.dispatchEvent(new CustomEvent('brewski:power-labels-synced', { detail: { savedCount, total: toSave.length, ts: Date.now() } }));
+        }
+      } catch (e) {}
+      // notify other parts of the SPA that power labels changed so dashboards refresh
+      try {
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          window.dispatchEvent(new CustomEvent('brewski:power-labels-synced', { detail: { savedCount, total: toSave.length, ts: Date.now() } }));
+        }
+      } catch (e) {}
+    } catch (e) {
+      if (DEBUG) console.error('saveAllPowerLabels error', e && e.message);
+      Alert.alert('Save failed', String(e && e.message));
+    }
+    setLoadingPower(false);
+  }
+
   // Delete a power label (remove mapping for a single topic/powerKey)
   async function doDeletePowerLabel(topic, powerKey) {
     try {
-      const bodyById = initial && initial.id ? { topic, power_key: powerKey, customer_id: initial.id } : null;
-      const bodyBySlug = initial && initial.slug ? { topic, power_key: powerKey, customer_slug: initial.slug } : null;
+  const storedTopic = canonicalizeForStorage(topic);
+  const bodyById = initial && initial.id ? { topic: storedTopic, power_key: powerKey, customer_id: initial.id } : null;
+  const bodyBySlug = initial && initial.slug ? { topic: storedTopic, power_key: powerKey, customer_slug: initial.slug } : null;
       let deleted = false;
       const tryDelete = async (path, body) => {
         try { await doFetch(path, { method: 'DELETE', body }); return true; } catch (e) { if (DEBUG) console.warn('AdminPortal: delete failed', path, e && e.message); return false; }
@@ -658,34 +872,33 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
       if (!deleted && bodyById) deleted = await tryDelete('/api/power-labels', bodyById);
       if (!deleted && bodyBySlug) deleted = await tryDelete('/api/power-labels', bodyBySlug);
 
+
       if (!deleted) {
-        // Try same-origin fallbacks (browser)
-        if (typeof window !== 'undefined') {
-          try {
-            if (bodyById) {
-              const r = await window.fetch('/admin/api/power-labels', { method: 'DELETE', headers: Object.assign({ 'Content-Type': 'application/json', Accept: 'application/json' }, getAuthHeader()), body: JSON.stringify(bodyById), credentials: 'same-origin' });
-              if (r && r.ok) deleted = true;
-            }
-          } catch (e) { if (DEBUG) console.warn('AdminPortal: same-origin delete failed', e && e.message); }
-        }
+        // Try canonical API host via doFetch instead of same-origin window.fetch
+        try {
+          if (bodyById) deleted = await doFetch('/admin/api/power-labels', { method: 'DELETE', body: bodyById });
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch delete byId failed', e && e.message); }
+        try {
+          if (!deleted && bodyBySlug) deleted = await doFetch('/admin/api/power-labels', { method: 'DELETE', body: bodyBySlug });
+        } catch (e) { if (DEBUG) console.warn('AdminPortal: doFetch delete bySlug failed', e && e.message); }
       }
 
       if (!deleted) throw new Error('Delete request failed');
 
-      // Update local powerLabels cache: remove any canonical variants for this topic|powerKey
+      // Update local powerLabels cache: remove any canonical variants for this canonical storedTopic|powerKey
       setPowerLabels(prev => {
         const next = { ...prev };
         try {
-          const candidates = canonicalCandidatesForTopic(topic);
+          const candidates = canonicalCandidatesForTopic(storedTopic);
+          // also include the storedTopic itself and an uppercased form
+          candidates.push(storedTopic);
+          candidates.push(String(storedTopic).toUpperCase());
           candidates.forEach(t => {
             delete next[`${t}|${powerKey}`];
             delete next[`${t}|${powerKey.toUpperCase()}`];
             delete next[`${t.toUpperCase()}|${powerKey}`];
             delete next[`${t.toUpperCase()}|${powerKey.toUpperCase()}`];
           });
-          // also delete the literal topic variants
-          delete next[`${topic}|${powerKey}`];
-          delete next[`${topic}|${powerKey.toUpperCase()}`];
         } catch (e) {}
         return next;
       });
@@ -706,9 +919,20 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
         return out;
       });
 
+      // Also clear any local draft keyed to this topic|powerKey
+      try {
+        setEditedPowerLabels(prev => { const next = { ...prev }; delete next[`${topic}|${powerKey}`]; delete next[`${topic}|${powerKey}`.toUpperCase()]; return next; });
+      } catch (e) {}
+
       // Refresh authoritative labels in background but don't force a page reload
       try { await loadPowerLabelsAndStates(); } catch (e) { /* best-effort */ }
       try { Alert.alert('Deleted', 'Power label removed'); } catch (e) { if (typeof window !== 'undefined') window.alert('Power label removed'); }
+      // notify other parts of the SPA that power labels changed so dashboards refresh
+      try {
+        if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          window.dispatchEvent(new CustomEvent('brewski:power-labels-synced', { detail: { topic, powerKey, deleted: true, ts: Date.now() } }));
+        }
+      } catch (e) {}
       return true;
     } catch (e) {
       if (DEBUG) console.warn('doDeletePowerLabel error', e && e.message);
@@ -730,6 +954,18 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   // Also reload power labels/states whenever the selected customer changes
   useEffect(() => {
     if (initial) loadPowerLabelsAndStates();
+  }, [initial && initial.id, initial && initial.slug]);
+
+  // Listen for client-side sync events from the Dashboard so labels refresh immediately
+  useEffect(() => {
+    const handler = (ev) => {
+      if (DEBUG) console.log('AdminPortal: received power-labels-synced event', ev && ev.detail);
+      try { loadPowerLabelsAndStates(); } catch (e) {}
+    };
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('brewski:power-labels-synced', handler);
+    }
+    return () => { try { if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') window.removeEventListener('brewski:power-labels-synced', handler); } catch (e) {} };
   }, [initial && initial.id, initial && initial.slug]);
   const [slug, setSlug] = useState(initial ? initial.slug : '');
   const [name, setName] = useState(initial ? initial.name : '');
@@ -867,11 +1103,23 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           // Use per-customer delete when id is numeric; otherwise attempt
           // generic delete path to avoid malformed URLs like /admin/api/customers/default/topics/...
           let res;
+          // First try numeric per-customer path
           if (initial && initial.id && Number(initial.id) && !Number.isNaN(Number(initial.id))) {
-            res = await doFetch(`/admin/api/customers/${initial.id}/topics/${topicId}`, { method: 'DELETE' });
-          } else {
-            res = await doFetch(`/admin/api/customers/topics/${topicId}`, { method: 'DELETE' });
+            try { res = await doFetch(`/admin/api/customers/${initial.id}/topics/${topicId}`, { method: 'DELETE' }); } catch (e) { res = null; }
           }
+          // If that failed or no numeric id, try slug-based generic delete
+          if (!res || !res.ok) {
+            try { res = await doFetch(`/admin/api/customers/topics/${topicId}`, { method: 'DELETE' }); } catch (e) { res = null; }
+          }
+          // If still failing, try deleting by topic key (query-param/body variants)
+          if (!res || !res.ok) {
+            try {
+              const key = encodeURIComponent(topicId);
+              // try query param DELETE
+              res = await doFetch(`/admin/api/customers/topics?topic_key=${key}`, { method: 'DELETE' });
+            } catch (e) { res = null; }
+          }
+          if (!res || !res.ok) throw new Error('Delete failed');
           if (DEBUG) console.log('deleteTopic response', res);
           loadTopics();
           try { Alert.alert('Deleted', 'Topic deleted'); } catch (e) { if (typeof window !== 'undefined') window.alert('Topic deleted'); }
@@ -1030,20 +1278,13 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
                     <View key={pk} style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 6 }}>
                       <Text style={{ width: 80 }}>{pk}: <Text style={{ color: '#1b5e20' }}>{row.powerKeys[pk]}</Text></Text>
                       <TextInput
-                        value={lookupPowerLabel(row.topic, pk) || ''}
-                        onChangeText={txt => setPowerLabels(l => ({ ...l, [`${row.topic}|${pk}`]: txt }))}
+                        value={(editedPowerLabels[`${row.topic}|${pk}`] !== undefined) ? editedPowerLabels[`${row.topic}|${pk}`] : (lookupPowerLabel(row.topic, pk) || '')}
+                        onChangeText={txt => setEditedPowerLabels(e => ({ ...e, [`${row.topic}|${pk}`]: txt }))}
                         placeholder="Label"
                         placeholderTextColor={PLACEHOLDER_COLOR}
                         style={[styles.input, { flex: 1, marginLeft: 8, minWidth: 80 }]}
                       />
                       <View style={{ flexDirection: 'row', marginLeft: 8, gap: 8 }}>
-                        <TouchableOpacity
-                          onPress={() => savePowerLabel(row.topic, pk, powerLabels[`${row.topic}|${pk}`] || '')}
-                          style={{ backgroundColor: '#1b5e20', paddingVertical: 6, paddingHorizontal: 12, borderRadius: 6 }}
-                          accessibilityLabel={`Save label for ${pk}`}
-                        >
-                          <Text style={{ color: '#fff', fontWeight: '600' }}>Save</Text>
-                        </TouchableOpacity>
                         <TouchableOpacity
                           onPress={() => confirmDeletePowerLabel(row.topic, pk)}
                           style={{ marginLeft: 4, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6, alignSelf: 'center' }}
@@ -1057,6 +1298,12 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
                 </View>
               ))}
             </View>
+            <View style={{ marginTop: 12, marginBottom: 8, flexDirection: 'row', justifyContent: 'flex-end', gap: 8 }}>
+              <TouchableOpacity onPress={saveAllPowerLabels} style={[styles.btn, styles.btnPrimarySmall]} accessibilityLabel="Save all power labels">
+                <Text style={styles.btnPrimaryText}>Save All</Text>
+              </TouchableOpacity>
+            </View>
+
             <View style={styles.dangerZone}>
               <Text style={styles.dangerTitle}>Danger Zone</Text>
               <Text style={styles.dangerDesc}>Delete this customer and ALL associated users and topics. This cannot be undone.</Text>

@@ -13,7 +13,6 @@ function safeSend(res, status, body, contentType) {
   }
 }
 const { createUser, findUserByUsername, verifyPassword, signToken, verifyToken, findUserById, updateUserById, updateUserFieldsByUsername } = require('./auth');
-const { ingestNumeric } = require('./ingest');
 
 function parseBodyJson(req, res, cb) {
   let body = '';
@@ -46,6 +45,34 @@ function extractBearerToken(req, url) {
   if (parts.length === 2 && /^Bearer$/i.test(parts[0])) return parts[1];
   // fallback to query param
   try { return url.searchParams && url.searchParams.get('token'); } catch(e) { return null; }
+}
+
+// Canonicalize incoming topic strings into SITE/DEVICE/STATE
+// - strip leading tele/ or stat/
+// - remove any trailing STATE token(s)
+// - default site to BREW when omitted
+// - uppercase site/device
+function canonicalizeTopic(raw) {
+  try {
+    if (!raw) return raw;
+    let s = String(raw).trim();
+    s = s.replace(/^(tele|stat)\//i, '');
+    const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
+    // remove trailing STATE tokens if present
+    while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
+    if (parts.length === 0) return raw;
+    let site = 'BREW';
+    let device = '';
+    if (parts.length === 1) {
+      device = parts[0];
+    } else {
+      site = parts[0] || 'BREW';
+      device = parts[1] || '';
+    }
+    site = String(site).toUpperCase();
+    device = String(device).toUpperCase();
+    return `${site}/${device}/STATE`;
+  } catch (e) { return raw; }
 }
 
 function handleAdminApi(req, res, url) {
@@ -202,29 +229,52 @@ function handleAdminApi(req, res, url) {
         if (isAdmin && !requestedCustomerId) {
           // Admin requesting all labels across all customers
           if (topic) {
-            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE topic = ? ORDER BY customer_id, topic, power_key').all(topic);
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE topic = ? ORDER BY customer_id, topic, power_key').all(topic);
           } else {
-            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels ORDER BY customer_id, topic, power_key').all();
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels ORDER BY customer_id, topic, power_key').all();
           }
         } else if (isAdmin && requestedCustomerId) {
           // Admin requesting labels for specific customer
           const customerId = Number(requestedCustomerId);
           if (topic) {
-            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(customerId, topic);
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(customerId, topic);
           } else {
-            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(customerId);
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(customerId);
           }
         } else {
           // Regular user - only their own customer's labels
           if (!me.customer_id) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }
           if (topic) {
-            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(me.customer_id, topic);
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(me.customer_id, topic);
           } else {
-            rows = db.prepare('SELECT id, customer_id, topic, power_key, label FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(me.customer_id);
+            rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(me.customer_id);
           }
         }
+        // Normalize topics and dedupe by customer/topic/power_key in-memory so clients
+        // receive a single canonical mapping per customer/topic/power_key even if the
+        // DB contains legacy or duplicate variants.
+        // use canonicalizeTopic helper
+
+        const dedupeMap = new Map();
+        for (const r of rows) {
+          try {
+            const canon = canonicalizeTopic(r.topic);
+            const pk = String(r.power_key || '').toUpperCase();
+            const cid = Number(r.customer_id) || 0;
+            const key = `${cid}|${canon}|${pk}`;
+            const existing = dedupeMap.get(key);
+            if (!existing) dedupeMap.set(key, Object.assign({}, r, { topic: canon, power_key: pk }));
+            else {
+              // prefer the most recently-updated row
+              const exUpdated = Number(existing.updated_at) || 0;
+              const curUpdated = Number(r.updated_at) || 0;
+              if (curUpdated > exUpdated) dedupeMap.set(key, Object.assign({}, r, { topic: canon, power_key: pk }));
+            }
+          } catch (e) { /* ignore per-row errors */ }
+        }
+        const out = Array.from(dedupeMap.values());
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, labels: rows }));
+        res.end(JSON.stringify({ ok: true, labels: out }));
       } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
       return true;
     }
@@ -233,8 +283,15 @@ function handleAdminApi(req, res, url) {
     if (url.pathname === '/admin/api/power-labels' && req.method === 'POST') {
       parseBodyJson(req, res, (err, obj) => {
         if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
-        const { topic, power_key, label, customer_id } = obj || {};
+        let { topic, power_key, label, customer_id } = obj || {};
         if (!topic || !power_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
+        // Normalize incoming topic to a canonical stored form to avoid duplicates and
+        // make client lookups reliable. Rules (best-effort):
+        //  - strip leading tele/ or stat/ prefixes
+        //  - ensure stored format is SITE/DEVICE/STATE
+        //  - if incoming topic lacks site, default to BREW
+          // canonicalize incoming topic using helper
+          try { topic = canonicalizeTopic(topic); } catch (e) { /* fallback: leave original */ }
         try {
           // Lightweight diagnostic logging to help correlate client-side failures
           // with proxy/origin logs. Avoid logging full request bodies or tokens.
@@ -263,7 +320,7 @@ function handleAdminApi(req, res, url) {
             targetCustomerId = me.customer_id;
           }
           
-          // Upsert (insert or update)
+          // Upsert (insert or update) using the canonicalized topic
           const info = db.prepare('INSERT INTO power_labels (customer_id, topic, power_key, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(customer_id, topic, power_key) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at').run(targetCustomerId, topic, power_key, label, now, now);
           // Log successful persistence for correlation with proxy/tunnel logs
           try {
@@ -281,85 +338,75 @@ function handleAdminApi(req, res, url) {
     if (url.pathname === '/admin/api/power-labels' && req.method === 'DELETE') {
       parseBodyJson(req, res, (err, obj) => {
         if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
-        const { topic, power_key } = obj || {};
+        let { topic, power_key, customer_id, customer_slug } = obj || {};
         if (!topic || !power_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
         try {
           const { findUserById } = require('./auth');
           const me = findUserById(req.user.id);
-          if (!me || !me.customer_id) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
+          if (!me) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }
           const Database = require('better-sqlite3');
           const path = require('path');
           const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
           const db = new Database(DB_PATH);
-          db.prepare('DELETE FROM power_labels WHERE customer_id = ? AND topic = ? AND power_key = ?').run(me.customer_id, topic, power_key);
+
+          // Normalize incoming topic to the canonical stored form (same rules as POST)
+          const canonicalTopic = canonicalizeTopic(topic);
+
+          // Determine target customer id. Admins may provide customer_id or customer_slug
+          let targetCustomerId = null;
+          if (Number(me.is_admin) === 1) {
+            if (customer_id) targetCustomerId = Number(customer_id);
+            else if (customer_slug) {
+              const row = db.prepare('SELECT id FROM customers WHERE slug = ? LIMIT 1').get(String(customer_slug));
+              if (row && row.id) targetCustomerId = Number(row.id);
+            }
+          }
+          if (!targetCustomerId) {
+            // fallback to requester's customer (managers/users)
+            if (!me.customer_id) {
+              res.writeHead(401, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify({ error: 'unauthorized' }));
+              return;
+            }
+            targetCustomerId = Number(me.customer_id);
+          }
+
+          // Delete any rows for this customer where the normalized/canonical topic equals the requested canonical topic
+          const pkUp = String(power_key).toUpperCase();
+          // Fetch candidate rows for this customer and power_key (match case-insensitive)
+          const candidates = db.prepare('SELECT id, topic, power_key FROM power_labels WHERE customer_id = ?').all(targetCustomerId);
+          // reuse canonicalizeTopic for per-row normalization
+          // Consider equivalent canonical topics where site token may differ
+          const swapSite = (t) => {
+            try {
+              if (!t || typeof t !== 'string') return t;
+              if (t.startsWith('BREW/')) return t.replace(/^BREW\//, 'RAIL/');
+              if (t.startsWith('RAIL/')) return t.replace(/^RAIL\//, 'BREW/');
+              return t;
+            } catch (e) { return t; }
+          };
+
+          const targets = new Set();
+          targets.add(String(canonicalTopic));
+          try { targets.add(String(swapSite(canonicalTopic))); } catch (e) {}
+
+          let deletedCount = 0;
+          for (const row of candidates) {
+            try {
+              const rowPkUp = String(row.power_key || '').toUpperCase();
+              if (rowPkUp !== pkUp) continue;
+              const norm = canonicalizeTopic(row.topic);
+              if (targets.has(String(norm))) {
+                const info = db.prepare('DELETE FROM power_labels WHERE id = ?').run(row.id);
+                if (info && info.changes) deletedCount += Number(info.changes);
+              }
+            } catch (e) { /* ignore per-row errors */ }
+          }
+          // Log deletion count for diagnostics
+          try { console.log('[admin-api] DELETE /admin/api/power-labels deleted_count=', deletedCount, 'customer=', targetCustomerId, 'canonical_topic=', canonicalTopic, 'power_key=', pkUp); } catch (e) {}
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true }));
         } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
-      });
-      return true;
-    }
-
-    // POST /admin/api/telemetry  (accept a snapshot of sensors to persist latest values)
-    // Body: { customer_id?: number, customer_slug?: string, sensors: [ { key, value, ts?, raw?, type?, unit? } ] }
-    if (url.pathname === '/admin/api/telemetry' && req.method === 'POST') {
-      parseBodyJson(req, res, (err, obj) => {
-        if (err) { safeSend(res, 400, { error: 'bad_json' }); return; }
-        try {
-          const payload = obj || {};
-          const sensors = Array.isArray(payload.sensors) ? payload.sensors : [];
-          const { findUserById } = require('./auth');
-          const me = findUserById(req.user && req.user.id ? req.user.id : null);
-          if (!me) { safeSend(res, 401, { error: 'unauthorized' }); return; }
-
-          const Database = require('better-sqlite3');
-          const path = require('path');
-          const DB_PATH = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, '..', 'brewski.sqlite3');
-          const db = new Database(DB_PATH);
-
-          let targetCustomerId = null;
-          if (Number(me.is_admin) === 1 && payload.customer_id) {
-            targetCustomerId = Number(payload.customer_id);
-          } else if (Number(me.is_admin) === 1 && payload.customer_slug) {
-            const row = db.prepare('SELECT id FROM customers WHERE slug = ?').get(payload.customer_slug);
-            if (row) targetCustomerId = row.id;
-          } else {
-            if (!me.customer_id) { safeSend(res, 401, { error: 'unauthorized' }); return; }
-            targetCustomerId = me.customer_id;
-          }
-          if (!targetCustomerId) { safeSend(res, 400, { error: 'missing_customer' }); return; }
-
-          const now = Date.now();
-          let persisted = 0;
-          for (let i = 0; i < sensors.length; i++) {
-            const s = sensors[i] || {};
-            if (!s.key) continue;
-            let value = s.value;
-            if (typeof value === 'string') {
-              if (value === 'ON') value = 1;
-              else if (value === 'OFF') value = 0;
-              else value = Number(value);
-            }
-            if (typeof value !== 'number' || Number.isNaN(value)) continue;
-            try {
-              ingestNumeric({
-                customerId: targetCustomerId,
-                key: s.key,
-                value: value,
-                raw: typeof s.raw === 'string' ? s.raw : JSON.stringify(s.raw || {}),
-                ts: s.ts || now,
-                type: s.type || null,
-                unit: s.unit || null,
-                topicKey: s.key
-              });
-              persisted++;
-            } catch (e) {
-              try { console.warn('telemetry persist error', e && e.message); } catch (ee) {}
-            }
-          }
-          safeSend(res, 200, { ok: true, persisted });
-        } catch (e) {
-          safeSend(res, 500, { error: 'server_error', detail: String(e && e.message) });
-        }
       });
       return true;
     }
@@ -749,8 +796,10 @@ function handleAdminApi(req, res, url) {
         // Keep sensors handlers for backward compatibility but expose Topics endpoints
         if (url.pathname.match(/^\/admin\/api\/customers\/\d+\/(sensors|topics)/)) {
           const parts = url.pathname.split('/').filter(Boolean);
-          const cid = Number(parts[parts.length - 2]);
-          if (!cid) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_customer_id' })); return true; }
+          // Robustly find the numeric customer id after the 'customers' segment
+          const custIdx = parts.indexOf('customers');
+          const cid = (custIdx !== -1 && parts.length > custIdx + 1) ? Number(parts[custIdx + 1]) : NaN;
+          if (!cid || Number.isNaN(cid)) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_customer_id' })); return true; }
           try {
             const me = findUserById(req.user.id);
             if (!me || Number(me.is_admin) !== 1) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return true; }

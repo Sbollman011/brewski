@@ -26,14 +26,13 @@ async function fetchPowerLabels(token) {
     // 2) If we still don't have a good response, try classical fetch to likely origins.
     if (!res || (typeof res.ok !== 'undefined' && !res.ok)) {
       const candidatePaths = ['/api/power-labels', '/admin/api/power-labels'];
-  const origins = [];
-      // current origin (same origin requests) - useful for hosted SPA
-      try { if (typeof window !== 'undefined' && window.location && window.location.origin) origins.push(window.location.origin); } catch (e) {}
-      // public API host (if configured in this module)
+      // Prefer canonical API host first to avoid same-origin SPA HTML responses.
+      const origins = [];
       try { if (typeof USE_PUBLIC_WS !== 'undefined' && USE_PUBLIC_WS && typeof PUBLIC_WS_HOST === 'string' && PUBLIC_WS_HOST) origins.push(`https://${PUBLIC_WS_HOST}`); } catch (e) {}
-
-  // If no origins were discovered (e.g. React Native), fall back to the configured default host
-  try { if (!origins.length) origins.push(`https://${DEFAULT_API_HOST}`); } catch (e) {}
+      // current origin (same origin requests) - fallback to hosted SPA origin
+      try { if (typeof window !== 'undefined' && window.location && window.location.origin) origins.push(window.location.origin); } catch (e) {}
+      // If no origins were discovered (e.g. React Native), fall back to the configured default host
+      try { if (!origins.length) origins.push(`https://${DEFAULT_API_HOST}`); } catch (e) {}
 
   // Try each origin + path with Authorization header (if token provided) then with token query param
       for (const origin of origins) {
@@ -63,12 +62,68 @@ async function fetchPowerLabels(token) {
 
     // 3) If res is a Response-like object parse JSON
     if (!res) return [];
-    if (typeof res.json === 'function') {
-      const js = await res.json();
-      return js && js.labels ? js.labels : [];
+    try {
+      // If Content-Type is not JSON, attempt a fallback to the absolute API host
+      const contentType = res && res.headers && typeof res.headers.get === 'function' ? (res.headers.get('content-type') || '') : '';
+      if (contentType && contentType.toLowerCase().indexOf('application/json') === -1) {
+        // Read text body for diagnostics
+        let bodyTxt = '';
+        try { bodyTxt = await res.text(); } catch (e) { bodyTxt = '<unreadable body>'; }
+        console.warn('Dashboard: fetchPowerLabels returned non-JSON response, trying direct API host', { url: res.url || null, status: res.status, contentType, bodySnippet: (bodyTxt && bodyTxt.slice ? bodyTxt.slice(0,200) : bodyTxt) });
+
+        // Try direct requests to central API host as a recovery path
+        try {
+          const directPaths = ['/admin/api/power-labels', '/api/power-labels'];
+          for (const p of directPaths) {
+              try {
+                // Use the centralized apiFetch helper so the request is routed to the
+                // canonical API host (DEFAULT_API_HOST) and Authorization/Accept
+                // headers are handled consistently. apiFetch already prefers the
+                // api host for /api and /admin/api paths.
+                const candidate = p; // e.g. '/admin/api/power-labels' or '/api/power-labels'
+                let rr = null;
+                try {
+                  // Prefer window.apiFetch if available (it wraps apiFetch)
+                  if (typeof window !== 'undefined' && window.apiFetch) {
+                    rr = await window.apiFetch(candidate, { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
+                  } else {
+                    rr = await apiFetch(candidate, { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
+                  }
+                } catch (e) {
+                  // If apiFetch itself throws, ignore and continue to next path
+                  if (DEBUG) console.log('Dashboard: apiFetch candidate failed', candidate, e && e.message);
+                  rr = null;
+                }
+
+                if (rr && rr.ok) {
+                  const ct = rr.headers && typeof rr.headers.get === 'function' ? (rr.headers.get('content-type') || '') : '';
+                  if (ct && ct.toLowerCase().indexOf('application/json') !== -1) {
+                    const js = await rr.json().catch(() => null);
+                    return js && js.labels ? js.labels : (Array.isArray(js) ? js : []);
+                  }
+                }
+              } catch (e) { if (DEBUG) console.log('Dashboard: direct retry failed', e && e.message); }
+            }
+        } catch (e) { if (DEBUG) console.log('Dashboard: direct host fallback failed', e && e.message); }
+
+        return [];
+      }
+      if (typeof res.json === 'function') {
+        const js = await res.json().catch(async (err) => {
+          // If JSON.parse failed, include the body for easier debugging
+          let bodyTxt = '';
+          try { bodyTxt = await res.text(); } catch (e) { bodyTxt = '<unreadable body>'; }
+          console.warn('Dashboard: fetchPowerLabels failed to parse JSON', { url: res.url || null, status: res.status, bodySnippet: (bodyTxt && bodyTxt.slice ? bodyTxt.slice(0,200) : bodyTxt) });
+          return null;
+        });
+        return js && js.labels ? js.labels : (Array.isArray(js) ? js : []);
+      }
+      // If it's already parsed (rare path)
+      return res.labels || [];
+    } catch (e) {
+      console.error('Dashboard: fetchPowerLabels unexpected error while parsing response', e && e.message ? e.message : e);
+      return [];
     }
-    // If it's already parsed
-    return res.labels || [];
   } catch (e) {
     console.error('Dashboard: All power label APIs failed:', e && e.message ? e.message : e);
     return [];
@@ -112,6 +167,91 @@ function canonicalCandidatesForTopic(topic) {
     // swallow
   }
   return Array.from(candidates);
+}
+
+// Normalize a candidate canonical base into a single SITE/DEVICE[/METRIC] form.
+// Inputs are provided explicitly so this helper remains pure and testable.
+// Preference rules:
+//  - If the input already contains a non-BREW site, keep it.
+//  - If input is a legacy or BREW-prefixed device and a non-BREW variant exists
+//    in `dbSensorBases` or `gMeta`, prefer that non-BREW site.
+//  - If no site is known, prefer `mode` or `customerSlug` (if present), else default to 'BREW'.
+function normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode } = {}) {
+  try {
+    if (!origKey || typeof origKey !== 'string') return origKey;
+    const partsRaw = String(origKey).split('/').filter(Boolean);
+    // If the incoming key already looks like SITE/DEVICE or SITE/DEVICE/METRIC, use it
+    if (partsRaw.length >= 2 && partsRaw[0] && partsRaw[1]) {
+      const site = partsRaw[0]; const device = partsRaw[1]; const metric = partsRaw.length >= 3 ? partsRaw[2] : null;
+      if (site.toUpperCase() !== 'BREW') {
+        return metric ? `${site}/${device}/${metric}` : `${site}/${device}`;
+      }
+      // If site is BREW, see if a non-BREW variant exists in dbSensorBases or gMeta
+      try {
+        if (dbSensorBases && dbSensorBases.size) {
+          for (const b of Array.from(dbSensorBases)) {
+            if (!b) continue;
+            const bp = String(b).split('/').filter(Boolean);
+            if (bp.length >= 2 && bp[1].toUpperCase() === device.toUpperCase() && bp[0].toUpperCase() !== 'BREW') {
+              return bp.length >= 3 ? `${bp[0]}/${bp[1]}/${bp[2]}` : `${bp[0]}/${bp[1]}`;
+            }
+          }
+        }
+      } catch (e) {}
+      try {
+        if (gMeta) {
+          for (const k of Object.keys(gMeta || {})) {
+            if (!k) continue;
+            const kp = String(k).split('/').filter(Boolean);
+            if (kp.length >= 2 && kp[1].toUpperCase() === device.toUpperCase() && kp[0].toUpperCase() !== 'BREW') {
+              return kp.length >= 3 ? `${kp[0]}/${kp[1]}/${kp[2]}` : `${kp[0]}/${kp[1]}`;
+            }
+          }
+        }
+      } catch (e) {}
+      // fallback: preserve BREW/device
+      return metric ? `${site}/${device}/${metric}` : `${site}/${device}`;
+    }
+
+    // If single-segment or tele/stat legacy, extract device and prefer discovered sites
+    // Handle tele/<device> or tele/<site>/<device>/... variants
+    const telMatch = String(origKey).match(/^tele\/(?:([^/]+)\/)?([^/]+)(?:\/.*)?$/i) || String(origKey).match(/^stat\/(?:([^/]+)\/)?([^/]+)(?:\/.*)?$/i);
+    if (telMatch) {
+      const maybeSite = telMatch[1] || null;
+      const device = telMatch[2];
+      // If explicit non-BREW site present, honor it
+      if (maybeSite && maybeSite.toUpperCase() !== 'BREW') return `${maybeSite}/${device}`;
+      // Search DB/gMeta for a preferred non-BREW site
+      try {
+        if (dbSensorBases && dbSensorBases.size) {
+          for (const b of Array.from(dbSensorBases)) {
+            if (!b) continue;
+            const bp = String(b).split('/').filter(Boolean);
+            if (bp.length >= 2 && bp[1].toUpperCase() === device.toUpperCase() && bp[0].toUpperCase() !== 'BREW') return bp.length >= 3 ? `${bp[0]}/${bp[1]}/${bp[2]}` : `${bp[0]}/${bp[1]}`;
+          }
+        }
+      } catch (e) {}
+      try {
+        if (gMeta) {
+          for (const k of Object.keys(gMeta || {})) {
+            if (!k) continue;
+            const kp = String(k).split('/').filter(Boolean);
+            if (kp.length >= 2 && kp[1].toUpperCase() === device.toUpperCase() && kp[0].toUpperCase() !== 'BREW') return kp.length >= 3 ? `${kp[0]}/${kp[1]}/${kp[2]}` : `${kp[0]}/${kp[1]}`;
+          }
+        }
+      } catch (e) {}
+
+      // Prefer explicit mode/customerSlug if available
+      if (mode && mode.toUpperCase() !== 'BREW') return `${mode}/${device}`;
+      if (customerSlug) return `${customerSlug}/${device}`;
+      return `BREW/${device}`;
+    }
+
+    // If nothing else matched, return original
+    return origKey;
+  } catch (e) {
+    return origKey;
+  }
 }
 import { SafeAreaView, View, Text, StyleSheet, Pressable, Animated, Easing, TextInput, Button, ScrollView, useWindowDimensions } from 'react-native';
 import Constants from 'expo-constants';
@@ -190,6 +330,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   })();
   // Power label state: { `${topic}|${powerKey}`: label }
   const [powerLabels, setPowerLabels] = useState({});
+  // Grouped by canonical base: { 'SITE/DEVICE': { POWER: 'Label', POWER1: 'Label2' } }
+  const [powerLabelsByCanonical, setPowerLabelsByCanonical] = useState({});
   // Fetch power labels on mount (and when token changes)
   useEffect(() => {
     let mounted = true;
@@ -212,6 +354,46 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 if (!labelMap[k1]) labelMap[k1] = l.label || '';
                 if (!labelMap[k2]) labelMap[k2] = l.label || '';
               });
+
+              // Also add normalized SITE/DEVICE variants (e.g., RAIL/DEV or BREW/DEV)
+              try {
+                // Normalize the topic into a canonical base (SITE/DEVICE) if possible
+                const maybeParts = String(l.topic).split('/').filter(Boolean);
+                let candidateBase = null;
+                if (maybeParts.length >= 2) {
+                  // If topic is tele/<site>/<device>/STATE or similar
+                  if (/^tele$/i.test(maybeParts[0])) {
+                    candidateBase = `${maybeParts[1]}/${maybeParts[2] || maybeParts[1]}`;
+                  } else {
+                    candidateBase = `${maybeParts[0]}/${maybeParts[1]}`;
+                  }
+                } else if (maybeParts.length === 1) {
+                  candidateBase = `BREW/${maybeParts[0]}`;
+                }
+                if (candidateBase) {
+                  const norm = normalizeCanonicalBase(candidateBase, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+                  if (norm) {
+                    const kA = `${norm}|${l.power_key}`;
+                    const kB = `${norm}|${l.power_key.toUpperCase()}`;
+                    if (!labelMap[kA]) labelMap[kA] = l.label || '';
+                    if (!labelMap[kB]) labelMap[kB] = l.label || '';
+                    // also add tele variants for normalized base
+                    try {
+                      const parts = norm.split('/').filter(Boolean);
+                      if (parts.length >= 2) {
+                        const tele1 = `tele/${parts[0]}/${parts[1]}/STATE`;
+                        const tele2 = `tele/${parts[1]}/STATE`;
+                        const t1 = `${tele1}|${l.power_key}`;
+                        const t2 = `${tele2}|${l.power_key}`;
+                        if (!labelMap[t1]) labelMap[t1] = l.label || '';
+                        if (!labelMap[t2]) labelMap[t2] = l.label || '';
+                        if (!labelMap[t1.toUpperCase()]) labelMap[t1.toUpperCase()] = l.label || '';
+                        if (!labelMap[t2.toUpperCase()]) labelMap[t2.toUpperCase()] = l.label || '';
+                      }
+                    } catch (e) {}
+                  }
+                }
+              } catch (e) {}
             }
           } catch (e) { /* ignore */ }
         });
@@ -228,7 +410,91 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         });
       }
       
-      if (mounted) setPowerLabels(labelMap);
+      if (mounted) {
+        // Build canonical-indexed map so UI can group variants under one canonical base
+        const canonicalMap = {};
+        if (Array.isArray(labelsArr)) {
+          labelsArr.forEach(l => {
+            try {
+              if (!l || !l.topic || !l.power_key) return;
+              const can = canonicalForTopic(l.topic) || normalizeCanonicalBase((String(l.topic).split('/').filter(Boolean).slice(-2).join('/')) || l.topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+              if (!can) return;
+              if (!canonicalMap[can]) canonicalMap[can] = {};
+              const upk = String(l.power_key).toUpperCase();
+              canonicalMap[can][upk] = l.label || '';
+            } catch (e) { }
+          });
+        } else if (labelsArr && typeof labelsArr === 'object') {
+          // if server already returned a map, try to normalize into canonical buckets
+          Object.keys(labelsArr || {}).forEach(k => {
+            try {
+              const [topicPart, pk] = k.split('|');
+              if (!topicPart || !pk) return;
+              const can = canonicalForTopic(topicPart) || topicPart;
+              if (!canonicalMap[can]) canonicalMap[can] = {};
+              canonicalMap[can][pk.toUpperCase()] = labelsArr[k] || '';
+            } catch (e) {}
+          });
+        }
+
+        setPowerLabels(labelMap);
+        setPowerLabelsByCanonical(canonicalMap);
+
+        // Derive canonical base keys from fetched labels so we can render
+        // power buttons immediately from DB state (no MQTT required).
+        try {
+          const bases = new Set();
+          Object.keys(labelMap || {}).forEach(k => {
+            try {
+              const [topicPart] = k.split('|');
+              if (!topicPart) return;
+              // Normalize topicPart into SITE/DEVICE base if possible
+              const parts = String(topicPart).split('/').filter(Boolean);
+              let candidateBase = null;
+              if (parts.length >= 3 && parts[0].toLowerCase() === 'tele') {
+                candidateBase = `${parts[1]}/${parts[2]}`;
+              } else if (parts.length >= 2) {
+                candidateBase = `${parts[0]}/${parts[1]}`;
+              } else if (parts.length === 1) {
+                candidateBase = `BREW/${parts[0]}`;
+              }
+              if (candidateBase) {
+                const norm = normalizeCanonicalBase(candidateBase, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+                if (norm) bases.add(norm);
+              }
+            } catch (e) {}
+          });
+          if (bases.size) {
+            setDbSensorBases(prev => {
+              const s = new Set(Array.from(prev || []));
+              for (const b of Array.from(bases)) s.add(b);
+              return s;
+            });
+
+            // Initialize gPower entries (presence of keys enables power buttons)
+            setGPower(prev => {
+              const next = { ...(prev || {}) };
+              Object.keys(labelMap || {}).forEach(k => {
+                try {
+                  const [topicPart, pk] = k.split('|');
+                  if (!topicPart || !pk) return;
+                  const parts = String(topicPart).split('/').filter(Boolean);
+                  let cand = null;
+                  if (parts.length >= 3 && parts[0].toLowerCase() === 'tele') cand = `${parts[1]}/${parts[2]}`;
+                  else if (parts.length >= 2) cand = `${parts[0]}/${parts[1]}`;
+                  else if (parts.length === 1) cand = `BREW/${parts[0]}`;
+                  if (!cand) return;
+                  const norm = normalizeCanonicalBase(cand, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || cand;
+                  if (!next[norm]) next[norm] = {};
+                  const upk = String(pk).toUpperCase();
+                  if (next[norm][upk] === undefined) next[norm][upk] = false; // unknown/off by default
+                } catch (e) {}
+              });
+              return next;
+            });
+          }
+        } catch (e) {}
+      }
     })();
     return () => { mounted = false; };
   }, [token]);
@@ -283,14 +549,25 @@ function parseJwtPayload(tok) {
       let res;
       const pathPublic = '/api/companies';
       const pathAdmin = '/admin/api/companies';
+      // Prefer window.apiFetch when available
       if (typeof window !== 'undefined' && window.apiFetch) {
         try { res = await window.apiFetch(pathPublic); } catch (e) { /* try admin */ }
       }
+      // Prefer the component helper which will route admin/public paths to the
+      // canonical API host (avoids hitting the web SPA host and getting HTML).
       if (!res) {
-        const urlPath = token ? `${pathAdmin}?token=${encodeURIComponent(token)}` : pathPublic;
-        const base = (IS_REACT_NATIVE || !(typeof window !== 'undefined' && window.apiFetch)) ? `https://${resolveHost()}` : '';
-        const url = base ? `${base}${urlPath}` : urlPath;
-        res = await fetch(url, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
+        try {
+          const urlPath = token ? `${pathAdmin}?token=${encodeURIComponent(token)}` : pathPublic;
+          res = await doApiFetch(urlPath, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
+        } catch (e) {
+          // fall back to direct absolute URL if doApiFetch is unavailable for some reason
+          const urlPath = token ? `${pathAdmin}?token=${encodeURIComponent(token)}` : pathPublic;
+          const API_HOST = 'api.brewingremote.com';
+          const useApiHost = String(urlPath || '').startsWith('/admin/api') || String(urlPath || '').startsWith('/api/');
+          const base = `https://${useApiHost ? API_HOST : resolveHost()}`;
+          const url = `${base}${urlPath}`;
+          res = await fetch(url, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
+        }
       }
       if (!res || !res.ok) return new Set();
       const js = await res.json();
@@ -392,28 +669,25 @@ function parseJwtPayload(tok) {
           } catch (e) { record.attempts.push({ method: 'window.apiFetch', ok: false, error: String(e) }); }
         }
 
-        // Build base URL (absolute for RN or when apiFetch absent)
-        const base = (IS_REACT_NATIVE || !(typeof window !== 'undefined' && window.apiFetch)) ? `https://${resolveHost()}` : '';
-        const primaryUrl = base ? `${base}/admin/api/me` : '/admin/api/me';
-
-        // 2) Try fetch with Authorization header
+        // Use doApiFetch (prefers window.apiFetch) so we hit the canonical API host
+        // and avoid getting the SPA HTML from the web host.
         let res = null;
         try {
-          res = await fetch(primaryUrl, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
-          record.attempts.push({ method: 'fetch', url: primaryUrl, ok: res && res.ok, status: res && res.status });
-        } catch (e) { record.attempts.push({ method: 'fetch', url: primaryUrl, ok: false, error: String(e) }); }
+          res = await doApiFetch('/admin/api/me', { headers: token ? { Authorization: `Bearer ${token}`, Accept: 'application/json' } : undefined });
+          record.attempts.push({ method: 'doApiFetch', url: '/admin/api/me', ok: res && res.ok, status: res && res.status });
+        } catch (e) { record.attempts.push({ method: 'doApiFetch', ok: false, error: String(e) }); }
 
-        // 3) If that failed, try ?token fallback
+        // If that failed, try ?token fallback using doApiFetch as well
         if (!res || !res.ok) {
           try {
-            const qUrl = base ? `${base}/admin/api/me?token=${encodeURIComponent(token)}` : `/admin/api/me?token=${encodeURIComponent(token)}`;
-            const r2 = await fetch(qUrl);
-            record.attempts.push({ method: 'fetch?token', url: qUrl, ok: r2 && r2.ok, status: r2 && r2.status });
+            const qPath = `/admin/api/me?token=${encodeURIComponent(token)}`;
+            const r2 = await doApiFetch(qPath);
+            record.attempts.push({ method: 'doApiFetch?token', url: qPath, ok: r2 && r2.ok, status: r2 && r2.status });
             if (r2 && r2.ok) res = r2;
             else {
-              try { const txt = await (r2 && r2.text ? r2.text() : Promise.resolve(null)); record.attempts.push({ method: 'fetch?token', bodyText: txt }); } catch (e) {}
+              try { const txt = await (r2 && r2.text ? r2.text() : Promise.resolve(null)); record.attempts.push({ method: 'doApiFetch?token', bodyText: txt }); } catch (e) {}
             }
-          } catch (e) { record.attempts.push({ method: 'fetch?token', ok: false, error: String(e) }); }
+          } catch (e) { record.attempts.push({ method: 'doApiFetch?token', ok: false, error: String(e) }); }
         }
 
         // Parse response JSON if available
@@ -438,12 +712,12 @@ function parseJwtPayload(tok) {
         const custId = js && js.user && js.user.customer_id ? js.user.customer_id : (js && js.customer && js.customer.id ? js.customer.id : null);
         if (custId) {
           try {
-            const custUrl = base ? `${base}/admin/api/customers/${encodeURIComponent(custId)}` : `/admin/api/customers/${encodeURIComponent(custId)}`;
+            const custUrl = `${base}/admin/api/customers/${encodeURIComponent(custId)}`;
             let cres = null;
             try { cres = await fetch(custUrl, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }); record.attempts.push({ method: 'custFetch', url: custUrl, ok: cres && cres.ok, status: cres && cres.status }); } catch (e) { record.attempts.push({ method: 'custFetch', url: custUrl, ok: false, error: String(e) }); }
             if ((!cres || !cres.ok)) {
               try {
-                const custQ = base ? `${base}/admin/api/customers/${encodeURIComponent(custId)}?token=${encodeURIComponent(token)}` : `/admin/api/customers/${encodeURIComponent(custId)}?token=${encodeURIComponent(token)}`;
+                const custQ = `${base}/admin/api/customers/${encodeURIComponent(custId)}?token=${encodeURIComponent(token)}`;
                 const cres2 = await fetch(custQ); record.attempts.push({ method: 'custFetch?token', url: custQ, ok: cres2 && cres2.ok, status: cres2 && cres2.status });
                 if (cres2 && cres2.ok) cres = cres2;
               } catch (e) { record.attempts.push({ method: 'custFetch?token', ok: false, error: String(e) }); }
@@ -535,17 +809,13 @@ function parseJwtPayload(tok) {
           metric: meta && meta.metric ? meta.metric : null,
         };
 
-        const base = (IS_REACT_NATIVE || !(typeof window !== 'undefined' && window.apiFetch)) ? `https://${resolveHost()}` : '';
-        const url = base ? `${base}${path}` : path;
-        const res = await fetch(url, {
+        // Use the component-level doApiFetch helper so all admin/public API
+        // calls are routed consistently to the canonical API host.
+        const res = await doApiFetch(path, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(token ? { Authorization: `Bearer ${token}` } : {})
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-
         if (res && res.ok) {
           // mark as persisted so we don't retry
           persistedBasesRef.current.add(baseKey);
@@ -555,16 +825,162 @@ function parseJwtPayload(tok) {
           return true;
         } else {
           // Try to surface response body for easier debugging
+          let bodyTxt = '';
           try {
-            const txt = await res.text().catch(() => '');
-            console.warn('Dashboard: failed to persist base', { baseKey, status: res.status, path, payload, body: txt });
+            bodyTxt = await res.text().catch(() => '');
+            console.warn('Dashboard: failed to persist base', { baseKey, status: res.status, path, payload, body: bodyTxt });
           } catch (e) {
             if (DEBUG) console.log('Dashboard: failed to persist base', baseKey, res && res.status);
           }
+
+          // If server responded with 400/bad_id for numeric-customer endpoint, try generic admin topics endpoint
+          // by including customer_slug in the payload. This helps when server expects slug-based create.
+              try {
+                const lower = (bodyTxt || '').toLowerCase();
+                if (res && res.status === 400 && lower.includes('bad_id') && customerSlug) {
+                  const fallbackPath = `/admin/api/customers/topics`;
+                  const fallbackPayload = { ...payload, customer_slug: customerSlug };
+                  if (DEBUG) console.log('Dashboard: attempting slug-fallback persist', { fallbackPath, fallbackPayload });
+                  const res2 = await doApiFetch(fallbackPath, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(fallbackPayload),
+                  });
+                  if (res2 && res2.ok) {
+                    persistedBasesRef.current.add(baseKey);
+                    try { setDbSensorBases(prev => { const s = new Set(Array.from(prev || [])); s.add(baseKey); return s; }); } catch (e) {}
+                    if (DEBUG) console.log('Dashboard: slug-fallback persisted base to topics DB', baseKey, fallbackPath, fallbackPayload);
+                    return true;
+                  } else {
+                    try { const t2 = await res2.text().catch(() => ''); if (DEBUG) console.warn('Dashboard: slug-fallback failed', { status: res2.status, body: t2 }); } catch (e) {}
+                  }
+                }
+              } catch (e) { if (DEBUG) console.warn('Dashboard: slug-fallback exception', e && e.message); }
         }
       } catch (e) { if (DEBUG) console.log('Dashboard: persistBaseToDB error', e && e.message); }
       return false;
     };
+
+    // Persist discovered power keys for a canonical base to the server so AdminPortal
+    // can render editable slots for POWER/POWER1/.. keys even if labels don't yet exist.
+    const persistDiscoveredPowerKeys = async (baseKey, powerStates) => {
+      try {
+        if (!token) return false; // need admin/auth token to persist
+        if (!baseKey || !powerStates || typeof powerStates !== 'object') return false;
+        // Require numeric customerId for reliable per-customer persistence; fall back to slug
+        if (!customerId && !customerSlug) return false;
+
+        const keys = Object.keys(powerStates).map(k => String(k).toUpperCase());
+        if (!keys.length) return false;
+
+        let savedAny = false;
+      for (const pk of keys) {
+          try {
+            // Only persist when we don't already have a server-known label locally
+            const parts = String(baseKey).split('/').filter(Boolean);
+            const site = parts[0];
+            const device = parts[1] || parts[0];
+            // candidate topics that AdminPortal commonly looks for
+            const stateTopicGuess = `tele/${site}/${device}/STATE`;
+            const baseStateVariant = `${baseKey}/STATE`;
+            const teleDeviceState = `tele/${device}/STATE`;
+
+            // If any of those variants already exists in local label map, skip
+            const checkKeys = [ `${stateTopicGuess}|${pk}`, `${baseStateVariant}|${pk}`, `${teleDeviceState}|${pk}`, `${baseKey}|${pk}` ];
+            let alreadyKnown = false;
+            if (powerLabels) {
+              for (const ck of checkKeys) {
+                if (powerLabels[ck] || powerLabels[ck.toUpperCase()]) { alreadyKnown = true; break; }
+              }
+            }
+            if (alreadyKnown) continue;
+
+            // Build a single canonical payload to avoid creating duplicate DB rows
+            const canonicalBase = normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || baseKey;
+            const canonicalTopic = `${canonicalBase}/STATE`;
+            const payload = customerId ? { topic: canonicalTopic, power_key: pk, label: '', customer_id: customerId } : { topic: canonicalTopic, power_key: pk, label: '', customer_slug: customerSlug };
+
+            const tryPost = async (path, body) => {
+              try {
+                // Use the component-level doApiFetch helper which prefers window.apiFetch
+                // and otherwise builds an absolute URL to the canonical API host.
+                const res = await doApiFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+                if (res && (res.ok || (res.status && res.status >= 200 && res.status < 300))) {
+                  if (DEBUG) console.log('Dashboard: POST success via doApiFetch', { path, status: res.status });
+                  return true;
+                }
+
+                // read body for diagnostics
+                let txt = '';
+                try { txt = await (res && res.text ? res.text() : Promise.resolve('')); } catch (e) { txt = ''; }
+                if (DEBUG) console.warn('Dashboard: POST failed via doApiFetch', { path, status: res && res.status, body: txt });
+
+                // If server indicates bad_id for numeric-customer create attempts, try slug-based fallback
+                try {
+                  const lower = (txt || '').toLowerCase();
+                  if (res && res.status === 400 && lower.includes('bad_id') && body && body.customer_id && customerSlug) {
+                    const fallbackBody = Object.assign({}, body);
+                    delete fallbackBody.customer_id;
+                    fallbackBody.customer_slug = customerSlug;
+                    if (DEBUG) console.log('Dashboard: trying slug-fallback POST for power-label via doApiFetch', { path, fallbackBody });
+                    const res2 = await doApiFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fallbackBody) });
+                    if (res2 && (res2.ok || (res2.status && res2.status >= 200 && res2.status < 300))) {
+                      if (DEBUG) console.log('Dashboard: slug-fallback POST success via doApiFetch', { path, status: res2.status });
+                      return true;
+                    }
+                    try { const t2 = await (res2 && res2.text ? res2.text() : Promise.resolve('')); if (DEBUG) console.warn('Dashboard: slug-fallback failed', { status: res2 && res2.status, body: t2 }); } catch (e) {}
+                  }
+                } catch (e) { if (DEBUG) console.warn('Dashboard: slug-fallback exception', e && e.message); }
+              } catch (e) { if (DEBUG) console.warn('Dashboard: POST exception via doApiFetch', e && e.message); }
+              return false;
+            };
+            // Attempt a single POST to admin endpoint, then fallback to public endpoint
+            try {
+              if (DEBUG) console.log('Dashboard: persistDiscoveredPowerKeys try payload', payload);
+              const ok1 = await tryPost(`/admin/api/power-labels`, payload);
+              const ok2 = (!ok1) ? await tryPost(`/api/power-labels`, payload) : ok1;
+              if (ok1 || ok2) savedAny = true;
+            } catch (e) { if (DEBUG) console.warn('persistDiscoveredPowerKeys single-post exception', e && e.message); }
+          } catch (e) {}
+        }
+        if (savedAny) {
+              // Refresh labels map so UI shows editable slots quickly
+              try {
+                const labelsArr = await fetchPowerLabels(token);
+                // convert to map like initial load does
+                const labelMap = {};
+                if (Array.isArray(labelsArr)) {
+                  labelsArr.forEach(l => {
+                    try {
+                      if (l && l.topic && l.power_key) {
+                        const key = `${l.topic}|${l.power_key}`;
+                        labelMap[key] = l.label || '';
+                        labelMap[key.toUpperCase()] = l.label || '';
+                        const candidates = canonicalCandidatesForTopic(l.topic);
+                        candidates.forEach(t => {
+                          const k1 = `${t}|${l.power_key}`;
+                          const k2 = `${t}|${l.power_key.toUpperCase()}`;
+                          if (!labelMap[k1]) labelMap[k1] = l.label || '';
+                          if (!labelMap[k2]) labelMap[k2] = l.label || '';
+                        });
+                      }
+                    } catch (e) {}
+                  });
+                }
+                setPowerLabels(l => ({ ...l, ...labelMap }));
+                // Inform other parts of the SPA (AdminPortal) that power-labels changed
+                try {
+                  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+                    const ev = new CustomEvent('brewski:power-labels-synced', { detail: { timestamp: Date.now() } });
+                    window.dispatchEvent(ev);
+                  }
+                } catch (e) {}
+              } catch (e) {}
+        }
+        return savedAny;
+      } catch (e) { return false; }
+    };
+    
   const anim = useRef(new Animated.Value(0)).current;
   const needleAnim = useRef(new Animated.Value(0)).current;
   const spinAnim = useRef(new Animated.Value(0)).current;
@@ -616,6 +1032,33 @@ function parseJwtPayload(tok) {
   // gauges should be created. Populated during snapshot hydrate and kept for runtime.
   const [dbSensorBases, setDbSensorBases] = useState(new Set());
 
+    // Auto-sync: when gPower changes, ensure discovered bases and power keys exist in server DB.
+    // This runs best-effort in background and avoids repeated work via a ref cache.
+    const syncedPowerRef = useRef(new Set());
+    useEffect(() => {
+      try {
+        const entries = Object.entries(gPower || {});
+        if (!entries.length) return;
+        (async () => {
+          for (const [baseKeyRaw, states] of entries) {
+            try {
+              const baseKey = normalizeCanonicalBase(baseKeyRaw, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+              if (!baseKey) continue;
+              // Skip DUMMYs
+              if (/\bDUMMY/i.test(baseKey)) continue;
+              const cacheKey = `${baseKey}|${Object.keys(states || {}).join(',')}`;
+              if (syncedPowerRef.current.has(cacheKey)) continue;
+              // Persist canonical base (topics DB) if missing
+              await persistBaseToDB(baseKey, baseKeyRaw, gMeta && gMeta[baseKeyRaw] ? gMeta[baseKeyRaw] : null);
+              // Persist discovered POWER keys as empty power_label rows so AdminPortal can edit them
+              await persistDiscoveredPowerKeys(baseKey, states);
+              syncedPowerRef.current.add(cacheKey);
+            } catch (e) { /* swallow per-entry errors */ }
+          }
+        })();
+      } catch (e) {}
+    }, [gPower, knownSlugs, gMeta, dbSensorBases, customerSlug, mode, token]);
+
   // derive the device list from known sensor/target keys + defaults
   const deviceList = useMemo(() => {
     // Use a canonical base of ORG/DEVICE for grouping. Keep a representative originalKey
@@ -627,55 +1070,8 @@ function parseJwtPayload(tok) {
       // Prefer explicit meta when present
       const m = gMeta[origKey];
       if (m && m.site && m.device) return `${m.site}/${m.device}`;
-
-      // Use server-provided known slugs when available; fall back to customerSlug/gMeta heuristics
-      const slugs = (knownSlugs && knownSlugs.size) ? knownSlugs : (() => {
-        const s = new Set();
-        try { Object.values(gMeta || {}).forEach(m => { if (m && m.site) s.add(String(m.site).toUpperCase()); }); } catch (e) {}
-        if (customerSlug) s.add(String(customerSlug).toUpperCase());
-        return s;
-      })();
-      const parts = origKey.split('/').filter(Boolean);
-
-      // Preferred pattern: tele/<ORG>/<DEVICE>/Sensor or tele/<ORG>/<DEVICE>/... -> use ORG/DEVICE
-      // Only treat this as org-prefixed when there are at least 4 segments (tele, org, device, terminal/extra)
-      if (parts.length >= 4 && (parts[0] && (parts[0].toLowerCase() === 'tele' || parts[0].toLowerCase() === 'stat'))) {
-        const orgCandidate = parts[1];
-        const device = parts[2];
-        if (orgCandidate && device) {
-          // If the orgCandidate matches a known slug, use it; otherwise if we have
-          // a current customerSlug (mode) treat unknown orgs as BREW so admins see them
-          if (slugs.has(orgCandidate.toUpperCase())) return `${orgCandidate}/${device}`;
-          // Legacy or unknown orgs map to BREW by default
-          return `BREW/${device}`;
-        }
-      }
-
-      // Legacy pattern: tele/<DEVICE>/Sensor or stat/<DEVICE>/Sensor (no org segment)
-      // Default these to BREW by policy — DB topics (AdminPortal) are authoritative and
-      // unprefixed topics should belong to the catch-all BREW customer.
-      if (parts.length >= 2 && (parts[0] && (parts[0].toLowerCase() === 'tele' || parts[0].toLowerCase() === 'stat'))) {
-        const device = parts[1];
-        if (device) {
-          return `BREW/${device}`;
-        }
-      }
-
-      // If already in ORG/DEVICE form (or DEVICE/METRIC), prefer to use the first two parts
-      if (parts.length >= 2) {
-        const first = parts[0]; const second = parts[1];
-        if (slugs.has(first.toUpperCase())) return `${first}/${second}`;
-        // If the first part looks like a known customer slug or uppercase token, map to that
-        if (/^[A-Z0-9_-]{2,32}$/.test(first)) return `${first}/${second}`;
-        // treat unknown first part as belonging to BREW
-        return `BREW/${second}`;
-      }
-
-      // Single segment -> treat as device under BREW by default
-      if (parts.length === 1) {
-        return `BREW/${parts[0]}`;
-      }
-      return origKey;
+        // Normalize using helper (prefers DB/gMeta-discovered non-BREW variants)
+        return normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
     };
 
     const addOrigKey = (origKey) => {
@@ -878,14 +1274,45 @@ function parseJwtPayload(tok) {
   // Helper to resolve a power label for a given canonical base and powerKey.
   // This will try direct matches, canonical candidate variants, uppercase keys,
   // and finally a device-name scoped fallback so labels appear in the right customer context.
+  // Compute a stable canonical base for a raw topic string. Prefer DB snapshot
+  // entries and explicit mode/customerSlug when available so variants collapse
+  // to a single representative.
+  const canonicalForTopic = (topic) => {
+    try {
+      if (!topic || typeof topic !== 'string') return null;
+      // If topic already looks canonical like SITE/DEVICE... return it
+      if (/^[A-Z0-9_-]+\/[A-Z0-9_-]+/i.test(topic)) {
+        // prefer DB-backed base when available
+        const norm = normalizeCanonicalBase(topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+        return norm || topic;
+      }
+      // Fallback: normalize anyway
+      return normalizeCanonicalBase(topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || topic;
+    } catch (e) { return topic; }
+  };
+
   const getPowerLabel = (baseKey, powerKey) => {
     if (!baseKey || !powerKey) return '';
     try {
       const pk = String(powerKey).toUpperCase();
+      // Prefer canonical grouped labels (collapses tele/... and BREW/... variants)
+      try {
+        const can = canonicalForTopic(baseKey) || baseKey;
+        if (powerLabelsByCanonical && powerLabelsByCanonical[can] && powerLabelsByCanonical[can][pk]) return powerLabelsByCanonical[can][pk];
+      } catch (e) {}
+
+      // First try exact direct matches
       const direct = `${baseKey}|${pk}`;
       if (powerLabels[direct]) return powerLabels[direct];
-      // try uppercase direct
       if (powerLabels[direct.toUpperCase()]) return powerLabels[direct.toUpperCase()];
+
+      // Prefer looking up by canonical grouping: convert known raw topics into
+      // canonical bases and look for any label stored under that canonical base
+      // (this groups tele/... and BREW/... variants together)
+      const can = canonicalForTopic(baseKey) || baseKey;
+      const canonicalKey = `${can}|${pk}`;
+      if (powerLabels[canonicalKey]) return powerLabels[canonicalKey];
+      if (powerLabels[canonicalKey.toUpperCase()]) return powerLabels[canonicalKey.toUpperCase()];
 
       // Try canonical candidate topics (admin stored topics may use tele/... variants)
       const candidates = canonicalCandidatesForTopic(baseKey);
@@ -910,7 +1337,44 @@ function parseJwtPayload(tok) {
         const k = `${c}|${pk}`;
         if (powerLabels[k]) return powerLabels[k];
         if (powerLabels[k.toUpperCase()]) return powerLabels[k.toUpperCase()];
+        // also try canonical-for-candidate
+        const candCan = canonicalForTopic(c);
+        if (candCan) {
+          const kk = `${candCan}|${pk}`;
+          if (powerLabels[kk]) return powerLabels[kk];
+          if (powerLabels[kk.toUpperCase()]) return powerLabels[kk.toUpperCase()];
+        }
       }
+
+      // Special-case normalization: some devices arrive as legacy/unprefixed and
+      // are placed into the BREW bucket while AdminPortal stores labels under
+      // the real org slug (or vice-versa). Try swapping prefixes between BREW
+      // and any known slug to find a matching label before falling back to
+      // device-name-only heuristics.
+      try {
+        const parts = String(baseKey).split('/').filter(Boolean);
+        if (parts.length >= 2) {
+          const site = parts[0];
+          const device = parts[1];
+          // If this base is under BREW, try known slugs that match a customer and
+          // look up labels under that prefix (e.g., BREW/FOO -> FOO/Device)
+          if (site.toUpperCase() === 'BREW' && knownSlugs && knownSlugs.size) {
+            for (const s of Array.from(knownSlugs)) {
+              if (!s) continue;
+              const alt = `${s}/${device}|${pk}`;
+              if (powerLabels[alt]) return powerLabels[alt];
+              if (powerLabels[alt.toUpperCase()]) return powerLabels[alt.toUpperCase()];
+            }
+          }
+          // Conversely, if baseKey is under a customer slug but admin labels were
+          // stored under BREW, try the BREW-prefixed variant.
+          if (site.toUpperCase() !== 'BREW') {
+            const alt2 = `BREW/${device}|${pk}`;
+            if (powerLabels[alt2]) return powerLabels[alt2];
+            if (powerLabels[alt2.toUpperCase()]) return powerLabels[alt2.toUpperCase()];
+          }
+        }
+      } catch (e) {}
 
       // Last resort: try matching by device name across powerLabels keys where customer matches
       const parts = baseKey.split('/').filter(Boolean);
@@ -927,6 +1391,15 @@ function parseJwtPayload(tok) {
             if (t.endsWith(`/${upDev}`) || t.includes(`/${upDev}/`) || t === upDev) return powerLabels[k];
           } catch (e) {}
         }
+      }
+    } catch (e) {}
+    // Diagnostic: surface missing mapping when we have labels loaded but no match
+    try {
+      const hasAny = Object.keys(powerLabels || {}).length > 0;
+      if (hasAny) {
+        if (DEBUG) console.warn('Dashboard: getPowerLabel - no label found', { baseKey, powerKey, sampleKeys: Object.keys(powerLabels || {}).slice(0,10) });
+      } else {
+        if (DEBUG) console.warn('Dashboard: getPowerLabel - powerLabels map empty');
       }
     } catch (e) {}
     return '';
@@ -957,6 +1430,62 @@ function parseJwtPayload(tok) {
     // fallback to configured public host or server FQDN
     try { if (typeof PUBLIC_WS_HOST === 'string' && PUBLIC_WS_HOST) return PUBLIC_WS_HOST; } catch (e) {}
     return (process.env.SERVER_FQDN || 'api.brewingremote.com');
+  };
+
+  // Centralized helper for making admin/public API calls from the Dashboard.
+  // Prefer `window.apiFetch` when available (it may return parsed JSON). When
+  // not available, build an absolute URL to the canonical API host so requests
+  // don't go to the web host and accidentally return SPA HTML.
+  const doApiFetch = async (path, opts) => {
+    try {
+      if (typeof window !== 'undefined' && window.apiFetch) {
+        try {
+          const r = await window.apiFetch(path, opts);
+          // If window.apiFetch returned a Response-like object, return it.
+          if (r && typeof r === 'object' && ('ok' in r || 'status' in r)) return r;
+          // Otherwise wrap the parsed JSON into a Response-like object
+          return {
+            ok: true,
+            status: 200,
+            json: async () => r,
+            text: async () => (typeof r === 'string' ? r : JSON.stringify(r)),
+          };
+        } catch (e) {
+          // fallthrough to direct fetch
+          if (DEBUG) console.warn('Dashboard: window.apiFetch failed, falling back to direct fetch', e && e.message);
+        }
+      }
+    } catch (e) {}
+
+    const base = `https://${resolveHost()}`;
+    const url = `${base}${path}`;
+    const headers = Object.assign({}, (opts && opts.headers) || {});
+    // Prefer JSON responses and mark as XHR so some proxies/servers route to API
+    if (!headers['Accept']) headers['Accept'] = 'application/json, text/plain;q=0.9,*/*;q=0.1';
+    // Avoid adding X-Requested-With for cross-origin requests to prevent CORS
+    // preflight failures when the SPA origin differs from the API host.
+    try {
+      if (!headers['X-Requested-With']) {
+        const isWeb = (typeof window !== 'undefined' && typeof window.document !== 'undefined');
+        if (!isWeb) {
+          headers['X-Requested-With'] = 'XMLHttpRequest';
+        } else {
+          try {
+            const isAbsolute = /^https?:\/\//i.test(url);
+            if (!isAbsolute) headers['X-Requested-With'] = 'XMLHttpRequest';
+            else {
+              const fpHost = (new URL(url)).hostname || '';
+              const curHost = window.location.hostname || '';
+              if (fpHost && curHost && fpHost === curHost) headers['X-Requested-With'] = 'XMLHttpRequest';
+            }
+          } catch (e) {}
+        }
+      }
+    } catch (e) {}
+    if (token && !headers.Authorization && !headers.authorization) headers.Authorization = `Bearer ${token}`;
+    const merged = Object.assign({}, opts || {}, { headers });
+    const res = await fetch(url, merged);
+    return res;
   };
 
   const reconnectMeta = useRef({ attempts: 0, timer: null });
@@ -1142,8 +1671,9 @@ function parseJwtPayload(tok) {
               meta.site = inferred || 'BREW';
             }
             // build canonical base using current mode/customerSlug
-            const canonical = canonicalBaseFromMeta(meta) || (meta.metric ? `${meta.device}/${meta.metric}` : `${meta.device}`);
+            let canonical = canonicalBaseFromMeta(meta) || (meta.metric ? `${meta.device}/${meta.metric}` : `${meta.device}`);
             if (!canonical) return;
+            try { canonical = normalizeCanonicalBase(canonical, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }); } catch (e) {}
             setGSensors(prev => ({ ...prev, [canonical]: val }));
             // register enriched meta under canonical base
             const enrichedMeta = { site: (meta.site || (mode && mode !== 'BREW' ? mode : customerSlug || 'BREW')), device: meta.device, metric: meta.metric || null, terminal: 'Sensor' };
@@ -1220,8 +1750,9 @@ function parseJwtPayload(tok) {
               const inferred = findSiteForDevice(meta.device);
               meta.site = inferred || 'BREW';
             }
-            const canonical = canonicalBaseFromMeta(meta) || (meta.metric ? `${meta.device}/${meta.metric}` : `${meta.device}`);
+            let canonical = canonicalBaseFromMeta(meta) || (meta.metric ? `${meta.device}/${meta.metric}` : `${meta.device}`);
             if (!canonical) return;
+            try { canonical = normalizeCanonicalBase(canonical, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }); } catch (e) {}
             setGTargets(prev => ({ ...prev, [canonical]: val }));
             const enrichedMeta = { site: (meta.site || (mode && mode !== 'BREW' ? mode : customerSlug || 'BREW')), device: meta.device, metric: meta.metric || null, terminal: 'Target' };
             registerMeta(canonical, enrichedMeta);
@@ -1259,15 +1790,19 @@ function parseJwtPayload(tok) {
               const customerFromTopic = parts[1];
               deviceName = parts[2];
               if (customerFromTopic && deviceName) {
+                // Prefer explicit site when present in topic; treat it as authoritative
                 baseKey = `${customerFromTopic}/${deviceName}`;
+                // Normalize minimally to keep site/device as-is (don't prefer DB BREW over explicit site)
+                try { var normBaseExplicit = `${customerFromTopic}/${deviceName}`; } catch (e) { var normBaseExplicit = baseKey; }
               }
             }
             // Legacy Pattern: tele/<device>/(STATE|RESULT) - direct device (being phased out)
             else if (parts[0].toLowerCase() === 'tele' && parts.length === 3) {
               deviceName = parts[1];
               if (deviceName) {
-                // Map legacy devices to current customer context; prefer mode, fall back to BREW
-                const siteForLegacy = mode || 'BREW';
+                // Try to infer site from existing meta first, else prefer explicit mode, then BREW
+                const inferred = findSiteForDevice(deviceName);
+                const siteForLegacy = inferred || mode || 'BREW';
                 baseKey = `${siteForLegacy}/${deviceName}`;
               }
             }
@@ -1275,30 +1810,67 @@ function parseJwtPayload(tok) {
             else if (parts[0].toLowerCase() === 'stat' && parts.length === 3) {
               deviceName = parts[1];
               if (deviceName) {
-                const siteForStat = mode || 'BREW';
+                const inferred = findSiteForDevice(deviceName);
+                const siteForStat = inferred || mode || 'BREW';
                 baseKey = `${siteForStat}/${deviceName}`;
               }
             }
-            
+
             if (!baseKey || !deviceName) return;
             
             // Update meta information
             setGMeta(prev => {
               const existing = prev[baseKey];
               if (!existing && baseKey.includes('/')) {
-                // Customer/Device format - store customer as site, device as device
                 const [customerSlugFromKey, deviceFromKey] = baseKey.split('/');
                 return { ...prev, [baseKey]: { site: customerSlugFromKey, device: deviceFromKey, metric: null } };
               }
               return prev;
             });
-            
-            // Update power states
-            setGPower(prev => {
-              const cur = { ...(prev[baseKey] || {}) };
-              Object.assign(cur, powerStates);
-              return { ...prev, [baseKey]: cur };
-            });
+
+            // Update power states: if the topic contained an explicit site (normBaseExplicit),
+            // treat that as authoritative and write under that key. Otherwise normalize.
+            try {
+              let normBase;
+              if (typeof normBaseExplicit !== 'undefined' && normBaseExplicit) {
+                normBase = normBaseExplicit;
+              } else {
+                normBase = normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+              }
+              // Update meta information under normalized key
+              setGMeta(prev => {
+                const existing = prev[normBase] || prev[baseKey];
+                if (!existing && normBase && normBase.includes('/')) {
+                  const [customerSlugFromKey, deviceFromKey] = normBase.split('/');
+                  return { ...prev, [normBase]: { site: customerSlugFromKey, device: deviceFromKey, metric: null } };
+                }
+                return prev;
+              });
+
+              // Persist canonical base to topics DB if missing (best-effort). Use the
+              // original topic string as a rawTopic hint so server can create a sensible record.
+              try {
+                if (normBase) {
+                  if (DEBUG) console.debug('Dashboard: persistBaseToDB attempt for', normBase, topic);
+                  persistBaseToDB(normBase, topic, { site: (normBase.split('/')[0] || null), device: (normBase.split('/')[1] || null) }).catch(() => {});
+                }
+              } catch (e) {}
+
+              setGPower(prev => {
+                const cur = { ...(prev[normBase] || {}) };
+                Object.assign(cur, powerStates);
+                const next = { ...prev, [normBase]: cur };
+                // Persist discovered power keys in background (best-effort)
+                try { persistDiscoveredPowerKeys(normBase, cur).catch(() => {}); } catch (e) {}
+                return next;
+              });
+            } catch (e) {
+              setGPower(prev => {
+                const cur = { ...(prev[baseKey] || {}) };
+                Object.assign(cur, powerStates);
+                return { ...prev, [baseKey]: cur };
+              });
+            }
           };
 
           if (obj.type === 'message' && obj.data && typeof obj.data.topic === 'string') {
@@ -1552,9 +2124,24 @@ function parseJwtPayload(tok) {
   }, [token, connectAttempt]);
 
   // Log token arrival timing relative to initial mount to detect race where first attempt has no token
+  // Also persist the JWT to localStorage.brewski_jwt so shared helpers (window.apiFetch)
+  // and other modules that read from localStorage will include Authorization headers.
+  // This is a minimal, safe write: only runs when a token is present and avoids
+  // repeatedly writing the same value.
   useEffect(() => {
     if (!token) return;
     debug('[TOKEN ready] len=', token.length, 'head=', token.slice(0,10));
+    try {
+      if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.setItem === 'function') {
+        const cur = window.localStorage.getItem('brewski_jwt');
+        if (cur !== token) {
+          window.localStorage.setItem('brewski_jwt', token);
+          if (DEBUG) console.log('Dashboard: persisted token to localStorage.brewski_jwt');
+        }
+      }
+    } catch (e) {
+      if (DEBUG) console.warn('Dashboard: failed to persist token to localStorage', e && e.message);
+    }
   }, [token]);
 
   useEffect(() => {
@@ -1566,20 +2153,12 @@ function parseJwtPayload(tok) {
     if (reconnectMeta.current.timer) { clearTimeout(reconnectMeta.current.timer); reconnectMeta.current.timer = null; }
     connectWebSocket();
     // Hydrate last-known values from localStorage for immediate UX (web only)
-    try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        const s = window.localStorage.getItem('brewski.gsensors'); if (s) setGSensors(prev=>({ ...JSON.parse(s), ...prev }));
-        const t = window.localStorage.getItem('brewski.gtargets'); if (t) setGTargets(prev=>({ ...JSON.parse(t), ...prev }));
-        const m = window.localStorage.getItem('brewski.gmeta'); if (m) setGMeta(prev=>({ ...JSON.parse(m), ...prev }));
-        const p = window.localStorage.getItem('brewski.gpower'); if (p) setGPower(prev=>({ ...JSON.parse(p), ...prev }));
-      }
-    } catch(e) {}
+    // NOTE: Removed localStorage hydration — rely on authoritative DB snapshot and live MQTT only
     (async () => {
       try {
-        const path = '/thresholds';
-        const base = (IS_REACT_NATIVE || !(typeof window !== 'undefined' && window.apiFetch)) ? `https://${resolveHost()}` : '';
-        const url = base ? `${base}${path}` : path;
-        const res = await (typeof window !== 'undefined' && window.apiFetch ? window.apiFetch(path) : fetch(url));
+  const path = '/thresholds';
+  let res;
+  try { res = await doApiFetch(path); } catch (e) { res = null; }
         if (res.status === 401) { try { window.dispatchEvent(new CustomEvent('brewski-unauthorized')); } catch (e) {} return; }
         const js = await res.json();
         if (js && js.overrides) setThresholds(js.overrides);
@@ -1590,14 +2169,12 @@ function parseJwtPayload(tok) {
       try {
         const latestPath = '/api/latest';
         let res;
-        if (typeof window !== 'undefined' && window.apiFetch) {
-          try { res = await window.apiFetch(latestPath); } catch (e) { res = null; }
-        }
-        if (!res) {
-          // Fallback to absolute URL in RN or when apiFetch absent
-          const base = (IS_REACT_NATIVE || !(typeof window !== 'undefined' && window.apiFetch)) ? `https://${resolveHost()}` : '';
-          const url = token ? `${base}${latestPath}?token=${encodeURIComponent(token)}` : `${base}${latestPath}`;
-          res = await fetch(url, { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
+        try {
+          // prefer central helper which may return parsed JSON
+          res = await doApiFetch(latestPath);
+        } catch (e) { res = null; }
+        if ((!res || (res && !res.ok)) && token) {
+          try { res = await doApiFetch(`${latestPath}?token=${encodeURIComponent(token)}`); } catch (e) { res = res || null; }
         }
         if (!res || !res.ok) return; // ignore failures silently
         const js = await res.json();
@@ -1654,6 +2231,11 @@ function parseJwtPayload(tok) {
           else if (device) baseKey = `${device}`;
           else baseKey = rawTopic;
 
+          // Normalize the canonical base so BREW vs non-BREW duplicates collapse
+          try {
+            baseKey = normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+          } catch (e) {}
+
           // If this snapshot row is not a STATE/RESULT-only entry, record the base
           // as an authoritative DB-backed sensor base. We avoid using STATE/RESULT
           // entries (control/state-only) to drive gauge creation.
@@ -1666,19 +2248,22 @@ function parseJwtPayload(tok) {
           if (/^POWER\d*$/i.test(powerLastSeg)) {
             // Determine power base key (site/device) from parsed parts
             if (site && device) {
-              const powerBaseKey = `${site}/${device}`;
-              const powerKey = powerLastSeg.toUpperCase();
-              if (!addsPower[powerBaseKey]) addsPower[powerBaseKey] = {};
-              let isOn = false;
-              if (typeof lv === 'string') {
-                isOn = lv === 'ON' || lv === '1' || lv === 'true';
-              } else if (typeof lv === 'number') {
-                isOn = lv === 1;
-              } else if (typeof lv === 'boolean') {
-                isOn = lv;
-              }
-              addsPower[powerBaseKey][powerKey] = isOn;
-              if (!addsMeta[powerBaseKey]) addsMeta[powerBaseKey] = { site, device, metric: null };
+              try {
+                let powerBaseKey = `${site}/${device}`;
+                powerBaseKey = normalizeCanonicalBase(powerBaseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+                const powerKey = powerLastSeg.toUpperCase();
+                if (!addsPower[powerBaseKey]) addsPower[powerBaseKey] = {};
+                let isOn = false;
+                if (typeof lv === 'string') {
+                  isOn = lv === 'ON' || lv === '1' || lv === 'true';
+                } else if (typeof lv === 'number') {
+                  isOn = lv === 1;
+                } else if (typeof lv === 'boolean') {
+                  isOn = lv;
+                }
+                addsPower[powerBaseKey][powerKey] = isOn;
+                if (!addsMeta[powerBaseKey]) addsMeta[powerBaseKey] = { site, device, metric: null };
+              } catch (e) {}
             }
             return;
           }
@@ -1890,15 +2475,7 @@ function parseJwtPayload(tok) {
   }, [mode]);
 
   // Persist gauge-related state so reloads restore immediately before network traffic
-  useEffect(() => {
-    try {
-      if (typeof window === 'undefined' || !window.localStorage) return;
-      window.localStorage.setItem('brewski.gsensors', JSON.stringify(gSensors));
-      window.localStorage.setItem('brewski.gtargets', JSON.stringify(gTargets));
-      window.localStorage.setItem('brewski.gmeta', JSON.stringify(gMeta));
-      window.localStorage.setItem('brewski.gpower', JSON.stringify(gPower));
-    } catch (e) { /* ignore quota / serialization issues */ }
-  }, [gSensors, gTargets, gMeta, gPower]);
+  // Removed client-side localStorage persistence (DB is source-of-truth).
 
   // animate displayedSensorValue toward sensorValue
   useEffect(() => {

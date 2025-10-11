@@ -19,48 +19,26 @@ function startHttpServer(opts = {}) {
   const requestHandler = (req, res) => {
     try {
       let url;
-  // Prefer an explicit SERVER_FQDN when constructing a base URL for parsing.
-  const SERVER_FQDN = process.env.SERVER_FQDN || 'api.brewingremote.com';
-  try { url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || SERVER_FQDN}`); } catch (err) {
+      try { url = new URL(req.url, `http://${(req && req.headers && req.headers.host) || 'localhost'}`); } catch (err) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'invalid_url', detail: String(err && err.message) }));
         return;
       }
 
-      // Diagnostic: log incoming admin/public power-labels requests so we can
-      // correlate browser 502s with server-side activity when tailing cloudflared.
-      try {
-        const originHeader = (req.headers && (req.headers.origin || req.headers['x-forwarded-host'] || req.headers.host)) || '-';
-        if (url.pathname && (url.pathname.includes('/api/power-labels') || url.pathname.startsWith('/admin/api'))) {
-          try { console.log(`[http] ${new Date().toISOString()} ${req.method} ${url.pathname} Origin:${originHeader} CL:${req.headers['content-length'] || 0}`); } catch (e) {}
-        }
-      } catch (e) {}
-
       const setSecurityHeadersLocal = () => setSecurityHeaders(req, res, server);
 
       // Quick health and info endpoints
-          if (req.method === 'OPTIONS') {
-            // Ensure preflight allows the methods the admin SPA will use (PUT/DELETE)
-            // and returns Access-Control-Allow-Origin when the origin is permitted.
-            setSecurityHeadersLocal();
-            // If getAllowedOrigin helper exists, call it to allow echoing origin
-            try {
-              const { getAllowedOrigin } = require('./lib/security');
-              const allowed = getAllowedOrigin(req);
-              if (allowed) {
-                res.setHeader('Access-Control-Allow-Origin', allowed);
-                res.setHeader('Vary', 'Origin');
-                res.setHeader('Access-Control-Allow-Credentials', 'true');
-              }
-            } catch (e) {}
-            res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-            // Allow common headers used by the SPA (JSON body + Authorization header)
-            res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-            res.setHeader('Access-Control-Max-Age', '600');
-            res.writeHead(204);
-            res.end();
-            return;
-          }
+      if (req.method === 'OPTIONS') {
+        // Ensure preflight allows the methods the admin SPA will use (PUT/DELETE)
+        setSecurityHeadersLocal();
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+        // Allow common headers used by the SPA (JSON body + Authorization header)
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+        res.setHeader('Access-Control-Max-Age', '600');
+        res.writeHead(204);
+        res.end();
+        return;
+      }
 
       if (url.pathname === '/health') {
         setSecurityHeadersLocal();
@@ -121,60 +99,6 @@ function startHttpServer(opts = {}) {
         return;
       }
 
-      if (url.pathname === '/api/power-labels' && req.method === 'GET') {
-        setSecurityHeadersLocal();
-        try {
-          // Auth: Bearer JWT or bridge token
-          const authHeader = (req.headers['authorization'] || '').toString();
-          const parts = authHeader.split(' ');
-          let token = null;
-          if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
-          if (!token) token = url.searchParams.get('token');
-          const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
-          let user = null;
-          if (token) {
-            if (BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
-              user = { id: 'bridge', customer_id: 1, is_admin: 1 };
-            } else {
-              try {
-                const { verifyToken, findUserById } = require('./lib/auth');
-                const claims = verifyToken(token);
-                if (claims) {
-                  const u = findUserById(claims.sub);
-                  if (u) user = u;
-                }
-              } catch (e) {}
-            }
-          }
-          if (!user) {
-            res.writeHead(401, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
-            return;
-          }
-          const customerId = Number(user.customer_id || 1);
-          const Database = require('better-sqlite3');
-          const dbPath = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, 'brewski.sqlite3');
-          const db = new Database(dbPath);
-          const topic = url.searchParams.get('topic');
-          let rows;
-          if (topic) {
-            rows = db.prepare('SELECT id, topic, power_key, label FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(customerId, topic);
-          } else {
-            rows = db.prepare('SELECT id, topic, power_key, label FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(customerId);
-          }
-          res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
-          res.end(JSON.stringify({ 
-            ok: true, 
-            labels: rows
-          }));
-          try { db.close(); } catch (e) {}
-        } catch (e) {
-          res.writeHead(500, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'server_error', detail: e && e.message }));
-        }
-        return;
-      }
-
       if (url.pathname === '/info') {
         const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : process.env.BRIDGE_TOKEN || null;
         const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');
@@ -187,6 +111,35 @@ function startHttpServer(opts = {}) {
           res.end(JSON.stringify({ server: 'brewski', ok: true }));
         }
         return;
+      }
+
+      // Delegate admin API if present (ensure CORS/security headers first)
+      // Public API shim: rewrite /api/* -> /admin/api/* and delegate to admin handler.
+      // This ensures API requests addressed to the SPA origin (e.g. brewingremote.com)
+      // are handled by the server-side API logic instead of falling through to the
+      // static SPA index (which returns HTML). If no admin handler exists for the
+      // rewritten path we return a JSON 404 to avoid serving index.html.
+      if (url.pathname.startsWith('/api/')) {
+        setSecurityHeadersLocal();
+        try {
+          const { handleAdminApi } = require('./lib/adminApi');
+          // Build a temporary URL object with the /admin prefix so the admin
+          // handler sees the expected pathname (e.g. /admin/api/power-labels).
+          const rewritten = new URL(url.toString());
+          rewritten.pathname = '/admin' + url.pathname; // '/api/...' -> '/admin/api/...'
+          const handled = handleAdminApi(req, res, rewritten);
+          if (handled) return; // admin handler responded
+          // If not handled, return JSON 404 to avoid serving SPA HTML for API paths
+          res.writeHead(404, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'not_found' }));
+          return;
+        } catch (e) {
+          // If admin handler import or execution fails, return JSON 500 rather than HTML
+          try { console.error('api rewrite handler error', e && e.message ? e.message : e); } catch (e) {}
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) }));
+          return;
+        }
       }
 
       // Delegate admin API if present (ensure CORS/security headers first)
@@ -479,15 +432,7 @@ function startHttpServer(opts = {}) {
 
   server.on('error', err => console.error('http-server error:', err && err.message ? err.message : err));
 
-  // Increase keep-alive and headers timeouts to be more forgiving for reverse proxies
-  try {
-    // Increase defaults to be more forgiving for reverse proxies (cloudflared)
-    // 120s keep-alive, headers timeout slightly larger than keepAlive
-    server.keepAliveTimeout = Number(process.env.SERVER_KEEPALIVE_MS || 120 * 1000);
-    server.headersTimeout = Number(process.env.SERVER_HEADERS_TIMEOUT_MS || 125 * 1000);
-  } catch (e) { console.warn('Unable to set server timeouts', e && e.message); }
-
-  server.listen(port, host, () => console.log('http-server listening on', host + ':' + port, server._isHttps ? '(HTTPS)' : '(HTTP)', 'SERVER_FQDN=' + (process.env.SERVER_FQDN || 'api.brewingremote.com')));
+  server.listen(port, host, () => console.log('http-server listening on', host + ':' + port, server._isHttps ? '(HTTPS)' : '(HTTP)'));
 
   return { server, port, host };
 }
