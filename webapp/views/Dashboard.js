@@ -1550,28 +1550,22 @@ function parseJwtPayload(tok) {
         const queryAllPowerStates = () => {
           const devices = ['FERM2', 'FERM4', 'FERM5', 'MASH', 'HLT', 'BOIL'];
           devices.forEach(deviceName => {
-            // Query primary power state
-            try { 
-              safeSend(ws, { 
-                type: 'publish', 
-                topic: `cmnd/${deviceName}/Power`, 
-                payload: '', 
-                id: `init-pwq-${deviceName}-${Date.now()}` 
-              }); 
-            } catch(e) {}
-            
+            try {
+              // Prefer explicit runtime mode/customer slug when available
+              const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+              const primaryTopic = site ? `cmnd/${site}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
+              safeSend(ws, { type: 'publish', topic: primaryTopic, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
+            } catch (e) {}
+
             // Query additional power states for multi-switch devices
             const multiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
             if (multiSwitchDevices.includes(deviceName)) {
               for (let i = 1; i <= 3; i++) {
                 try {
-                  safeSend(ws, { 
-                    type: 'publish', 
-                    topic: `cmnd/${deviceName}/Power${i}`, 
-                    payload: '', 
-                    id: `init-pwq-${deviceName}-p${i}-${Date.now()}` 
-                  }); 
-                } catch(e) {}
+                  const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+                  const t = site ? `cmnd/${site}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
+                  safeSend(ws, { type: 'publish', topic: t, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` });
+                } catch (e) {}
               }
             }
           });
@@ -1686,32 +1680,24 @@ function parseJwtPayload(tok) {
             // Auto-query power states for newly discovered devices
             const queryPowerStates = (customerSlug, deviceName) => {
               if (!wsRef.current || wsRef.current.readyState !== 1) return;
-              
+
               const baseKey = `${customerSlug}/${deviceName}`;
               if (gPower[baseKey]) return; // Already have power state
-              
-              // Query primary power state
-              try { 
-                wsRef.current.send(JSON.stringify({ 
-                  type: 'publish', 
-                  topic: `cmnd/${deviceName}/Power`, 
-                  payload: '', 
-                  id: `pwq-${deviceName}-${Date.now()}` 
-                })); 
-              } catch(e) {}
-              
+
+              // Use explicit customer/site prefix when available, otherwise fall back to device-only topic
+              const primaryTopic = customerSlug ? `cmnd/${customerSlug}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
+              try {
+                wsRef.current.send(JSON.stringify({ type: 'publish', topic: primaryTopic, payload: '', id: `pwq-${deviceName}-${Date.now()}` }));
+              } catch (e) {}
+
               // Query additional power states (POWER1, POWER2, POWER3) for multi-switch devices
               const commonMultiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
               if (commonMultiSwitchDevices.some(d => deviceName.toUpperCase().includes(d))) {
                 for (let i = 1; i <= 3; i++) {
                   try {
-                    wsRef.current.send(JSON.stringify({ 
-                      type: 'publish', 
-                      topic: `cmnd/${deviceName}/Power${i}`, 
-                      payload: '', 
-                      id: `pwq-${deviceName}-p${i}-${Date.now()}` 
-                    })); 
-                  } catch(e) {}
+                    const t = customerSlug ? `cmnd/${customerSlug}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
+                    wsRef.current.send(JSON.stringify({ type: 'publish', topic: t, payload: '', id: `pwq-${deviceName}-p${i}-${Date.now()}` }));
+                  } catch (e) {}
                 }
               }
             };
@@ -2309,16 +2295,19 @@ function parseJwtPayload(tok) {
             targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
           } catch (e) {}
 
-          // Query power states by device name (derive from canonical base)
+          // Query power states using canonical base when possible
           try {
             const parts = base.split('/').filter(Boolean);
             const deviceName = parts.length >= 2 ? parts[1] : parts[0];
+            const site = parts.length >= 2 ? parts[0] : null;
             if (deviceName) {
-              // Primary power query
-              try { ws.send(JSON.stringify({ type: 'publish', topic: `cmnd/${deviceName}/Power`, payload: '', id: `snap-pwq-${deviceName}-${Date.now()}` })); } catch(e) {}
+              // Primary power query: prefer site-prefixed topic
+              const primaryTopic = site ? `cmnd/${site}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
+              try { ws.send(JSON.stringify({ type: 'publish', topic: primaryTopic, payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` })); } catch(e) {}
               // Additional multi-switch queries (best-effort)
               for (let i = 1; i <= 3; i++) {
-                try { ws.send(JSON.stringify({ type: 'publish', topic: `cmnd/${deviceName}/Power${i}`, payload: '', id: `snap-pwq-${deviceName}-p${i}-${Date.now()}` })); } catch(e) {}
+                const t = site ? `cmnd/${site}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
+                try { ws.send(JSON.stringify({ type: 'publish', topic: t, payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` })); } catch(e) {}
               }
             }
           } catch (e) {}
@@ -2442,27 +2431,20 @@ function parseJwtPayload(tok) {
       const devices = ['FERM2', 'FERM4', 'FERM5', 'MASH', 'HLT', 'BOIL'];
       
       devices.forEach(deviceName => {
-        // Query primary power state
-        try { 
-          wsRef.current.send(JSON.stringify({ 
-            type: 'publish', 
-            topic: `cmnd/${deviceName}/Power`, 
-            payload: '', 
-            id: `customer-pwq-${deviceName}-${Date.now()}` 
-          })); 
-        } catch(e) {}
-        
+        try {
+          const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
+          const primaryTopic = site ? `cmnd/${site}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: primaryTopic, payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` }));
+        } catch (e) {}
+
         // Query additional power states for multi-switch devices
         const multiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
         if (multiSwitchDevices.includes(deviceName)) {
           for (let i = 1; i <= 3; i++) {
             try {
-              wsRef.current.send(JSON.stringify({ 
-                type: 'publish', 
-                topic: `cmnd/${deviceName}/Power${i}`, 
-                payload: '', 
-                id: `customer-pwq-${deviceName}-p${i}-${Date.now()}` 
-              })); 
+              const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
+              const t = site ? `cmnd/${site}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
+              wsRef.current.send(JSON.stringify({ type: 'publish', topic: t, payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` }));
             } catch(e) {}
           }
         }
@@ -2526,34 +2508,42 @@ function parseJwtPayload(tok) {
   };
   const publishPower = (baseKey, powerKey, nextOn) => {
     if (!wsRef.current || wsRef.current.readyState !== 1) return;
-    
-    // baseKey should be in CUSTOMER/DEVICE format
-    const parts = baseKey.split('/');
-    if (parts.length !== 2) {
-      console.warn('Invalid baseKey format, expected CUSTOMER/DEVICE:', baseKey);
+
+    // baseKey is expected to be canonical (SITE/DEVICE). If it already
+    // contains a site portion use it; otherwise attempt to derive site from
+    // mode/customerSlug or fall back to device-name-only topic as legacy.
+    let site = null;
+    let deviceName = null;
+    try {
+      const parts = String(baseKey || '').split('/').filter(Boolean);
+      if (parts.length >= 2) {
+        site = parts[0];
+        deviceName = parts[1];
+      } else if (parts.length === 1) {
+        deviceName = parts[0];
+      }
+    } catch (e) {}
+
+    // If site missing, prefer runtime mode (which is uppercase customer slug)
+    if (!site) {
+      if (mode) site = mode;
+      else if (customerSlug) site = String(customerSlug).toUpperCase();
+    }
+
+    if (!deviceName) {
+      console.warn('publishPower: unable to determine device name from baseKey:', baseKey);
       return;
     }
-    
-    const [customerSlug, deviceName] = parts;
-    if (!customerSlug || !deviceName) {
-      console.warn('Missing customer or device in baseKey:', baseKey);
-      return;
-    }
-    
-    // Tasmota command topics: cmnd/<Device>/<Power or Power1/Power2/etc>
+
+    // Tasmota command topics: cmnd/<[site/]Device>/<Power or Power1/Power2/etc>
     const cmdKey = powerKey === 'POWER' ? 'Power' : powerKey.replace(/^POWER/, 'Power');
-    const topic = `cmnd/${deviceName}/${cmdKey}`;
+    const topic = site ? `cmnd/${site}/${deviceName}/${cmdKey}` : `cmnd/${deviceName}/${cmdKey}`;
     const payload = nextOn ? 'ON' : 'OFF';
-    const id = `pw-${customerSlug}-${deviceName}-${cmdKey}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
-    
-    try { 
-      wsRef.current.send(JSON.stringify({ 
-        type: 'publish', 
-        topic, 
-        payload, 
-        id 
-      })); 
-      
+    const id = `pw-${site || 'UNK'}-${deviceName}-${cmdKey}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
+
+    try {
+      wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload, id }));
+
       // Optimistically update local state for immediate UI feedback
       setGPower(prev => {
         const current = prev[baseKey] || {};
@@ -2565,8 +2555,8 @@ function parseJwtPayload(tok) {
           }
         };
       });
-      
-    } catch(e) {}
+
+    } catch (e) {}
   };
 
   const doReconnect = () => {
