@@ -505,6 +505,12 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // responsive layout measurements
   const { width: winWidth } = useWindowDimensions();
   const wsRef = useRef(null);
+  // While hydrating from /api/latest we may want to prefer live replies that
+  // arrive immediately after probes. Use these refs to defer applying the
+  // snapshot for a short window so live stat/STATE messages can override it.
+  const snapshotPendingRef = useRef(false);
+  const liveUpdatedBasesRef = useRef(new Set());
+  const pendingSnapshotRef = useRef({ addsSensors: {}, addsMeta: {}, addsPower: {}, seenDbBases: new Set() });
   const [sensorValue, setSensorValue] = useState(null);
   const [displayedSensorValue, setDisplayedSensorValue] = useState(null);
   // target values are authoritative from the broker; start as null until broker returns a value
@@ -1859,10 +1865,76 @@ function parseJwtPayload(tok) {
             }
           };
 
+          // Handle stat/<device>/POWER and stat/<device>/POWERn topics where payload is a simple ON/OFF or 1/0.
+          // Treat these as authoritative per-key reports and update gPower immediately.
+          const applyStatPower = (topic, rawPayload) => {
+            try {
+              if (!topic || typeof topic !== 'string') return;
+              const parts = topic.split('/').filter(Boolean);
+              if (parts.length < 3) return;
+              if (parts[0].toLowerCase() !== 'stat') return;
+              const last = parts[parts.length - 1];
+              if (!/^POWER\d*$/i.test(last)) return;
+              const powerKey = String(last).toUpperCase();
+
+              // Support both stat/<device>/POWER and stat/<site>/<device>/POWER
+              let site = null; let device = null;
+              if (parts.length === 3) {
+                // stat/<device>/POWER
+                device = parts[1];
+              } else if (parts.length >= 4) {
+                // stat/<site>/<device>/POWER (or longer)
+                site = parts[1]; device = parts[2];
+              }
+              if (!device) return;
+
+              // Determine site preference
+              const siteForStat = site || findSiteForDevice(device) || mode || (customerSlug ? String(customerSlug).toUpperCase() : null) || 'BREW';
+              const normBase = normalizeCanonicalBase(`${siteForStat}/${device}`, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || `${siteForStat}/${device}`;
+
+              // Interpret payload
+              let isOn = false;
+              try {
+                if (typeof rawPayload === 'string') {
+                  const up = rawPayload.trim().toUpperCase();
+                  isOn = (up === 'ON' || up === '1' || up === 'TRUE');
+                } else if (typeof rawPayload === 'number') {
+                  isOn = rawPayload === 1;
+                } else if (typeof rawPayload === 'boolean') {
+                  isOn = rawPayload;
+                }
+              } catch (e) {}
+
+              if (DEBUG) {
+                try { console.debug('Dashboard: applyStatPower', { topic, normBase, powerKey, isOn }); } catch (e) {}
+              }
+
+              // Update meta for base if missing
+              setGMeta(prev => {
+                const existing = prev[normBase];
+                if (!existing && normBase.includes('/')) {
+                  const [s, d] = normBase.split('/');
+                  return { ...prev, [normBase]: { site: s, device: d, metric: null } };
+                }
+                return prev;
+              });
+
+              setGPower(prev => {
+                const cur = { ...(prev[normBase] || {}) };
+                cur[powerKey] = isOn;
+                const next = { ...prev, [normBase]: cur };
+                try { persistDiscoveredPowerKeys(normBase, cur).catch(() => {}); } catch (e) {}
+                return next;
+              });
+            } catch (e) {}
+          };
+
           if (obj.type === 'message' && obj.data && typeof obj.data.topic === 'string') {
             const topic = obj.data.topic;
             const lowerTopic = topic.toLowerCase();
             let raw = obj.data.payload;
+            // quick path: handle stat/<device>/POWER* topics directly
+            try { applyStatPower(topic, raw); } catch (e) {}
             let n = Number(raw);
             let parsedJson = null;
             if (Number.isNaN(n) && /\/sensor$/i.test(topic)) {
@@ -1954,6 +2026,8 @@ function parseJwtPayload(tok) {
           if (obj.type === 'mqtt-message' && typeof obj.topic === 'string') {
             const lowerTopic = obj.topic.toLowerCase();
             let raw = obj.payload;
+            // quick path: handle stat/<device>/POWER* topics directly
+            try { applyStatPower(obj.topic, raw); } catch (e) {}
             // Special-case: tasmota discovery messages provide authoritative site/device info
             try {
               if (typeof obj.topic === 'string' && obj.topic.toLowerCase().startsWith('tasmota/discovery/')) {
@@ -2166,6 +2240,13 @@ function parseJwtPayload(tok) {
         const js = await res.json();
         if (!js || !js.sensors || !Array.isArray(js.sensors)) return;
 
+        if (DEBUG) {
+          try {
+            const sample = (js.sensors || []).slice(0,10).map(r => ({ key: r.key, topic_key: r.topic_key, type: r.type, last_value: r.last_value, last_ts: r.last_ts }));
+            console.debug('Dashboard: /api/latest hydrate sample rows:', { sensorsCount: (js.sensors || []).length, sample, hasServerStatList: !!(js.latest_stats || js.stat_messages || js.stats || js.stat_messages_list) });
+          } catch (e) {}
+        }
+
         // Extract customer information for dynamic filtering
         if (js.customer && js.customer.slug) {
           setCustomerSlug(js.customer.slug);
@@ -2179,9 +2260,54 @@ function parseJwtPayload(tok) {
           }
         }
 
-  const addsSensors = {}, addsMeta = {}, addsPower = {};
+        const addsSensors = {}, addsMeta = {}, addsPower = {};
+  // track per-base/per-powerKey timestamps so we apply the most recent snapshot value
+  const addsPowerTs = {};
   // collect authoritative DB-backed sensor bases from the snapshot
   const seenDbBases = new Set();
+  // If the server exposes a pre-computed list of recent stat/ messages (per-key POWER reports),
+  // prefer those as authoritative for initial UI state. Support flexible property names.
+  const statLists = js.latest_stats || js.stat_messages || js.stats || js.stat_messages_list || null;
+  // Map of canonicalBase -> Set of POWER keys provided by server stats so snapshot doesn't override.
+  const statProvidedMap = {};
+  if (Array.isArray(statLists) && statLists.length) {
+    try {
+      statLists.forEach(s => {
+        try {
+          // Accept objects with { topic, payload } or { topic, value } or raw row shapes
+          const topic = s.topic || s.top || s.key || s.stat_topic || null;
+          const rawPayload = (s.payload !== undefined) ? s.payload : (s.value !== undefined ? s.value : (s.raw !== undefined ? s.raw : (s.last_value !== undefined ? s.last_value : null)));
+          if (!topic) return;
+
+          // Attempt to parse power key from topic (stat/<device>/POWER or stat/<site>/<device>/POWERn)
+          const parts = String(topic).split('/').filter(Boolean);
+          if (parts.length < 3) return; // expect at least stat/<device>/<POWER>
+          if (parts[0].toLowerCase() !== 'stat') return;
+          const last = parts[parts.length - 1];
+          if (!/^POWER\d*$/i.test(last)) return;
+          const powerKey = String(last).toUpperCase();
+
+          // derive site/device like applyStatPower does
+          let site = null; let device = null;
+          if (parts.length === 3) { device = parts[1]; }
+          else if (parts.length >= 4) { site = parts[1]; device = parts[2]; }
+          if (!device) return;
+          const siteForStat = site || findSiteForDevice(device) || mode || (customerSlug ? String(customerSlug).toUpperCase() : null) || 'BREW';
+          const normBase = normalizeCanonicalBase(`${siteForStat}/${device}`, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || `${siteForStat}/${device}`;
+
+          // mark provided key so snapshot doesn't overwrite
+          if (!statProvidedMap[normBase]) statProvidedMap[normBase] = new Set();
+          statProvidedMap[normBase].add(powerKey);
+
+          // Call existing applyStatPower helper so client state is seeded exactly like live messages
+          try { applyStatPower(topic, rawPayload); } catch (e) {}
+        } catch (e) {}
+      });
+    } catch (e) {}
+  }
+  else {
+    if (DEBUG) console.debug('Dashboard: no server-side stat list found in /api/latest response; relying on sensor rows only');
+  }
         js.sensors.forEach(row => {
           if (!row) return;
           const lv = row.last_value;
@@ -2229,16 +2355,142 @@ function parseJwtPayload(tok) {
             seenDbBases.add(baseKey);
           }
 
-          // Hydrate POWER states: topic may end with POWER or POWER1 etc.
+          // Hydrate POWER states. Prefer structured raw JSON where possible (row.last_raw / row.last_value).
           const powerLastSeg = rawTopic.split('/').slice(-1)[0];
+
+          // helper to persist found states into addsPower under a normalized base
+          const persistFound = (baseCandidate, foundMap, ts) => {
+            try {
+              if (!baseCandidate) return;
+              let powerBaseKey = baseCandidate;
+              try { powerBaseKey = normalizeCanonicalBase(powerBaseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }); } catch (e) {}
+              if (!powerBaseKey) return;
+              if (!addsPower[powerBaseKey]) addsPower[powerBaseKey] = {};
+              if (!addsPowerTs[powerBaseKey]) addsPowerTs[powerBaseKey] = {};
+              const tsNum = Number(ts) || 0;
+              // For each discovered power key, only accept it if it's newer-or-equal to any
+              // previously-seen snapshot value for the same base/key. This prevents older
+              // compact rows from overwriting newer structured STATE rows.
+              Object.entries(foundMap || {}).forEach(([pk, pv]) => {
+                try {
+                  const upk = String(pk).toUpperCase();
+                  // If the server-provided stat list already supplied this base/key, prefer it and skip snapshot apply
+                  try {
+                    if (statProvidedMap[powerBaseKey] && statProvidedMap[powerBaseKey].has(upk)) {
+                      if (DEBUG) console.debug('Dashboard: snapshot.persistFound - skipping because server-stat provided', { powerBaseKey, key: upk });
+                      return;
+                    }
+                  } catch (e) {}
+                  const prevTs = Number(addsPowerTs[powerBaseKey][upk] || 0);
+                  if (tsNum >= prevTs) {
+                    addsPower[powerBaseKey][upk] = pv;
+                    addsPowerTs[powerBaseKey][upk] = tsNum;
+                  } else {
+                    if (DEBUG) {
+                      try { console.debug('Dashboard: snapshot.persistFound - skipping older value', { powerBaseKey, key: upk, tsNum, prevTs }); } catch (e) {}
+                    }
+                  }
+                } catch (e) {}
+              });
+              if (!addsMeta[powerBaseKey]) addsMeta[powerBaseKey] = { site, device, metric: null };
+              if (DEBUG) {
+                try { console.debug('Dashboard: snapshot.persistFound', { powerBaseKey, addedNow: foundMap, currentAdds: addsPower[powerBaseKey], addsPowerTs: addsPowerTs[powerBaseKey] }); } catch (e) {}
+              }
+            } catch (e) {}
+          };
+
+          // Try parsing row.last_raw first (preferred). Fall back to last_value if needed.
+          let parsedLastRaw = null;
+          try {
+            if (row.last_raw) {
+              parsedLastRaw = (typeof row.last_raw === 'string') ? JSON.parse(row.last_raw) : row.last_raw;
+            }
+          } catch (e) { parsedLastRaw = null; }
+
+          // If last_raw contained POWER keys (e.g., { POWER1: 'OFF', POWER2: 'ON' }), prefer these.
+          if (parsedLastRaw && typeof parsedLastRaw === 'object') {
+            try {
+              const found = {};
+              Object.entries(parsedLastRaw).forEach(([k, v]) => {
+                try {
+                  const up = String(k).toUpperCase();
+                  if (up === 'POWER' || /^POWER\d+$/.test(up)) {
+                    const isOn = (typeof v === 'string') ? (v.toUpperCase() === 'ON' || v === '1' || v.toUpperCase() === 'TRUE') : !!v;
+                    found[up] = isOn;
+                  }
+                } catch (e) {}
+              });
+              if (Object.keys(found).length) {
+                const baseCandidate = (site && device) ? `${site}/${device}` : (core && core.length ? (core.length >= 2 ? `${core[0]}/${core[1]}` : `BREW/${core[0]}`) : rawTopic);
+                persistFound(baseCandidate, found, row.last_ts);
+                return;
+              }
+
+              // Compact shape: { power_key: 'POWER1', state: 'ON' }
+                  if (parsedLastRaw.power_key) {
+                const pk = String(parsedLastRaw.power_key).toUpperCase();
+                if (/^POWER\d*$/i.test(pk)) {
+                  const st = parsedLastRaw.state;
+                  const isOn = (typeof st === 'string') ? (st.toUpperCase() === 'ON' || st === '1' || st.toUpperCase() === 'TRUE') : !!st;
+                  const baseCandidate = (site && device) ? `${site}/${device}` : (parts && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : (device ? `BREW/${device}` : rawTopic));
+                  persistFound(baseCandidate, { [pk]: isOn }, row.last_ts);
+                  return;
+                }
+              }
+            } catch (e) {}
+          }
+
+          // If last_raw didn't yield results, try last_value when it's a JSON string (STATE/RESULT rows)
+          if (!parsedLastRaw && hasTerminal && /^(STATE|RESULT)$/i.test(lastPart) && typeof row.last_value === 'string') {
+            try {
+              const pv = JSON.parse(row.last_value);
+              if (pv && typeof pv === 'object') {
+                const found = {};
+                Object.entries(pv).forEach(([k, v]) => {
+                  try {
+                    const up = String(k).toUpperCase();
+                    if (up === 'POWER' || /^POWER\d+$/.test(up)) {
+                      const isOn = (typeof v === 'string') ? (v.toUpperCase() === 'ON' || v === '1' || v.toUpperCase() === 'TRUE') : !!v;
+                      found[up] = isOn;
+                    }
+                  } catch (e) {}
+                });
+                if (Object.keys(found).length) {
+                  const baseCandidate = (site && device) ? `${site}/${device}` : (core && core.length ? (core.length >= 2 ? `${core[0]}/${core[1]}` : `BREW/${core[0]}`) : rawTopic);
+                  persistFound(baseCandidate, found, row.last_ts);
+                  return;
+                }
+              }
+            } catch (e) {}
+          }
+
+          // Prefer raw JSON, but if none available, fall back to explicit row.type indicating a POWER key
+          if (row.type && /^POWER\d*$/i.test(String(row.type))) {
+            try {
+              const pk = String(row.type).toUpperCase();
+              // prefer any state info in last_raw, else last_value
+              let isOn = false;
+              try {
+                if (row.last_raw) {
+                  const lr = (typeof row.last_raw === 'string') ? JSON.parse(row.last_raw) : row.last_raw;
+                  if (lr && typeof lr === 'object' && lr.state !== undefined) {
+                    const s = lr.state;
+                    isOn = (typeof s === 'string') ? (s.toUpperCase() === 'ON' || s === '1' || s.toUpperCase() === 'TRUE') : !!s;
+                  }
+                }
+              } catch (e) {}
+              try { if (!isOn && (row.last_value === 1 || row.last_value === '1' || row.last_value === true)) isOn = true; } catch (e) {}
+              const baseCandidate = (site && device) ? `${site}/${device}` : (parts && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : (device ? `BREW/${device}` : rawTopic));
+              persistFound(baseCandidate, { [pk]: isOn }, row.last_ts);
+              return;
+            } catch (e) {}
+          }
+
+          // Legacy: topic itself ends with POWER/POWER1 etc (per-key rows)
           if (/^POWER\d*$/i.test(powerLastSeg)) {
-            // Determine power base key (site/device) from parsed parts
             if (site && device) {
               try {
-                let powerBaseKey = `${site}/${device}`;
-                powerBaseKey = normalizeCanonicalBase(powerBaseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
                 const powerKey = powerLastSeg.toUpperCase();
-                if (!addsPower[powerBaseKey]) addsPower[powerBaseKey] = {};
                 let isOn = false;
                 if (typeof lv === 'string') {
                   isOn = lv === 'ON' || lv === '1' || lv === 'true';
@@ -2247,8 +2499,8 @@ function parseJwtPayload(tok) {
                 } else if (typeof lv === 'boolean') {
                   isOn = lv;
                 }
-                addsPower[powerBaseKey][powerKey] = isOn;
-                if (!addsMeta[powerBaseKey]) addsMeta[powerBaseKey] = { site, device, metric: null };
+                const baseCandidate = `${site}/${device}`;
+                persistFound(baseCandidate, { [powerKey]: isOn }, row.last_ts);
               } catch (e) {}
             }
             return;
@@ -2262,10 +2514,20 @@ function parseJwtPayload(tok) {
             if (!addsMeta[baseKey]) addsMeta[baseKey] = { site, device, metric, terminal: 'Sensor' };
           }
         });
-  if (Object.keys(addsSensors).length) setGSensors(prev => ({ ...addsSensors, ...prev }));
-  if (Object.keys(addsMeta).length) setGMeta(prev => ({ ...addsMeta, ...prev }));
-  if (Object.keys(addsPower).length) setGPower(prev => ({ ...addsPower, ...prev }));
-  if (seenDbBases.size) {
+  if (Object.keys(addsSensors).length) setGSensors(prev => ({ ...prev, ...addsSensors }));
+  if (Object.keys(addsMeta).length) {
+    if (DEBUG) { try { console.debug('Dashboard: snapshot.addsMeta', addsMeta); } catch (e) {} }
+    setGMeta(prev => ({ ...prev, ...addsMeta }));
+  }
+  if (Object.keys(addsPower).length) {
+    if (DEBUG) { try { console.debug('Dashboard: snapshot.addsPower (before apply)', addsPower); } catch (e) {} }
+    setGPower(prev => ({ ...prev, ...addsPower }));
+    if (DEBUG) {
+      // schedule a microtask to log resulting gPower (best-effort; may log previous value if state hasn't updated yet)
+      try { setTimeout(() => { try { console.debug('Dashboard: snapshot.applied gPower (post-apply)'); } catch (e) {} }, 250); } catch (e) {}
+    }
+  }
+  if (seenDbBases.size || Object.keys(addsPower).length) {
     const newDbSet = new Set(Array.from(seenDbBases));
     setDbSensorBases(newDbSet);
 
@@ -2295,6 +2557,18 @@ function parseJwtPayload(tok) {
             targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
           } catch (e) {}
 
+              // Also proactively request the device's STATE so we get fresh POWER/STATE JSON
+              try {
+                const parts = base.split('/').filter(Boolean);
+                const deviceName = parts.length >= 2 ? parts[1] : parts[0];
+                const site = parts.length >= 2 ? parts[0] : null;
+                // Ask the bridge for the State topic and also send a non-mutating Status 0 probe
+                try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state-${base}-${Date.now()}` })); } catch (e) {}
+                try { ws.send(JSON.stringify({ type: 'publish', topic: site ? `cmnd/${site}/${deviceName}/Status` : `cmnd/${deviceName}/Status`, payload: '0', id: `snap-probe-status-${base}-${Date.now()}` })); } catch (e) {}
+                // also call the local helper which sends a couple retries
+                try { probeStateForDevice(site, deviceName); } catch (e) {}
+              } catch (e) {}
+
           // Query power states using canonical base when possible
           try {
             const parts = base.split('/').filter(Boolean);
@@ -2304,6 +2578,8 @@ function parseJwtPayload(tok) {
               // Primary power query: prefer site-prefixed topic
               const primaryTopic = site ? `cmnd/${site}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
               try { ws.send(JSON.stringify({ type: 'publish', topic: primaryTopic, payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` })); } catch(e) {}
+                  // ask for state as well (ensure recent STATE is present)
+                  try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state2-${base}-${Date.now()}` })); } catch (e) {}
               // Additional multi-switch queries (best-effort)
               for (let i = 1; i <= 3; i++) {
                 const t = site ? `cmnd/${site}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
@@ -2556,6 +2832,29 @@ function parseJwtPayload(tok) {
         };
       });
 
+      // Ask device to publish its STATE so other clients / snapshot see authoritative state quickly
+      try { probeStateForDevice(site, deviceName); } catch (e) {}
+
+    } catch (e) {}
+  };
+
+  // Helper: after issuing a Power command, ask the device to publish its STATE
+  // non-mutatingly so other clients and the server snapshot become consistent.
+  const probeStateForDevice = (site, deviceName) => {
+    if (!wsRef.current || wsRef.current.readyState !== 1) return;
+    try {
+      const statusTopic = site ? `cmnd/${site}/${deviceName}/Status` : `cmnd/${deviceName}/Status`;
+      const idBase = `status-probe-${site || 'UNK'}-${deviceName}-${Date.now()}`;
+      // Status 0 asks Tasmota to publish a full state (non-mutating)
+      try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopic, payload: '0', id: idBase + '-0' })); } catch (e) {}
+      // Also ask the bridge for the current STATE (best-effort). Some bridges
+      // respond to get requests for <SITE>/<DEVICE>/State and will emit a
+      // current/message that applyPower will handle.
+      try { wsRef.current.send(JSON.stringify({ type: 'get', topic: `${site}/${deviceName}/State`, id: idBase + '-get' })); } catch (e) {}
+
+      // Two retries to help with flaky networks / device latency
+      setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopic, payload: '0', id: idBase + '-r1' })); } catch (e) {} }, 250);
+      setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopic, payload: '0', id: idBase + '-r2' })); } catch (e) {} }, 1000);
     } catch (e) {}
   };
 

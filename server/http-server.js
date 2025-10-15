@@ -85,10 +85,105 @@ function startHttpServer(opts = {}) {
           const rows = db.prepare('SELECT id, key, topic_key, type, unit, last_value, last_ts, last_raw FROM sensors WHERE customer_id = ? AND last_ts IS NOT NULL ORDER BY last_ts DESC LIMIT 1000').all(customerId);
           // Include customer context for frontend filtering
           const customerInfo = db.prepare('SELECT slug, name FROM customers WHERE id = ?').get(customerId);
+          // Build a compact latest_stats array from sensor rows so clients can
+          // quickly seed per-key POWER state without re-parsing many rows.
+          const latestStats = [];
+          try {
+            // Build a canonical map keyed by base|power_key -> newest entry
+            const latestMap = {}; // key -> { topic, power_key, value, last_ts, last_raw }
+
+            const normalizeBase = (rawTopic) => {
+              try {
+                if (!rawTopic) return '';
+                let s = String(rawTopic).trim();
+                s = s.replace(/^(tele|stat)\//i, '');
+                const parts = s.split('/').filter(Boolean);
+                while (parts.length && String(parts[parts.length - 1]).toUpperCase() === 'STATE') parts.pop();
+                return parts.map(p => String(p).toUpperCase()).join('/');
+              } catch (e) { return String(rawTopic || ''); }
+            };
+
+            const normalizePowerValue = (v) => {
+              if (v === null || v === undefined) return v;
+              if (typeof v === 'number') return Number(v);
+              const s = String(v).trim().toUpperCase();
+              if (s === 'ON' || s === '1' || s === 'TRUE') return 1;
+              if (s === 'OFF' || s === '0' || s === 'FALSE') return 0;
+              return v;
+            };
+
+            rows.forEach(row => {
+              try {
+                const topic = (row && (row.topic_key || row.key)) || '';
+                const ts = Number(row && row.last_ts) || 0;
+                const base = normalizeBase(topic);
+
+                if (row && row.type && /^POWER\d*$/i.test(String(row.type))) {
+                  const pk = String(row.type).toUpperCase();
+                  // If the row.key/topic contains the POWER suffix (e.g. "RAIL/DEV/POWER1"),
+                  // normalize the base by stripping that trailing POWER segment so grouping
+                  // becomes SITE/DEVICE and we can map per-key entries consistently.
+                  let baseForEntry = base;
+                  try {
+                    const parts = String(base || '').split('/').filter(Boolean);
+                    const last = parts.length ? parts[parts.length - 1] : '';
+                    if (last && String(last).toUpperCase() === pk) {
+                      parts.pop();
+                      baseForEntry = parts.join('/');
+                    }
+                  } catch (e) { /* ignore and fall back to base */ }
+                  const mapKey = `${baseForEntry}|${pk}`;
+                  const entry = { topic: baseForEntry, power_key: pk, value: normalizePowerValue(row.last_value), last_ts: ts, last_raw: row.last_raw || null };
+                  if (!latestMap[mapKey] || latestMap[mapKey].last_ts < ts) latestMap[mapKey] = entry;
+                  return;
+                }
+
+                let parsed = null;
+                if (row && row.last_raw) {
+                  try { parsed = (typeof row.last_raw === 'string') ? JSON.parse(row.last_raw) : row.last_raw; } catch (e) { parsed = null; }
+                }
+                if (!parsed && row && row.last_value && typeof row.last_value === 'string') {
+                  try { parsed = JSON.parse(row.last_value); } catch (e) { parsed = null; }
+                }
+                if (parsed && typeof parsed === 'object') {
+                  Object.entries(parsed).forEach(([k, v]) => {
+                    try {
+                      if (/^POWER\d*$/i.test(k)) {
+                        const pk = String(k).toUpperCase();
+                        const mapKey = `${base}|${pk}`;
+                        const entry = { topic: base, power_key: pk, value: normalizePowerValue(v), last_ts: ts, last_raw: row.last_raw || null };
+                        if (!latestMap[mapKey] || latestMap[mapKey].last_ts < ts) latestMap[mapKey] = entry;
+                      }
+                    } catch (e) {}
+                  });
+                } else if (row && row.last_raw && typeof row.last_raw === 'string') {
+                  // Fallback: last_raw is unstructured text — try to extract POWER keys like "POWER1 ON" or "POWER2:OFF"
+                  try {
+                    const re = /(POWER\d*)[^A-Z0-9\-\_]*(ON|OFF|1|0|TRUE|FALSE)/ig;
+                    let m;
+                    while ((m = re.exec(row.last_raw))) {
+                      try {
+                        const pk = String(m[1]).toUpperCase();
+                        const v = String(m[2]).toUpperCase();
+                        const mapKey = `${base}|${pk}`;
+                        const entry = { topic: base, power_key: pk, value: normalizePowerValue(v), last_ts: ts, last_raw: row.last_raw || null };
+                        if (!latestMap[mapKey] || latestMap[mapKey].last_ts < ts) latestMap[mapKey] = entry;
+                      } catch (e) {}
+                    }
+                  } catch (e) {}
+                }
+              } catch (e) { /* ignore per-row parse errors */ }
+            });
+
+            // Dump map into array
+            Object.keys(latestMap).forEach(k => latestStats.push(latestMap[k]));
+          } catch (e) { /* ignore whole-lot errors */ }
+
           res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
           res.end(JSON.stringify({ 
             ok: true, 
             sensors: rows,
+            latest_stats: latestStats,
             customer: customerInfo || { slug: 'default', name: 'Default Customer' }
           }));
           try { db.close(); } catch (e) {}
