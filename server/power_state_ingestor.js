@@ -205,9 +205,31 @@ function startPowerStateIngestor() {
           const val = raw[k] === 'ON' ? 1 : 0;
           // Use canonical topic as the sensor key/topicKey so we create/look up
           // a consistent sensor row instead of many legacy variants.
-          const canonical = canonicalizeTopic(topic);
+          let canonical = canonicalizeTopic(topic);
           // Use the same sensor key that upsertPowerState/ingestNumeric will write: strip trailing /STATE
-          const keyBase = String(canonical).replace(/\/STATE$/i, '');
+          let keyBase = String(canonical).replace(/\/STATE$/i, '');
+
+          // Defensive normalization: if the incoming topic includes an explicit site
+          // (e.g., RAIL/FERM2) but we already have a canonical BREW/<device> sensor row,
+          // prefer the existing BREW/<device> so we don't create a separate SITE/<device>
+          // row for legacy no-site devices. This keeps legacy devices namespaced under
+          // BREW and avoids collisions across tenants.
+          try {
+            const parts = String(keyBase || '').split('/').filter(Boolean);
+            const device = parts.length ? parts[parts.length - 1] : null;
+            if (device && parts.length > 1) {
+              const brewKey = `BREW/${device}`;
+              // case-insensitive search for existing BREW/<device>
+              try {
+                const existing = db.prepare('SELECT id FROM sensors WHERE UPPER(key)=? LIMIT 1').get(String(brewKey).toUpperCase());
+                if (existing && existing.id) {
+                  canonical = `${brewKey}/STATE`;
+                  keyBase = brewKey;
+                  if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: remapping to existing BREW row', { incoming: topic, brewKey, canonical });
+                }
+              } catch (e) { /* ignore DB lookup errors */ }
+            }
+          } catch (e) { /* ignore normalization errors */ }
           // Read last_value and last_ts for debugging to decide why we may skip upserts
           let lastRow = null;
           try {
