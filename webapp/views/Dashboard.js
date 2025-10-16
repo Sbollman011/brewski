@@ -1366,14 +1366,14 @@ function parseJwtPayload(tok) {
   const INDICATOR_RENDERERS = {
     // Example: HEATING-heatingindicator -> render a small red 'lamp' when ON
     heatingindicator: ({ isOn }) => (
-      <View style={{ alignItems: 'center', justifyContent: 'center' }}>
-        <View style={{ width: 14, height: 14, borderRadius: 8, backgroundColor: isOn ? '#d32f2f' : '#cfd8dc', borderWidth: 1, borderColor: isOn ? '#b71c1c' : '#b0bec5', marginBottom: 4, shadowColor: '#000', shadowOffset: { width: 0, height: isOn ? 2 : 1 }, shadowOpacity: isOn ? 0.25 : 0.08, shadowRadius: isOn ? 3 : 1 }} />
+      <View style={{ width: '100%', alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: 14, height: 14, borderRadius: 7, backgroundColor: isOn ? '#d32f2f' : '#cfd8dc', borderWidth: 1, borderColor: isOn ? '#b71c1c' : '#b0bec5', shadowColor: '#000', shadowOffset: { width: 0, height: isOn ? 2 : 1 }, shadowOpacity: isOn ? 0.25 : 0.08, shadowRadius: isOn ? 3 : 1 }} />
       </View>
     ),
     // Example: COOLING-coolingindicator -> render a small blue 'cool' lamp when ON
     coolingindicator: ({ isOn }) => (
-      <View style={{ alignItems: 'center', justifyContent: 'center' }}>
-        <View style={{ width: 14, height: 14, borderRadius: 8, backgroundColor: isOn ? '#1976d2' : '#cfd8dc', borderWidth: 1, borderColor: isOn ? '#0d47a1' : '#b0bec5', marginBottom: 4, shadowColor: '#000', shadowOffset: { width: 0, height: isOn ? 2 : 1 }, shadowOpacity: isOn ? 0.22 : 0.08, shadowRadius: isOn ? 3 : 1 }} />
+      <View style={{ width: '100%', alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: 14, height: 14, borderRadius: 7, backgroundColor: isOn ? '#1976d2' : '#cfd8dc', borderWidth: 1, borderColor: isOn ? '#0d47a1' : '#b0bec5', shadowColor: '#000', shadowOffset: { width: 0, height: isOn ? 2 : 1 }, shadowOpacity: isOn ? 0.22 : 0.08, shadowRadius: isOn ? 3 : 1 }} />
       </View>
     ),
     // future indicators can be added here
@@ -3040,14 +3040,22 @@ function parseJwtPayload(tok) {
                                 let displayLabel = label;
                                 try {
                                   // Split on common dash characters (hyphen-minus, en-dash, em-dash)
-                                  // and be resilient to leading/trailing whitespace or leading dashes.
+                                  // Preserve empty left-side segments so labels like "-heatingindicator"
+                                  // are treated as indicator-only (no display text) rather than ignored.
                                   if (label && typeof label === 'string') {
-                                    const parts = String(label).split(/[-–—]/).map(s => (s || '').trim()).filter(Boolean);
-                                    if (parts.length >= 2) {
-                                      // left-most part(s) become the display label, right-most is the indicator key
-                                      displayLabel = parts.slice(0, parts.length - 1).join(' - ');
-                                      const indicatorKey = String(parts[parts.length - 1]).toLowerCase();
-                                      if (INDICATOR_RENDERERS[indicatorKey]) indicatorRenderer = INDICATOR_RENDERERS[indicatorKey];
+                                    const rawParts = String(label).split(/[-–—]/).map(s => (s || '').trim());
+                                    const startsWithDash = /^\s*[-–—]/.test(String(label));
+                                    // Treat as indicator when we have at least two parts OR the label
+                                    // started with a dash (e.g. "-heatingindicator").
+                                    if (rawParts.length >= 2 || (rawParts.length === 1 && startsWithDash)) {
+                                      // right-most is indicator key; left side(s) form displayLabel (may be empty)
+                                      const indicatorKey = String(rawParts[rawParts.length - 1] || '').toLowerCase();
+                                      if (indicatorKey && INDICATOR_RENDERERS[indicatorKey]) {
+                                        indicatorRenderer = INDICATOR_RENDERERS[indicatorKey];
+                                        displayLabel = rawParts.slice(0, rawParts.length - 1).join(' - ');
+                                        // ensure empty displayLabel is represented as an empty string (not undefined)
+                                        if (!displayLabel) displayLabel = '';
+                                      }
                                     }
                                   }
                                 } catch (e) {}
