@@ -474,16 +474,29 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           try {
             // tele/<slug>/<device>/STATE
             if (parts.length >= 4 && parts[0].toLowerCase() === 'tele' && /state/i.test(parts[parts.length - 1])) {
+              // defensive: ensure device segment isn't accidentally a site token or 'STATE'
+              const siteCandidate = parts[1] || '';
+              const deviceCandidate = parts[2] || '';
+              const badDevice = /^(STATE|BREW|RAIL)$/i.test(String(deviceCandidate));
+              if (badDevice) {
+                // try to locate a more plausible device segment later in the path
+                const alt = parts.slice(2, parts.length - 1).find(p => !/^(STATE|BREW|RAIL)$/i.test(String(p)));
+                if (alt) return `${String(siteCandidate).toUpperCase()}/${alt}`;
+                return null;
+              }
               return `${parts[1].toUpperCase()}/${parts[2]}`;
             }
             // tele/<device>/STATE (legacy no slug) -> attribute to current customer
             if (parts.length === 3 && parts[0].toLowerCase() === 'tele' && /state/i.test(parts[2])) {
               const device = parts[1];
+              if (!device || /^(STATE|BREW|RAIL)$/i.test(String(device))) return null;
               const slug = initial && initial.slug ? initial.slug.toUpperCase() : 'BREW';
               return `${slug}/${device}`;
             }
             // <slug>/<device>/STATE
             if (parts.length >= 3 && /state/i.test(parts[parts.length - 1])) {
+              const devicePart = parts[1] || '';
+              if (!devicePart || /^(STATE|BREW|RAIL)$/i.test(String(devicePart))) return null;
               return `${parts[0].toUpperCase()}/${parts[1]}`;
             }
             // fallback: strip tele/ and trailing /STATE when present

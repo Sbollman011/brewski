@@ -110,7 +110,15 @@ function normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, cus
     const partsRaw = String(origKey).split('/').filter(Boolean);
     // If the incoming key already looks like SITE/DEVICE or SITE/DEVICE/METRIC, use it
     if (partsRaw.length >= 2 && partsRaw[0] && partsRaw[1]) {
-      const site = partsRaw[0]; const device = partsRaw[1]; const metric = partsRaw.length >= 3 ? partsRaw[2] : null;
+      const site = partsRaw[0];
+      const device = partsRaw[1];
+      // Treat trailing tokens like STATE/RESULT as terminals, not as metrics
+      const rawMetric = partsRaw.length >= 3 ? partsRaw[2] : null;
+      const metric = rawMetric && !/^(STATE|RESULT)$/i.test(rawMetric) ? rawMetric : null;
+      // Defensive: reject obviously bogus device tokens (e.g. SITE/STATE, SITE/BREW, device same as site)
+      if (!device || /^(STATE|BREW|RAIL)$/i.test(String(device)) || String(device).toUpperCase() === String(site).toUpperCase()) {
+        return null;
+      }
       if (site.toUpperCase() !== 'BREW') {
         return metric ? `${site}/${device}/${metric}` : `${site}/${device}`;
       }
@@ -143,12 +151,16 @@ function normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, cus
 
     // If single-segment or tele/stat legacy, extract device and prefer discovered sites
     // Handle tele/<device> or tele/<site>/<device>/... variants
-    const telMatch = String(origKey).match(/^tele\/(?:([^/]+)\/)?([^/]+)(?:\/.*)?$/i) || String(origKey).match(/^stat\/(?:([^/]+)\/)?([^/]+)(?:\/.*)?$/i);
+  const telMatch = String(origKey).match(/^tele\/(?:([^/]+)\/)?([^/]+)(?:\/.*)?$/i) || String(origKey).match(/^stat\/(?:([^/]+)\/)?([^/]+)(?:\/.*)?$/i);
     if (telMatch) {
       const maybeSite = telMatch[1] || null;
       const device = telMatch[2];
       // If explicit non-BREW site present, honor it
-      if (maybeSite && maybeSite.toUpperCase() !== 'BREW') return `${maybeSite}/${device}`;
+      if (maybeSite && maybeSite.toUpperCase() !== 'BREW') {
+        if (/^(STATE|BREW|RAIL)$/i.test(String(device))) return null;
+        if (String(device).toUpperCase() === String(maybeSite).toUpperCase()) return null;
+        return `${maybeSite}/${device}`;
+      }
       // Search DB/gMeta for a preferred non-BREW site
       try {
         if (dbSensorBases && dbSensorBases.size) {
@@ -170,6 +182,7 @@ function normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, cus
       } catch (e) {}
 
       // Prefer explicit mode/customerSlug if available
+      if (!device || /^(STATE|BREW|RAIL)$/i.test(String(device))) return null;
       if (mode && mode.toUpperCase() !== 'BREW') return `${mode}/${device}`;
       if (customerSlug) return `${customerSlug}/${device}`;
       return `BREW/${device}`;
@@ -714,11 +727,14 @@ function parseJwtPayload(tok) {
     return null;
   };
     // Track which bases we've already attempted to persist so we don't spam the admin API
-    const persistedBasesRef = useRef(new Set());
-  // Track which placeholder power_label posts we've recently attempted so we don't repeat them
-  const placeholderPostedRef = useRef(new Map()); // key -> timestamp ms
-  // Debounce timer to consolidate label refreshes after multiple posts
-  const labelsRefreshTimerRef = useRef(null);
+      const persistedBasesRef = useRef(new Set());
+    // Track which placeholder power_label posts we've recently attempted so we don't repeat them
+    const placeholderPostedRef = useRef(new Map()); // key -> timestamp ms
+    // Track devices that historically published without a site prefix (legacy "nosite" topics like tele/<device>/...)
+    // If a device is known to be legacy-nosite and we're sending commands under BREW, omit the site
+    const legacyNoSiteDevicesRef = useRef(new Set());
+    // Debounce timer to consolidate label refreshes after multiple posts
+    const labelsRefreshTimerRef = useRef(null);
 
     // Persist a discovered base (canonical) into the server topics DB via admin API.
     // This attempts a single POST and on success adds the base to dbSensorBases so
@@ -1236,42 +1252,49 @@ function parseJwtPayload(tok) {
   const canonicalForTopic = (topic) => {
     try {
       if (!topic || typeof topic !== 'string') return null;
-      // If topic already looks canonical like SITE/DEVICE... return it
-      if (/^[A-Z0-9_-]+\/[A-Z0-9_-]+/i.test(topic)) {
-        // prefer DB-backed base when available
-        const norm = normalizeCanonicalBase(topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
-        return norm || topic;
-      }
-      // Fallback: normalize anyway
-      return normalizeCanonicalBase(topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || topic;
-    } catch (e) { return topic; }
+      // Normalize topic by stripping tele/stat prefix and trailing STATE/RESULT
+      let s = String(topic).trim();
+      s = s.replace(/^(tele|stat)\//i, '');
+      s = s.replace(/\/(STATE|RESULT)$/i, '');
+      // Try normalized core first
+      const norm = normalizeCanonicalBase(s, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+      if (norm) return norm;
+      // Fallback: try original topic
+      const norm2 = normalizeCanonicalBase(topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+      return norm2 || null;
+    } catch (e) { return null; }
   };
 
   const getPowerLabel = (baseKey, powerKey) => {
     if (!baseKey || !powerKey) return '';
     try {
       const pk = String(powerKey).toUpperCase();
-      // Prefer canonical grouped labels (collapses tele/... and BREW/... variants)
+      // 1) Prefer grouped canonical map from server (SITE/DEVICE -> { POWER: label })
       try {
         const can = canonicalForTopic(baseKey) || baseKey;
-        if (powerLabelsByCanonical && powerLabelsByCanonical[can] && powerLabelsByCanonical[can][pk]) return powerLabelsByCanonical[can][pk];
+        if (can && powerLabelsByCanonical && powerLabelsByCanonical[can] && powerLabelsByCanonical[can][pk]) return powerLabelsByCanonical[can][pk];
       } catch (e) {}
 
-      // First try exact direct matches
+      // 2) Direct exact matches
       const direct = `${baseKey}|${pk}`;
       if (powerLabels[direct]) return powerLabels[direct];
       if (powerLabels[direct.toUpperCase()]) return powerLabels[direct.toUpperCase()];
 
-      // Prefer looking up by canonical grouping: convert known raw topics into
-      // canonical bases and look for any label stored under that canonical base
-      // (this groups tele/... and BREW/... variants together)
-      const can = canonicalForTopic(baseKey) || baseKey;
-      const canonicalKey = `${can}|${pk}`;
-      if (powerLabels[canonicalKey]) return powerLabels[canonicalKey];
-      if (powerLabels[canonicalKey.toUpperCase()]) return powerLabels[canonicalKey.toUpperCase()];
+      // 3) Check canonical SITE/DEVICE keys in powerLabels (with and without /STATE)
+      try {
+        const can = canonicalForTopic(baseKey) || null;
+        if (can) {
+          const canonicalKey = `${can}|${pk}`;
+          const canonicalStateKey = `${can}/STATE|${pk}`;
+          if (powerLabels[canonicalKey]) return powerLabels[canonicalKey];
+          if (powerLabels[canonicalKey.toUpperCase()]) return powerLabels[canonicalKey.toUpperCase()];
+          if (powerLabels[canonicalStateKey]) return powerLabels[canonicalStateKey];
+          if (powerLabels[canonicalStateKey.toUpperCase()]) return powerLabels[canonicalStateKey.toUpperCase()];
+        }
+      } catch (e) {}
 
-      // Try canonical candidate topics (admin stored topics may use tele/... variants)
-      const candidates = canonicalCandidatesForTopic(baseKey);
+      // 4) Try canonical candidate topics (tele/... and legacy variants)
+      const candidates = canonicalCandidatesForTopic(baseKey || '') || [];
       // If baseKey looks like SITE/DEVICE, also try tele/<site>/<device>/STATE and
       // legacy tele/<device>/STATE variants so labels stored under those topics are found.
       try {
@@ -1290,15 +1313,22 @@ function parseJwtPayload(tok) {
         }
       } catch (e) {}
       for (const c of candidates) {
+        if (!c) continue;
         const k = `${c}|${pk}`;
         if (powerLabels[k]) return powerLabels[k];
         if (powerLabels[k.toUpperCase()]) return powerLabels[k.toUpperCase()];
-        // also try canonical-for-candidate
+        // also try canonical-for-candidate -> then try canonical/STATE variant
         const candCan = canonicalForTopic(c);
         if (candCan) {
           const kk = `${candCan}|${pk}`;
           if (powerLabels[kk]) return powerLabels[kk];
           if (powerLabels[kk.toUpperCase()]) return powerLabels[kk.toUpperCase()];
+          // also try candCan/STATE canonical key (server canonical form)
+          try {
+            const kkState = `${candCan}/STATE|${pk}`;
+            if (powerLabels[kkState]) return powerLabels[kkState];
+            if (powerLabels[kkState.toUpperCase()]) return powerLabels[kkState.toUpperCase()];
+          } catch (e) {}
         }
       }
 
@@ -1527,8 +1557,8 @@ function parseJwtPayload(tok) {
             try {
               // Prefer explicit runtime mode/customer slug when available
               const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
-              const primaryTopic = site ? `cmnd/${site}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
-              safeSend(ws, { type: 'publish', topic: primaryTopic, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
+              const primaryTopic = buildCmdTopic(site, deviceName, 'Power');
+              safeSend(ws, { type: 'publish', topic: primaryTopic.toLowerCase().startsWith('cmnd/') ? primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/') : primaryTopic, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
             } catch (e) {}
 
             // Query additional power states for multi-switch devices
@@ -1537,8 +1567,8 @@ function parseJwtPayload(tok) {
               for (let i = 1; i <= 3; i++) {
                 try {
                   const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
-                  const t = site ? `cmnd/${site}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
-                  safeSend(ws, { type: 'publish', topic: t, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` });
+                  const t = buildCmdTopic(site, deviceName, `Power${i}`);
+                  safeSend(ws, { type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` });
                 } catch (e) {}
               }
             }
@@ -1659,18 +1689,20 @@ function parseJwtPayload(tok) {
               if (gPower[baseKey]) return; // Already have power state
 
               // Use explicit customer/site prefix when available, otherwise fall back to device-only topic
-              const primaryTopic = customerSlug ? `cmnd/${customerSlug}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
-              try {
-                wsRef.current.send(JSON.stringify({ type: 'publish', topic: primaryTopic, payload: '', id: `pwq-${deviceName}-${Date.now()}` }));
-              } catch (e) {}
+                try {
+                  const pt = buildCmdTopic(customerSlug, deviceName, 'Power');
+                  wsRef.current.send(JSON.stringify({ type: 'publish', topic: pt.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `pwq-${deviceName}-${Date.now()}` }));
+                } catch (e) {}
 
               // Query additional power states (POWER1, POWER2, POWER3) for multi-switch devices
               const commonMultiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
               if (commonMultiSwitchDevices.some(d => deviceName.toUpperCase().includes(d))) {
                 for (let i = 1; i <= 3; i++) {
                   try {
-                    const t = customerSlug ? `cmnd/${customerSlug}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
-                    wsRef.current.send(JSON.stringify({ type: 'publish', topic: t, payload: '', id: `pwq-${deviceName}-p${i}-${Date.now()}` }));
+                    try {
+                      const t = buildCmdTopic(customerSlug, deviceName, `Power${i}`);
+                      wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `pwq-${deviceName}-p${i}-${Date.now()}` }));
+                    } catch (e) {}
                   } catch (e) {}
                 }
               }
@@ -1687,6 +1719,8 @@ function parseJwtPayload(tok) {
             const directSensorMatch = topic.match(/^tele\/([^/]+)\/SENSOR$/i);
             if (directSensorMatch && mode) {
               const [, dev] = directSensorMatch;
+              // Mark device as legacy-nosite (published without site prefix historically)
+              try { legacyNoSiteDevicesRef.current.add(String(dev).toUpperCase()); } catch (e) {}
               queryPowerStates(mode, dev);
             }
 
@@ -1763,6 +1797,8 @@ function parseJwtPayload(tok) {
                 // Try to infer site from existing meta first, else prefer explicit mode, then BREW
                 const inferred = findSiteForDevice(deviceName);
                 const siteForLegacy = inferred || mode || 'BREW';
+                // Mark as legacy-nosite if the topic lacked an explicit site token
+                try { legacyNoSiteDevicesRef.current.add(String(deviceName).toUpperCase()); } catch (e) {}
                 baseKey = `${siteForLegacy}/${deviceName}`;
               }
             }
@@ -1772,6 +1808,8 @@ function parseJwtPayload(tok) {
               if (deviceName) {
                 const inferred = findSiteForDevice(deviceName);
                 const siteForStat = inferred || mode || 'BREW';
+                // Mark as legacy-nosite when stat/<device>/... (no site token present)
+                try { legacyNoSiteDevicesRef.current.add(String(deviceName).toUpperCase()); } catch (e) {}
                 baseKey = `${siteForStat}/${deviceName}`;
               }
             }
@@ -1858,6 +1896,10 @@ function parseJwtPayload(tok) {
 
               // Determine site preference
               const siteForStat = site || findSiteForDevice(device) || mode || (customerSlug ? String(customerSlug).toUpperCase() : null) || 'BREW';
+              // If the stat topic lacked a site token (stat/<device>/...), mark this device as legacy-nosite
+              if (!site && device) {
+                try { legacyNoSiteDevicesRef.current.add(String(device).toUpperCase()); } catch (e) {}
+              }
               const normBase = normalizeCanonicalBase(`${siteForStat}/${device}`, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || `${siteForStat}/${device}`;
 
               // Interpret payload
@@ -1973,8 +2015,11 @@ function parseJwtPayload(tok) {
               Object.entries(g.topics).forEach(([topic, val]) => {
                   const parsed = parseTopic(topic);
                   if (!parsed) return;
-                  // If site missing in grouped inventory, default to BREW (DB is source-of-truth)
-                  if (!parsed.site) parsed.site = 'BREW';
+                  // If site missing in grouped inventory, default to BREW (and mark legacy-nosite)
+                  if (!parsed.site) {
+                    try { legacyNoSiteDevicesRef.current.add(String(parsed.device).toUpperCase()); } catch (e) {}
+                    parsed.site = 'BREW';
+                  }
                   // Canonicalize baseKey using parsed.site
                   const cand = canonicalBaseFromMeta(parsed);
                   let baseKey = null;
@@ -2017,6 +2062,10 @@ function parseJwtPayload(tok) {
                     else { device = tparts[0]; }
                     if (device) {
                       const canonical = site ? `${site}/${device}` : `${device}`;
+                      // If discovery provided no site token, mark device as legacy-nosite
+                      if (!site && device) {
+                        try { legacyNoSiteDevicesRef.current.add(String(device).toUpperCase()); } catch (e) {}
+                      }
                       setGMeta(prev => ({ ...prev, [canonical]: { site: site || null, device, metric: null } }));
                       // If sensors payload exists, extract first Temperature reading
                       try {
@@ -2302,7 +2351,10 @@ function parseJwtPayload(tok) {
           }
 
           // Default missing site to BREW so snapshot canonicalization matches runtime
-          if (!site) site = 'BREW';
+          if (!site) {
+            try { if (device) legacyNoSiteDevicesRef.current.add(String(device).toUpperCase()); } catch (e) {}
+            site = 'BREW';
+          }
 
           // Reconstruct canonical baseKey matching applySensor logic
           let baseKey;
@@ -2532,7 +2584,7 @@ function parseJwtPayload(tok) {
                 const site = parts.length >= 2 ? parts[0] : null;
                 // Ask the bridge for the State topic and also send a non-mutating Status 0 probe
                 try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state-${base}-${Date.now()}` })); } catch (e) {}
-                try { ws.send(JSON.stringify({ type: 'publish', topic: site ? `cmnd/${site}/${deviceName}/Status` : `cmnd/${deviceName}/Status`, payload: '0', id: `snap-probe-status-${base}-${Date.now()}` })); } catch (e) {}
+                try { const st = buildCmdTopic(site, deviceName, 'Status'); ws.send(JSON.stringify({ type: 'publish', topic: st.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '0', id: `snap-probe-status-${base}-${Date.now()}` })); } catch (e) {}
                 // also call the local helper which sends a couple retries
                 try { probeStateForDevice(site, deviceName); } catch (e) {}
               } catch (e) {}
@@ -2544,14 +2596,12 @@ function parseJwtPayload(tok) {
             const site = parts.length >= 2 ? parts[0] : null;
             if (deviceName) {
               // Primary power query: prefer site-prefixed topic
-              const primaryTopic = site ? `cmnd/${site}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
-              try { ws.send(JSON.stringify({ type: 'publish', topic: primaryTopic, payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` })); } catch(e) {}
+              try { const primaryTopic = buildCmdTopic(site, deviceName, 'Power'); ws.send(JSON.stringify({ type: 'publish', topic: primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` })); } catch(e) {}
                   // ask for state as well (ensure recent STATE is present)
                   try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state2-${base}-${Date.now()}` })); } catch (e) {}
               // Additional multi-switch queries (best-effort)
               for (let i = 1; i <= 3; i++) {
-                const t = site ? `cmnd/${site}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
-                try { ws.send(JSON.stringify({ type: 'publish', topic: t, payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` })); } catch(e) {}
+                try { const t = buildCmdTopic(site, deviceName, `Power${i}`); ws.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` })); } catch(e) {}
               }
             }
           } catch (e) {}
@@ -2677,8 +2727,8 @@ function parseJwtPayload(tok) {
       devices.forEach(deviceName => {
         try {
           const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
-          const primaryTopic = site ? `cmnd/${site}/${deviceName}/Power` : `cmnd/${deviceName}/Power`;
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: primaryTopic, payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` }));
+          const primaryTopic = buildCmdTopic(site, deviceName, 'Power');
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` }));
         } catch (e) {}
 
         // Query additional power states for multi-switch devices
@@ -2687,8 +2737,8 @@ function parseJwtPayload(tok) {
           for (let i = 1; i <= 3; i++) {
             try {
               const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
-              const t = site ? `cmnd/${site}/${deviceName}/Power${i}` : `cmnd/${deviceName}/Power${i}`;
-              wsRef.current.send(JSON.stringify({ type: 'publish', topic: t, payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` }));
+                const t = buildCmdTopic(site, deviceName, `Power${i}`);
+                wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` }));
             } catch(e) {}
           }
         }
@@ -2750,6 +2800,19 @@ function parseJwtPayload(tok) {
     try { wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload: val, id })); debug('publish', topic, val, id); } catch (e) {}
     setTimeout(() => { try { wsRef.current && wsRef.current.send(JSON.stringify({ type: 'get', topic, id: id + '-get' })); } catch (e) {} }, 500);
   };
+  // Build a cmnd topic, stripping the BREW site for devices we know historically published without a site.
+  const buildCmdTopic = (site, deviceName, cmdKey) => {
+    try {
+      const s = site ? String(site).toUpperCase() : null;
+      const d = deviceName ? String(deviceName) : '';
+      // If this device is known to be legacy-nosite and we're operating under BREW, omit the prefix
+      if (s === 'BREW' && legacyNoSiteDevicesRef.current && legacyNoSiteDevicesRef.current.has(String(d).toUpperCase())) {
+  return buildCmdTopic(s, d, cmdKey);
+      }
+  return buildCmdTopic(s, d, cmdKey);
+  } catch (e) { return buildCmdTopic(site, deviceName, cmdKey); }
+  };
+
   const publishPower = (baseKey, powerKey, nextOn) => {
     if (!wsRef.current || wsRef.current.readyState !== 1) return;
 
@@ -2781,9 +2844,8 @@ function parseJwtPayload(tok) {
 
     // Tasmota command topics: cmnd/<[site/]Device>/<Power or Power1/Power2/etc>
   const cmdKey = powerKey === 'POWER' ? 'Power' : powerKey.replace(/^POWER/, 'Power');
-  // Ensure topic prefixes are lowercase per convention
-  const sitePart = site ? String(site) : null;
-  const topic = sitePart ? `cmnd/${sitePart}/${deviceName}/${cmdKey}` : `cmnd/${deviceName}/${cmdKey}`;
+  // Build topic using helper that may strip BREW for legacy-nosite devices
+  const topic = buildCmdTopic(site, deviceName, cmdKey);
     const payload = nextOn ? 'ON' : 'OFF';
     const id = `pw-${site || 'UNK'}-${deviceName}-${cmdKey}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
 
@@ -2821,7 +2883,7 @@ function parseJwtPayload(tok) {
   const probeStateForDevice = (site, deviceName) => {
     if (!wsRef.current || wsRef.current.readyState !== 1) return;
     try {
-      const statusTopic = site ? `cmnd/${site}/${deviceName}/Status` : `cmnd/${deviceName}/Status`;
+      const statusTopic = buildCmdTopic(site, deviceName, 'Status');
       const idBase = `status-probe-${site || 'UNK'}-${deviceName}-${Date.now()}`;
       // normalize prefix to lowercase
       const stParts = statusTopic.split('/'); if (stParts && stParts.length) stParts[0] = stParts[0].toLowerCase(); const statusTopicOut = stParts.join('/');
