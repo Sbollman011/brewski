@@ -1,11 +1,10 @@
 import React from 'react';
-import { View, Text, Pressable, StyleSheet, SafeAreaView, Platform, StatusBar, ImageBackground } from 'react-native';
+import { View, Text, Pressable, StyleSheet, SafeAreaView, Platform, StatusBar, Image } from 'react-native';
 
 export default function Header({ title, token, onMenuPress, onDashboardPress, onLoginPress, onLogoutPress, hideControls = false, menuOpen = false }) {
   return (
     <SafeAreaView style={styles.safeArea}>
-  <ImageBackground source={require('../assets/logo.png')} style={styles.logoBg} imageStyle={{ opacity: 0.18, resizeMode: 'contain' }}>
-        <View style={styles.appBar}>
+      <View style={styles.appBar}>
         {!hideControls && (
           <Pressable
             accessibilityLabel={menuOpen ? 'Close navigation menu' : 'Open navigation menu'}
@@ -19,7 +18,8 @@ export default function Header({ title, token, onMenuPress, onDashboardPress, on
             <View style={styles.bar} />
           </Pressable>
         )}
-        <Pressable onPress={() => { try { if (typeof onDashboardPress === 'function') return onDashboardPress(); if (typeof window !== 'undefined') window.location.href = '/dashboard'; } catch (e) {} }} accessibilityLabel="Home">
+        <Pressable onPress={() => { try { if (typeof onDashboardPress === 'function') return onDashboardPress(); if (typeof window !== 'undefined') window.location.href = '/dashboard'; } catch (e) {} }} accessibilityLabel="Home" style={{ flexDirection: 'row', alignItems: 'center' }}>
+          <Image source={require('../assets/logo.png')} style={styles.headerLogo} />
           <Text style={styles.appTitle}>{title || 'Brew Remote'}</Text>
         </Pressable>
         <View style={styles.rightArea}>
@@ -36,7 +36,6 @@ export default function Header({ title, token, onMenuPress, onDashboardPress, on
           )}
         </View>
         </View>
-      </ImageBackground>
     </SafeAreaView>
   );
 }
@@ -52,5 +51,5 @@ const styles = StyleSheet.create({
   portalText: { color: '#fff', fontWeight: '600' },
   loginBtn: { backgroundColor: '#ffffff22', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6 },
   loginText: { color: '#fff', fontWeight: '600' },
-  logoBg: { width: '100%', justifyContent: 'center', paddingHorizontal: 8 }
+  headerLogo: { width: 28, height: 28, marginRight: 8, resizeMode: 'contain' }
 });

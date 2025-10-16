@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { apiFetch } from '../src/api';
-import { ImageBackground } from 'react-native';
+import { Image } from 'react-native';
 
 // Global debug toggle for this module. Set to true only while actively
 // troubleshooting — leave false for normal operation to avoid noisy logs.
@@ -492,7 +492,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // Debug info for /admin/api/me hydration attempts (visible when DEBUG=true)
   const [meDebug, setMeDebug] = useState(null);
   // responsive layout measurements
-  const { width: winWidth } = useWindowDimensions();
+  const { width: winWidth, height: winHeight } = useWindowDimensions();
   const wsRef = useRef(null);
   // While hydrating from /api/latest we may want to prefer live replies that
   // arrive immediately after probes. Use these refs to defer applying the
@@ -3010,10 +3010,14 @@ function parseJwtPayload(tok) {
     return { cols: c, gaugeSize: sized, columnWidth: colWidth, gap: gapVal };
   }, [winWidth]);
 
+  // RN-aware small spacer: used for early render paths (waiting for auth) so
+  // mobile apps don't get a large top gap.
+  const headerSpacerHeight = (Constants && Constants.statusBarHeight ? Constants.statusBarHeight : 0) + (IS_REACT_NATIVE ? 4 : 12);
+
   if (!token) {
     return (
       <SafeAreaView style={styles.container}>
-        <View style={[styles.headerSpacer, { height: (Constants.statusBarHeight || 0) + 12 }]} />
+        <View style={[styles.headerSpacer, { height: headerSpacerHeight }]} />
         <View style={styles.loadingWrap}><Text style={styles.loadingText}>Waiting for authentication...</Text></View>
       </SafeAreaView>
     );
@@ -3029,10 +3033,43 @@ function parseJwtPayload(tok) {
   }
 
   // (In-app debug overlay removed after diagnosis.)
+  // (In-app debug overlay removed after diagnosis.)
+
+  // compute a responsive watermark size and vertical placement
+  // Use a single consolidated block to avoid duplicate declarations from iterative edits.
+  // Target a larger watermark for visibility but cap it per viewport class to avoid overflow.
+  const _base = Math.floor(Math.min(winWidth, winHeight) * 0.18);
+  // Increase visual prominence: scale target up further from base
+  const _target = Math.floor(_base * 3.2);
+  const _capDesktop = 700;
+  const _capTablet = 480;
+  const _capMobile = 320;
+  const _cap = winWidth >= 1200 ? _capDesktop : (winWidth >= 820 ? _capTablet : _capMobile);
+  const _min = 80;
+  // scale watermark up for stronger branding, but clamp to a safe maximum
+  const _scaledTarget = _target * 3;
+  const _maxWm = 1200;
+  const _wmSize = Math.max(_min, Math.min(Math.min(_cap, _scaledTarget), _maxWm));
+  // Use the RN-aware headerSpacerHeight defined earlier and add a larger offset
+  // for watermark anchoring on desktop/tablet. Use a much smaller offset on RN
+  // so the mobile app doesn't show an excessive top gap.
+  const headerSpacerH = headerSpacerHeight + (IS_REACT_NATIVE ? 8 : 52);
+  // Anchor the watermark a bit higher to appear visually centered
+  // Compute a true centered top based on viewport and watermark size, then clamp
+  const centeredTop = Math.floor((winHeight - _wmSize) / 2);
+  const bottomLimit = Math.floor(winHeight - _wmSize - 40);
+  const topPx = Math.max(headerSpacerH + (IS_REACT_NATIVE ? 4 : 12), Math.min(bottomLimit, centeredTop));
+  // Increase opacity and scale; nudge so centered content doesn't fully cover it.
+  // On RN use a much smaller nudge so the watermark appears a bit higher.
+  const wmNudge = Math.floor(_wmSize * (IS_REACT_NATIVE ? 0.02 : 0.12));
+  const wmStyle = { position: 'absolute', width: _wmSize, height: _wmSize, opacity: 0.30, top: Math.max(24, topPx + wmNudge), left: Math.floor((winWidth - _wmSize) / 2), zIndex: 0, pointerEvents: 'none' };
+  // headerSpacerHeight was declared earlier for the auth/waiting path; reuse it here
 
   return (
-    <ImageBackground source={require('../assets/logo.png')} style={{ flex: 1, width: '100%', alignItems: 'center' }} imageStyle={{ opacity: 0.12, resizeMode: 'contain' }}>
-      <SafeAreaView style={styles.container}>
+    <>
+      {/* Watermark image absolutely positioned and responsive (single source) */}
+      <Image source={require('../assets/logo.png')} style={wmStyle} pointerEvents="none" resizeMode="contain" />
+    <SafeAreaView style={styles.container}>
   {/* In-app debug panel for RN / DEBUG mode (removed) */}
       {DEBUG && (
         <DebugOverlay
@@ -3051,8 +3088,8 @@ function parseJwtPayload(tok) {
           dumpToConsole={() => { console.log('DEBUG DUMP', { mode, customerSlug, knownSlugs: Array.from(knownSlugs || []), gMeta, gSensors, gTargets, gPower, deviceList, filteredDevices, pendingSensorMessages, pendingPowerMessages }); }}
         />
       )}
-      {/* small spacer to keep content below any header/hamburger */}
-      <View style={[styles.headerSpacer, { height: (Constants.statusBarHeight || 0) + 12 }]} />
+  {/* small spacer to keep content below any header/hamburger */}
+  <View style={[styles.headerSpacer, { height: headerSpacerHeight }]} />
       {/* Placeholder future: group filter UI (to filter deviceList by second topic segment/group) */}
       <ScrollView style={styles.scroll} contentContainerStyle={styles.contentContainer}>
         {!loading && (
@@ -3091,6 +3128,9 @@ function parseJwtPayload(tok) {
                   if (metaKey) meta = gMeta[metaKey];
                 }
                 const gp = computeGaugeParams(d.key, meta, sensorVal);
+                // compute a modest min height so cards align but don't become oversized
+                // smaller than previous attempt to avoid excessive whitespace
+                const cardMin = Math.round(gaugeSize + 80);
                 
 
                 
@@ -3151,26 +3191,27 @@ function parseJwtPayload(tok) {
                 
                 return (
                   <View key={`gwrap-${d.key}`} style={{ width: columnWidth, padding: gap/2, alignItems:'center' }}>
-                    <View style={{ width: '100%', alignItems: 'center' }}>
-                      <Gauge
-                        key={`g-${d.key}`}
-                        size={gaugeSize}
-                        title={d.label}
-                        sensorValue={sensorVal}
-                        targetValue={targetVal}
-                        onSetTarget={(v) => { publishTargetForDevice(d.key, v); }}
-                        id={i}
-                        sensorTopic={`${d.key}/Sensor`}
-                        targetTopic={`${d.key}/Target`}
-                        greenStart={gp.greenStart}
-                        greenEnd={gp.greenEnd}
-                        min={gp.min}
-                        max={gp.max}
-                      />
-                      
-                      {/* Integrated power switches directly below gauge */}
-                      {powerSwitches && (
-                        <View style={{ width: '100%', marginTop: 8, alignItems: 'center' }}>
+                    <View style={styles.gaugeCardWrapper}>
+                      <View style={[styles.gaugeCard, { minHeight: cardMin }]}>
+                        <Gauge
+                          key={`g-${d.key}`}
+                          size={gaugeSize}
+                          title={d.label}
+                          sensorValue={sensorVal}
+                          targetValue={targetVal}
+                          onSetTarget={(v) => { publishTargetForDevice(d.key, v); }}
+                          id={i}
+                          sensorTopic={`${d.key}/Sensor`}
+                          targetTopic={`${d.key}/Target`}
+                          greenStart={gp.greenStart}
+                          greenEnd={gp.greenEnd}
+                          min={gp.min}
+                          max={gp.max}
+                        />
+
+                        {/* Integrated power switches directly below gauge */}
+                        {powerSwitches && (
+                          <View style={{ width: '100%', marginTop: 8, alignItems: 'center' }}>
                           <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 6 }}>
                             {(() => {
                               const entries = Object.entries(powerSwitches[1] || {});
@@ -3311,6 +3352,7 @@ function parseJwtPayload(tok) {
                       )}
                     </View>
                   </View>
+                </View>
                 );
               })}
             </View>
@@ -3338,12 +3380,12 @@ function parseJwtPayload(tok) {
         </View>
       )}
       </SafeAreaView>
-    </ImageBackground>
+    </>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#f6f7f9', alignItems: 'center', justifyContent: 'flex-start', padding: 16, paddingTop: 24 },
+  container: { flex: 1, backgroundColor: 'transparent', alignItems: 'center', justifyContent: 'flex-start', padding: 16, paddingTop: 24 },
   content: { width: '100%', maxWidth: 420, paddingHorizontal: 12, paddingBottom: 18, alignItems: 'center' },
   scroll: { flex: 1, width: '100%' },
   contentContainer: { alignItems: 'center', paddingBottom: 60 },
@@ -3369,6 +3411,28 @@ const styles = StyleSheet.create({
   headerSpacer: { height: 8, width: '100%' },
   fullscreenOverlay: { position: 'absolute', left: 0, top: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.18)', alignItems: 'center', justifyContent: 'center' },
   overlayInner: { alignItems: 'center', justifyContent: 'center', padding: 16, borderRadius: 12, backgroundColor: 'transparent' }
+  ,
+  watermarkImage: { position: 'absolute', width: 220, height: 220, opacity: 0.12, top: '45%', left: '50%', transform: [{ translateX: -110 }, { translateY: -110 }], zIndex: 0, resizeMode: 'contain' }
+  ,
+  gaugeCardWrapper: { width: '100%', alignItems: 'center', justifyContent: 'center' },
+  gaugeCard: {
+    width: '100%',
+    alignItems: 'center',
+    paddingVertical: 10,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+    backgroundColor: 'rgba(255,255,255,0.75)',
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(0,0,0,0.04)',
+    // subtle shadow
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    elevation: 4,
+  }
 });
 
 // Debug overlay component (visible when DEBUG=true)
