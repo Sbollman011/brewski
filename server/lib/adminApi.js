@@ -321,6 +321,79 @@ function handleAdminApi(req, res, url) {
           }
           
           // Upsert (insert or update) using the canonicalized topic
+          // Guard: if the incoming label is blank/whitespace and an existing non-empty
+          // label already exists for an equivalent canonical topic for this customer
+          // and power_key, avoid overwriting it. We consider topic variants (tele/..,
+          // BREW vs org-slug) equivalent by canonicalizing stored topics and comparing
+          // to the incoming canonical topic.
+          const incomingLabel = (label || '') + '';
+          const isIncomingBlank = incomingLabel.trim().length === 0;
+          if (isIncomingBlank) {
+            try {
+              // Fetch candidate rows for this customer and power_key (case-insensitive)
+              const candidates = db.prepare('SELECT id, topic, power_key, label FROM power_labels WHERE customer_id = ? AND UPPER(power_key) = UPPER(?)').all(targetCustomerId, power_key);
+              if (Array.isArray(candidates) && candidates.length) {
+                // Compare canonical forms rather than raw topic strings to detect
+                // equivalent variants stored under different prefixes.
+                const incomingCanon = topic;
+                // Helper: extract device segment from a canonical topic like SITE/DEVICE[/...]
+                const deviceFromCanon = (canon) => {
+                  try {
+                    if (!canon) return null;
+                    const parts = String(canon).split('/').filter(Boolean);
+                    if (!parts.length) return null;
+                    // If canonical includes SITE/DEVICE[/...], device is second segment
+                    if (parts.length >= 2) return String(parts[1]).toUpperCase();
+                    // Otherwise single-token topic, treat that as device
+                    return String(parts[0]).toUpperCase();
+                  } catch (e) { return null; }
+                };
+
+                const incomingDevice = deviceFromCanon(incomingCanon);
+
+                for (const r of candidates) {
+                  try {
+                    const storedCanon = canonicalizeTopic(r.topic);
+                    if (!storedCanon) continue;
+                    // Exact canonical match (same SITE/DEVICE/STATE) — previous behavior
+                    if (String(storedCanon).toUpperCase() === String(incomingCanon).toUpperCase()) {
+                      if (r.label && String(r.label).trim().length > 0) {
+                        try { console.log('[admin-api] SKIP blank label upsert due to existing canonical match with non-empty label user=', me && me.username ? me.username : me && me.id ? me.id : '<unknown>', 'customer=', targetCustomerId, 'topic=', topic, 'power_key=', power_key, 'stored_id=', r.id); } catch (e) {}
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ ok: true, skipped: true }));
+                        try { db.close && db.close(); } catch (e) {}
+                        return;
+                      }
+                    }
+
+                    // If canonical differs only by SITE (e.g., BREW vs RAIL) but the device
+                    // segment is the same and an existing non-empty label exists, skip to
+                    // avoid overwriting user-set labels stored under site-variant topics.
+                    try {
+                      const storedDevice = deviceFromCanon(storedCanon);
+                      // Also consider site tokens — avoid matching when either site is the legacy NOSITE
+                      const storedSite = (String(storedCanon || '').split('/')[0] || '').toUpperCase();
+                      const incomingSiteToken = (String(incomingCanon || '').split('/')[0] || '').toUpperCase();
+                      const bothSitesKnown = storedSite && incomingSiteToken && storedSite !== 'NOSITE' && incomingSiteToken !== 'NOSITE';
+                      if (incomingDevice && storedDevice && incomingDevice === storedDevice && bothSitesKnown) {
+                        if (r.label && String(r.label).trim().length > 0) {
+                          try { console.log('[admin-api] SKIP blank label upsert due to existing per-device match with non-empty label user=', me && me.username ? me.username : me && me.id ? me.id : '<unknown>', 'customer=', targetCustomerId, 'topic=', topic, 'power_key=', power_key, 'stored_id=', r.id, 'stored_topic=', r.topic); } catch (e) {}
+                          res.writeHead(200, { 'Content-Type': 'application/json' });
+                          res.end(JSON.stringify({ ok: true, skipped: true }));
+                          try { db.close && db.close(); } catch (e) {}
+                          return;
+                        }
+                      }
+                    } catch (e) { /* non-fatal per-row */ }
+                  } catch (e) { /* per-row error non-fatal */ }
+                }
+              }
+            } catch (e) {
+              try { console.error('[admin-api] error checking existing labels before blank-upsert guard', e && e.message); } catch (e) {}
+              // Fall through to normal upsert if the check fails
+            }
+          }
+
           const info = db.prepare('INSERT INTO power_labels (customer_id, topic, power_key, label, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(customer_id, topic, power_key) DO UPDATE SET label=excluded.label, updated_at=excluded.updated_at').run(targetCustomerId, topic, power_key, label, now, now);
           // Log successful persistence for correlation with proxy/tunnel logs
           try {

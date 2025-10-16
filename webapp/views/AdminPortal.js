@@ -569,8 +569,9 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
         }
         return { topic, powerKeys: pks, assignedCustomer: initial.slug, labels: labelsForTopic };
       });
-      setPowerStates(merged);
-      setPowerLabels(labelMap);
+  setPowerStates(merged);
+  // Merge fetched labels into existing cache to avoid clobbering local/optimistic edits
+  setPowerLabels(prev => ({ ...(prev || {}), ...(labelMap || {}) }));
       // Remove any local drafts that now match authoritative server labels
       try {
         setEditedPowerLabels(prev => {
@@ -586,7 +587,11 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           return next;
         });
       } catch (e) {}
-    } catch (e) { setPowerStates([]); setPowerLabels({}); }
+    } catch (e) { 
+      // On error, preserve existing local powerLabels instead of clearing them.
+      if (DEBUG) console.warn('AdminPortal: loadPowerLabelsAndStates failed', e && e.message);
+      setPowerStates([]);
+    }
     setLoadingPower(false);
   }
 

@@ -7,127 +7,55 @@ const DEBUG = false;
 // Detect React Native at module load time and provide a default API host
 const IS_REACT_NATIVE = (() => { try { return (typeof navigator !== 'undefined' && navigator.product === 'ReactNative'); } catch (e) { return false; } })();
 const DEFAULT_API_HOST = (typeof process !== 'undefined' && process.env && process.env.SERVER_FQDN) ? process.env.SERVER_FQDN : 'api.brewingremote.com';
+// In-flight promise cache for fetchPowerLabels to coalesce concurrent callers
+const _inflightFetchPowerLabels = new Map();
+
 // Helper to fetch power labels from the API. Accepts an optional JWT token
 // and will try multiple fallbacks to handle different hosting/proxy setups.
 async function fetchPowerLabels(token) {
-  try {
-    let res = null;
+  const cacheKey = token || '__anon__';
+  if (_inflightFetchPowerLabels.has(cacheKey)) return await _inflightFetchPowerLabels.get(cacheKey);
 
-    // 1) Prefer window.apiFetch if present (it knows how to attach auth headers)
+  const doFetch = async () => {
     try {
+      // Prefer window.apiFetch when available
       if (typeof window !== 'undefined' && window.apiFetch) {
-        try { res = await window.apiFetch('/api/power-labels'); } catch (e) { /* fallthrough */ }
-        if ((!res || !res.ok) && window.apiFetch) {
-          try { res = await window.apiFetch('/admin/api/power-labels'); } catch (e) { /* fallthrough */ }
-        }
-      }
-    } catch (e) { /* ignore */ }
-
-    // 2) If we still don't have a good response, try classical fetch to likely origins.
-    if (!res || (typeof res.ok !== 'undefined' && !res.ok)) {
-      const candidatePaths = ['/api/power-labels', '/admin/api/power-labels'];
-      // Prefer canonical API host first to avoid same-origin SPA HTML responses.
-      const origins = [];
-      try { if (typeof USE_PUBLIC_WS !== 'undefined' && USE_PUBLIC_WS && typeof PUBLIC_WS_HOST === 'string' && PUBLIC_WS_HOST) origins.push(`https://${PUBLIC_WS_HOST}`); } catch (e) {}
-      // current origin (same origin requests) - fallback to hosted SPA origin
-      try { if (typeof window !== 'undefined' && window.location && window.location.origin) origins.push(window.location.origin); } catch (e) {}
-      // If no origins were discovered (e.g. React Native), fall back to the configured default host
-      try { if (!origins.length) origins.push(`https://${DEFAULT_API_HOST}`); } catch (e) {}
-
-  // Try each origin + path with Authorization header (if token provided) then with token query param
-      for (const origin of origins) {
-        for (const path of candidatePaths) {
-          const url = `${origin}${path}`;
-          try {
-            const headers = {};
-            if (token) headers['Authorization'] = `Bearer ${token}`;
-            if (DEBUG) console.log('Dashboard: attempting fetch', { url, headers });
-            const r = await (typeof window !== 'undefined' && window.fetch ? window.fetch(url, { headers, mode: 'cors' }) : fetch(url, { headers }));
-            if (r && r.ok) { res = r; break; }
-            // try with token query param as a last resort
-            if (token) {
-              const sep = url.includes('?') ? '&' : '?';
-              const urlWithToken = `${url}${sep}token=${encodeURIComponent(token)}`;
-              try {
-                if (DEBUG) console.log('Dashboard: attempting fetch with token query param', { url: urlWithToken });
-                const r2 = await (typeof window !== 'undefined' && window.fetch ? window.fetch(urlWithToken, { mode: 'cors' }) : fetch(urlWithToken));
-                if (r2 && r2.ok) { res = r2; break; }
-              } catch (e) { if (DEBUG) console.log('Dashboard: fetch attempt failed', e && e.message ? e.message : e); }
-            }
-          } catch (e) { if (DEBUG) console.log('Dashboard: fetch attempt failed', e && e.message ? e.message : e); }
-        }
-        if (res && res.ok) break;
-      }
-    }
-
-    // 3) If res is a Response-like object parse JSON
-    if (!res) return [];
-    try {
-      // If Content-Type is not JSON, attempt a fallback to the absolute API host
-      const contentType = res && res.headers && typeof res.headers.get === 'function' ? (res.headers.get('content-type') || '') : '';
-      if (contentType && contentType.toLowerCase().indexOf('application/json') === -1) {
-        // Read text body for diagnostics
-        let bodyTxt = '';
-        try { bodyTxt = await res.text(); } catch (e) { bodyTxt = '<unreadable body>'; }
-        console.warn('Dashboard: fetchPowerLabels returned non-JSON response, trying direct API host', { url: res.url || null, status: res.status, contentType, bodySnippet: (bodyTxt && bodyTxt.slice ? bodyTxt.slice(0,200) : bodyTxt) });
-
-        // Try direct requests to central API host as a recovery path
         try {
-          const directPaths = ['/admin/api/power-labels', '/api/power-labels'];
-          for (const p of directPaths) {
-              try {
-                // Use the centralized apiFetch helper so the request is routed to the
-                // canonical API host (DEFAULT_API_HOST) and Authorization/Accept
-                // headers are handled consistently. apiFetch already prefers the
-                // api host for /api and /admin/api paths.
-                const candidate = p; // e.g. '/admin/api/power-labels' or '/api/power-labels'
-                let rr = null;
-                try {
-                  // Prefer window.apiFetch if available (it wraps apiFetch)
-                  if (typeof window !== 'undefined' && window.apiFetch) {
-                    rr = await window.apiFetch(candidate, { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
-                  } else {
-                    rr = await apiFetch(candidate, { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
-                  }
-                } catch (e) {
-                  // If apiFetch itself throws, ignore and continue to next path
-                  if (DEBUG) console.log('Dashboard: apiFetch candidate failed', candidate, e && e.message);
-                  rr = null;
-                }
-
-                if (rr && rr.ok) {
-                  const ct = rr.headers && typeof rr.headers.get === 'function' ? (rr.headers.get('content-type') || '') : '';
-                  if (ct && ct.toLowerCase().indexOf('application/json') !== -1) {
-                    const js = await rr.json().catch(() => null);
-                    return js && js.labels ? js.labels : (Array.isArray(js) ? js : []);
-                  }
-                }
-              } catch (e) { if (DEBUG) console.log('Dashboard: direct retry failed', e && e.message); }
-            }
-        } catch (e) { if (DEBUG) console.log('Dashboard: direct host fallback failed', e && e.message); }
-
-        return [];
+          const r = await window.apiFetch('/admin/api/power-labels');
+          if (r && r.ok) {
+            const js = (typeof r.json === 'function') ? await r.json().catch(() => null) : r;
+            return js && js.labels ? js.labels : [];
+          }
+        } catch (e) { /* ignore and fallthrough */ }
       }
-      if (typeof res.json === 'function') {
-        const js = await res.json().catch(async (err) => {
-          // If JSON.parse failed, include the body for easier debugging
-          let bodyTxt = '';
-          try { bodyTxt = await res.text(); } catch (e) { bodyTxt = '<unreadable body>'; }
-          console.warn('Dashboard: fetchPowerLabels failed to parse JSON', { url: res.url || null, status: res.status, bodySnippet: (bodyTxt && bodyTxt.slice ? bodyTxt.slice(0,200) : bodyTxt) });
-          return null;
-        });
-        return js && js.labels ? js.labels : (Array.isArray(js) ? js : []);
-      }
-      // If it's already parsed (rare path)
-      return res.labels || [];
+
+      // Try admin API helper which routes to canonical host
+      try {
+        const r = await doApiFetch('/admin/api/power-labels');
+        if (r && r.ok) {
+          const js = await r.json().catch(() => null);
+          return js && js.labels ? js.labels : [];
+        }
+      } catch (e) { /* ignore */ }
+
+      // Fallback to public API path
+      try {
+        const r2 = await doApiFetch('/api/power-labels');
+        if (r2 && r2.ok) {
+          const js2 = await r2.json().catch(() => null);
+          return js2 && js2.labels ? js2.labels : [];
+        }
+      } catch (e) { /* ignore */ }
+
+      return [];
     } catch (e) {
-      console.error('Dashboard: fetchPowerLabels unexpected error while parsing response', e && e.message ? e.message : e);
       return [];
     }
-  } catch (e) {
-    console.error('Dashboard: All power label APIs failed:', e && e.message ? e.message : e);
-    return [];
-  }
+  };
+
+  const p = doFetch();
+  _inflightFetchPowerLabels.set(cacheKey, p);
+  try { return await p; } finally { _inflightFetchPowerLabels.delete(cacheKey); }
 }
 // Produce a set of canonical candidate keys for a topic so label lookups
 // behave the same as the AdminPortal canonicalization. Return an array of
@@ -437,7 +365,17 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           });
         }
 
-        setPowerLabels(labelMap);
+  if (DEBUG) console.log('Dashboard: setting powerLabels from fetch', { count: Object.keys(labelMap || {}).length, sample: Object.keys(labelMap || {}).slice(0,5) });
+        if (DEBUG) console.log('Dashboard: merging fetched power labels into local cache', { fetched: Object.keys(labelMap || {}).length, existing: Object.keys(powerLabels || {}).length });
+        setPowerLabels(prev => {
+          try {
+            const next = Object.assign({}, prev || {});
+            Object.keys(labelMap || {}).forEach(k => { try { next[k] = labelMap[k]; } catch (e) {} });
+            // ensure uppercase variants are set
+            Object.keys(labelMap || {}).forEach(k => { try { next[k.toUpperCase()] = labelMap[k]; } catch (e) {} });
+            return next;
+          } catch (e) { return labelMap; }
+        });
         setPowerLabelsByCanonical(canonicalMap);
 
         // Derive canonical base keys from fetched labels so we can render
@@ -777,6 +715,10 @@ function parseJwtPayload(tok) {
   };
     // Track which bases we've already attempted to persist so we don't spam the admin API
     const persistedBasesRef = useRef(new Set());
+  // Track which placeholder power_label posts we've recently attempted so we don't repeat them
+  const placeholderPostedRef = useRef(new Map()); // key -> timestamp ms
+  // Debounce timer to consolidate label refreshes after multiple posts
+  const labelsRefreshTimerRef = useRef(null);
 
     // Persist a discovered base (canonical) into the server topics DB via admin API.
     // This attempts a single POST and on success adds the base to dbSensorBases so
@@ -869,120 +811,128 @@ function parseJwtPayload(tok) {
 
     // Persist discovered power keys for a canonical base to the server so AdminPortal
     // can render editable slots for POWER/POWER1/.. keys even if labels don't yet exist.
+    // This implementation is intentionally concise and defensive to avoid nested
+    // control-flow that previously led to a mismatched-brace syntax error.
     const persistDiscoveredPowerKeys = async (baseKey, powerStates) => {
       try {
-        if (!token) return false; // need admin/auth token to persist
+        if (!token) return false;
         if (!baseKey || !powerStates || typeof powerStates !== 'object') return false;
-        // Require numeric customerId for reliable per-customer persistence; fall back to slug
         if (!customerId && !customerSlug) return false;
 
-        const keys = Object.keys(powerStates).map(k => String(k).toUpperCase());
+        const keys = Object.keys(powerStates || {}).map(k => String(k).toUpperCase());
         if (!keys.length) return false;
 
-        let savedAny = false;
-      for (const pk of keys) {
-          try {
-            // Only persist when we don't already have a server-known label locally
-            const parts = String(baseKey).split('/').filter(Boolean);
-            const site = parts[0];
-            const device = parts[1] || parts[0];
-            // candidate topics that AdminPortal commonly looks for
-            const stateTopicGuess = `tele/${site}/${device}/STATE`;
-            const baseStateVariant = `${baseKey}/STATE`;
-            const teleDeviceState = `tele/${device}/STATE`;
+        const canonicalBase = normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || baseKey;
+        const canonicalTopic = `${canonicalBase}/STATE`;
 
-            // If any of those variants already exists in local label map, skip
-            const checkKeys = [ `${stateTopicGuess}|${pk}`, `${baseStateVariant}|${pk}`, `${teleDeviceState}|${pk}`, `${baseKey}|${pk}` ];
-            let alreadyKnown = false;
-            if (powerLabels) {
-              for (const ck of checkKeys) {
-                if (powerLabels[ck] || powerLabels[ck.toUpperCase()]) { alreadyKnown = true; break; }
-              }
-            }
-            if (alreadyKnown) continue;
+        // Fetch existing server labels for this customer so we can detect any
+        // non-empty label for the same device+power_key across topic variants
+        // (including legacy NOSITE rows). This prevents posting blank placeholders
+        // that would otherwise create duplicate/overlapping rows.
+        let existingKeys = new Set(); // set of POWER keys already present for this device
+        try {
+          let fetchPath = null;
+          if (customerId) fetchPath = `/admin/api/power-labels?customer_id=${encodeURIComponent(customerId)}`;
+          else if (customerSlug) fetchPath = `/api/power-labels?customer_slug=${encodeURIComponent(customerSlug)}`;
+          else fetchPath = `/api/power-labels`;
 
-            // Build a single canonical payload to avoid creating duplicate DB rows
-            const canonicalBase = normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || baseKey;
-            const canonicalTopic = `${canonicalBase}/STATE`;
-            const payload = customerId ? { topic: canonicalTopic, power_key: pk, label: '', customer_id: customerId } : { topic: canonicalTopic, power_key: pk, label: '', customer_slug: customerSlug };
-
-            const tryPost = async (path, body) => {
-              try {
-                // Use the component-level doApiFetch helper which prefers window.apiFetch
-                // and otherwise builds an absolute URL to the canonical API host.
-                const res = await doApiFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-                if (res && (res.ok || (res.status && res.status >= 200 && res.status < 300))) {
-                  if (DEBUG) console.log('Dashboard: POST success via doApiFetch', { path, status: res.status });
-                  return true;
-                }
-
-                // read body for diagnostics
-                let txt = '';
-                try { txt = await (res && res.text ? res.text() : Promise.resolve('')); } catch (e) { txt = ''; }
-                if (DEBUG) console.warn('Dashboard: POST failed via doApiFetch', { path, status: res && res.status, body: txt });
-
-                // If server indicates bad_id for numeric-customer create attempts, try slug-based fallback
+          let r = null;
+          try { r = await doApiFetch(fetchPath); } catch (e) { r = null; }
+          if (!r || !r.ok) {
+            // Try public fallback
+            try { r = await doApiFetch(`/api/power-labels`); } catch (e) { r = r || null; }
+          }
+          if (r && r.ok) {
+            const js = await r.json().catch(() => null);
+            if (js && Array.isArray(js.labels)) {
+              // Determine device name for incoming canonical base
+              const targetParts = String(canonicalBase || '').split('/').filter(Boolean);
+              const targetDevice = targetParts.length >= 2 ? String(targetParts[1]).toUpperCase() : (targetParts[0] || '').toUpperCase();
+              js.labels.forEach(l => {
                 try {
-                  const lower = (txt || '').toLowerCase();
-                  if (res && res.status === 400 && lower.includes('bad_id') && body && body.customer_id && customerSlug) {
-                    const fallbackBody = Object.assign({}, body);
-                    delete fallbackBody.customer_id;
-                    fallbackBody.customer_slug = customerSlug;
-                    if (DEBUG) console.log('Dashboard: trying slug-fallback POST for power-label via doApiFetch', { path, fallbackBody });
-                    const res2 = await doApiFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fallbackBody) });
-                    if (res2 && (res2.ok || (res2.status && res2.status >= 200 && res2.status < 300))) {
-                      if (DEBUG) console.log('Dashboard: slug-fallback POST success via doApiFetch', { path, status: res2.status });
-                      return true;
-                    }
-                    try { const t2 = await (res2 && res2.text ? res2.text() : Promise.resolve('')); if (DEBUG) console.warn('Dashboard: slug-fallback failed', { status: res2 && res2.status, body: t2 }); } catch (e) {}
-                  }
-                } catch (e) { if (DEBUG) console.warn('Dashboard: slug-fallback exception', e && e.message); }
-              } catch (e) { if (DEBUG) console.warn('Dashboard: POST exception via doApiFetch', e && e.message); }
-              return false;
-            };
-            // Attempt a single POST to admin endpoint, then fallback to public endpoint
-            try {
-              if (DEBUG) console.log('Dashboard: persistDiscoveredPowerKeys try payload', payload);
-              const ok1 = await tryPost(`/admin/api/power-labels`, payload);
-              const ok2 = (!ok1) ? await tryPost(`/api/power-labels`, payload) : ok1;
-              if (ok1 || ok2) savedAny = true;
-            } catch (e) { if (DEBUG) console.warn('persistDiscoveredPowerKeys single-post exception', e && e.message); }
-          } catch (e) {}
-        }
-        if (savedAny) {
-              // Refresh labels map so UI shows editable slots quickly
-              try {
-                const labelsArr = await fetchPowerLabels(token);
-                // convert to map like initial load does
-                const labelMap = {};
-                if (Array.isArray(labelsArr)) {
-                  labelsArr.forEach(l => {
-                    try {
-                      if (l && l.topic && l.power_key) {
-                        const key = `${l.topic}|${l.power_key}`;
-                        labelMap[key] = l.label || '';
-                        labelMap[key.toUpperCase()] = l.label || '';
-                        const candidates = canonicalCandidatesForTopic(l.topic);
-                        candidates.forEach(t => {
-                          const k1 = `${t}|${l.power_key}`;
-                          const k2 = `${t}|${l.power_key.toUpperCase()}`;
-                          if (!labelMap[k1]) labelMap[k1] = l.label || '';
-                          if (!labelMap[k2]) labelMap[k2] = l.label || '';
-                        });
-                      }
-                    } catch (e) {}
-                  });
-                }
-                setPowerLabels(l => ({ ...l, ...labelMap }));
-                // Inform other parts of the SPA (AdminPortal) that power-labels changed
-                try {
-                  if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
-                    const ev = new CustomEvent('brewski:power-labels-synced', { detail: { timestamp: Date.now() } });
-                    window.dispatchEvent(ev);
-                  }
+                  if (!l || !l.topic || !l.power_key) return;
+                  const raw = String(l.topic || '');
+                  // canonicalize stored topic locally (strip tele/stat, drop trailing STATE)
+                  let s = raw.replace(/^(tele|stat)\//i, '');
+                  const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
+                  while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
+                  if (!parts.length) return;
+                  const storedDevice = parts.length >= 2 ? parts[1] : parts[0];
+                  if (!storedDevice) return;
+                  const upk = String(l.power_key).toUpperCase();
+                  const hasLabel = String(l.label || '').trim().length > 0;
+                  // If any non-empty label exists for the same device+power_key, mark it present
+                  if (hasLabel && storedDevice === targetDevice) existingKeys.add(upk);
                 } catch (e) {}
-              } catch (e) {}
+              });
+            }
+          }
+        } catch (e) { /* ignore fetch errors and proceed to attempt posts */ }
+
+        let savedAny = false;
+        for (const pk of keys) {
+          try {
+            if (existingKeys.has(pk)) continue; // server already knows this key for this device
+            const placeholderKey = `${canonicalTopic}|${pk}`;
+            const lastPosted = placeholderPostedRef.current.get(placeholderKey) || 0;
+            const now = Date.now();
+            if (now - lastPosted < 60_000) continue; // rate-limit reposts
+
+            // Build payload; include numeric customer_id when available
+            const payload = { topic: canonicalTopic, power_key: pk, label: '' };
+            if (customerId) payload.customer_id = customerId;
+
+            // Try admin endpoint first, then public fallback
+            let ok = false;
+            try {
+              const res = await doApiFetch('/admin/api/power-labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+              if (res && (res.ok || (res.status && res.status >= 200 && res.status < 300))) ok = true;
+            } catch (e) { /* ignore */ }
+            if (!ok) {
+              try {
+                const res2 = await doApiFetch('/api/power-labels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+                if (res2 && (res2.ok || (res2.status && res2.status >= 200 && res2.status < 300))) ok = true;
+              } catch (e) { /* ignore */ }
+            }
+
+            if (ok) {
+              savedAny = true;
+              placeholderPostedRef.current.set(placeholderKey, Date.now());
+            }
+          } catch (e) { /* per-key error is non-fatal */ }
         }
+
+        if (savedAny) {
+          // Debounced refresh to consolidate multiple posts
+          if (labelsRefreshTimerRef.current) clearTimeout(labelsRefreshTimerRef.current);
+          labelsRefreshTimerRef.current = setTimeout(async () => {
+            try {
+              const labelsArr = await fetchPowerLabels(token);
+              const labelMap = {};
+              if (Array.isArray(labelsArr)) {
+                labelsArr.forEach(l => {
+                  try {
+                    if (l && l.topic && l.power_key) {
+                      const key = `${l.topic}|${l.power_key}`;
+                      labelMap[key] = l.label || '';
+                      labelMap[key.toUpperCase()] = l.label || '';
+                      const candidates = canonicalCandidatesForTopic(l.topic);
+                      candidates.forEach(t => {
+                        const k1 = `${t}|${l.power_key}`;
+                        const k2 = `${t}|${l.power_key.toUpperCase()}`;
+                        if (!labelMap[k1]) labelMap[k1] = l.label || '';
+                        if (!labelMap[k2]) labelMap[k2] = l.label || '';
+                      });
+                    }
+                  } catch (e) {}
+                });
+              }
+              setPowerLabels(l => ({ ...l, ...labelMap }));
+              try { if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') window.dispatchEvent(new CustomEvent('brewski:power-labels-synced', { detail: { timestamp: Date.now() } })); } catch (e) {}
+            } catch (e) {}
+          }, 800);
+        }
+
         return savedAny;
       } catch (e) { return false; }
     };
@@ -1409,6 +1359,24 @@ function parseJwtPayload(tok) {
       }
     } catch (e) {}
     return '';
+  };
+
+  // Indicator renderers for special label suffixes (lowercase keys).
+  // Each renderer receives an object { isOn } and should return a JSX element.
+  const INDICATOR_RENDERERS = {
+    // Example: HEATING-heatingindicator -> render a small red 'lamp' when ON
+    heatingindicator: ({ isOn }) => (
+      <View style={{ alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: 14, height: 14, borderRadius: 8, backgroundColor: isOn ? '#d32f2f' : '#cfd8dc', borderWidth: 1, borderColor: isOn ? '#b71c1c' : '#b0bec5', marginBottom: 4, shadowColor: '#000', shadowOffset: { width: 0, height: isOn ? 2 : 1 }, shadowOpacity: isOn ? 0.25 : 0.08, shadowRadius: isOn ? 3 : 1 }} />
+      </View>
+    ),
+    // Example: COOLING-coolingindicator -> render a small blue 'cool' lamp when ON
+    coolingindicator: ({ isOn }) => (
+      <View style={{ alignItems: 'center', justifyContent: 'center' }}>
+        <View style={{ width: 14, height: 14, borderRadius: 8, backgroundColor: isOn ? '#1976d2' : '#cfd8dc', borderWidth: 1, borderColor: isOn ? '#0d47a1' : '#b0bec5', marginBottom: 4, shadowColor: '#000', shadowOffset: { width: 0, height: isOn ? 2 : 1 }, shadowOpacity: isOn ? 0.22 : 0.08, shadowRadius: isOn ? 3 : 1 }} />
+      </View>
+    ),
+    // future indicators can be added here
   };
 
   const [connectionError, setConnectionError] = useState(false);
@@ -2812,13 +2780,23 @@ function parseJwtPayload(tok) {
     }
 
     // Tasmota command topics: cmnd/<[site/]Device>/<Power or Power1/Power2/etc>
-    const cmdKey = powerKey === 'POWER' ? 'Power' : powerKey.replace(/^POWER/, 'Power');
-    const topic = site ? `cmnd/${site}/${deviceName}/${cmdKey}` : `cmnd/${deviceName}/${cmdKey}`;
+  const cmdKey = powerKey === 'POWER' ? 'Power' : powerKey.replace(/^POWER/, 'Power');
+  // Ensure topic prefixes are lowercase per convention
+  const sitePart = site ? String(site) : null;
+  const topic = sitePart ? `cmnd/${sitePart}/${deviceName}/${cmdKey}` : `cmnd/${deviceName}/${cmdKey}`;
     const payload = nextOn ? 'ON' : 'OFF';
     const id = `pw-${site || 'UNK'}-${deviceName}-${cmdKey}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
 
     try {
-      wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload, id }));
+      // normalize topic to lowercase for prefix (cmnd/stat/tele) while preserving case of site/device segments
+      try {
+        const parts = topic.split('/');
+        if (parts && parts.length) parts[0] = parts[0].toLowerCase();
+        const outTopic = parts.join('/');
+        wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload, id }));
+      } catch (e) {
+        wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload, id }));
+      }
 
       // Optimistically update local state for immediate UI feedback
       setGPower(prev => {
@@ -2833,7 +2811,7 @@ function parseJwtPayload(tok) {
       });
 
       // Ask device to publish its STATE so other clients / snapshot see authoritative state quickly
-      try { probeStateForDevice(site, deviceName); } catch (e) {}
+  try { probeStateForDevice(site, deviceName); } catch (e) {}
 
     } catch (e) {}
   };
@@ -2845,16 +2823,15 @@ function parseJwtPayload(tok) {
     try {
       const statusTopic = site ? `cmnd/${site}/${deviceName}/Status` : `cmnd/${deviceName}/Status`;
       const idBase = `status-probe-${site || 'UNK'}-${deviceName}-${Date.now()}`;
-      // Status 0 asks Tasmota to publish a full state (non-mutating)
-      try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopic, payload: '0', id: idBase + '-0' })); } catch (e) {}
-      // Also ask the bridge for the current STATE (best-effort). Some bridges
-      // respond to get requests for <SITE>/<DEVICE>/State and will emit a
-      // current/message that applyPower will handle.
-      try { wsRef.current.send(JSON.stringify({ type: 'get', topic: `${site}/${deviceName}/State`, id: idBase + '-get' })); } catch (e) {}
+      // normalize prefix to lowercase
+      const stParts = statusTopic.split('/'); if (stParts && stParts.length) stParts[0] = stParts[0].toLowerCase(); const statusTopicOut = stParts.join('/');
+      try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-0' })); } catch (e) {}
+      // Also ask the bridge for the current STATE (best-effort).
+      try { const getParts = [site ? site : '', deviceName, 'State'].filter(Boolean); if (getParts.length) { const getTopic = `${getParts.join('/')}`; const getPartsArr = getTopic.split('/'); if (getPartsArr && getPartsArr.length) getPartsArr[0] = getPartsArr[0].toLowerCase(); const getTopicOut = getPartsArr.join('/'); wsRef.current.send(JSON.stringify({ type: 'get', topic: getTopicOut, id: idBase + '-get' })); } } catch (e) {}
 
       // Two retries to help with flaky networks / device latency
-      setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopic, payload: '0', id: idBase + '-r1' })); } catch (e) {} }, 250);
-      setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopic, payload: '0', id: idBase + '-r2' })); } catch (e) {} }, 1000);
+  setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-r1' })); } catch (e) {} }, 250);
+  setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-r2' })); } catch (e) {} }, 1000);
     } catch (e) {}
   };
 
@@ -3057,6 +3034,24 @@ function parseJwtPayload(tok) {
                                 let label = getPowerLabel(baseKey, powerKey);
                                 if (!label) label = powerKey === 'POWER' ? 'PWR' : powerKey.replace('POWER', 'PWR');
 
+                                // Support special label suffixes like "HEATING-heatingindicator"
+                                // where the suffix after '-' names a registered indicator renderer.
+                                let indicatorRenderer = null;
+                                let displayLabel = label;
+                                try {
+                                  // Split on common dash characters (hyphen-minus, en-dash, em-dash)
+                                  // and be resilient to leading/trailing whitespace or leading dashes.
+                                  if (label && typeof label === 'string') {
+                                    const parts = String(label).split(/[-–—]/).map(s => (s || '').trim()).filter(Boolean);
+                                    if (parts.length >= 2) {
+                                      // left-most part(s) become the display label, right-most is the indicator key
+                                      displayLabel = parts.slice(0, parts.length - 1).join(' - ');
+                                      const indicatorKey = String(parts[parts.length - 1]).toLowerCase();
+                                      if (INDICATOR_RENDERERS[indicatorKey]) indicatorRenderer = INDICATOR_RENDERERS[indicatorKey];
+                                    }
+                                  }
+                                } catch (e) {}
+
                                 // Debug logging
                                 if (DEBUG) {
                                   console.log('Dashboard Power Label Debug:', { baseKey, powerKey, foundLabel: label, sampleLabels: Object.keys(powerLabels || {}).slice(0,10) });
@@ -3067,16 +3062,18 @@ function parseJwtPayload(tok) {
                                 const showDeviceContext = arr.length > 1;
 
                                 return (
-                                  <Pressable 
-                                    key={powerKey} 
-                                    onPress={() => publishPower(powerSwitches[0], powerKey, !isOn)} 
+                                  <Pressable
+                                    key={powerKey}
+                                    onPress={() => { if (!indicatorRenderer) publishPower(powerSwitches[0], powerKey, !isOn); }}
+                                    disabled={!!indicatorRenderer}
+                                    accessibilityRole={indicatorRenderer ? 'text' : 'button'}
                                     style={{ 
                                       paddingVertical: 6, 
                                       paddingHorizontal: 10, 
                                       borderRadius: 8, 
-                                      backgroundColor: isOn ? '#4caf50' : '#f8f9fa',
+                                      backgroundColor: indicatorRenderer ? '#f3f4f6' : (isOn ? '#4caf50' : '#f8f9fa'),
                                       borderWidth: 1,
-                                      borderColor: isOn ? '#4caf50' : '#dee2e6',
+                                      borderColor: indicatorRenderer ? '#e9ecef' : (isOn ? '#4caf50' : '#dee2e6'),
                                       minWidth: arr.length === 1 ? 60 : 45,
                                       alignItems: 'center',
                                       justifyContent: 'center',
@@ -3088,23 +3085,36 @@ function parseJwtPayload(tok) {
                                       transform: [{ scale: isOn ? 1.02 : 1 }]
                                     }}
                                   >
-                                    <Text style={{ 
-                                      color: isOn ? '#fff' : '#495057', 
-                                      fontSize: arr.length === 1 ? 11 : 10, 
-                                      fontWeight: '700',
-                                      textAlign: 'center'
-                                    }}>
-                                      {label}
-                                    </Text>
-                                    <Text style={{ 
-                                      color: isOn ? '#e8f5e8' : '#6c757d', 
-                                      fontSize: 8,
-                                      fontWeight: '600',
-                                      textAlign: 'center',
-                                      marginTop: 1
-                                    }}>
-                                      {isOn ? 'ON' : 'OFF'}
-                                    </Text>
+                                    {indicatorRenderer ? (
+                                      <View style={{ alignItems: 'center' }}>
+                                        {/* show the textual label above the indicator when a prefix label exists */}
+                                        {displayLabel ? (
+                                          <Text style={{ color: isOn ? '#fff' : '#495057', fontSize: arr.length === 1 ? 11 : 10, fontWeight: '700', textAlign: 'center' }}>{displayLabel}</Text>
+                                        ) : null}
+                                        {indicatorRenderer({ isOn })}
+                                        <Text style={{ color: isOn ? '#e8f5e8' : '#6c757d', fontSize: 8, fontWeight: '600', textAlign: 'center', marginTop: 1 }}>{isOn ? 'ON' : 'OFF'}</Text>
+                                      </View>
+                                    ) : (
+                                      <>
+                                      <Text style={{ 
+                                        color: isOn ? '#fff' : '#495057', 
+                                        fontSize: arr.length === 1 ? 11 : 10, 
+                                        fontWeight: '700',
+                                        textAlign: 'center'
+                                      }}>
+                                        {label}
+                                      </Text>
+                                      <Text style={{ 
+                                        color: isOn ? '#e8f5e8' : '#6c757d', 
+                                        fontSize: 8,
+                                        fontWeight: '600',
+                                        textAlign: 'center',
+                                        marginTop: 1
+                                      }}>
+                                        {isOn ? 'ON' : 'OFF'}
+                                      </Text>
+                                      </>
+                                    )}
                                   </Pressable>
                                 );
                               })
