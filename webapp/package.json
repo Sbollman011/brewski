@@ -17,6 +17,7 @@
     "build:android:preview": "eas build -p android --profile preview"
   },
   "dependencies": {
+    "@expo/vector-icons": "^15.0.2",
     "expo": "~54.0.0",
     "expo-notifications": "^0.32.11",
     "expo-status-bar": "~3.0.8",

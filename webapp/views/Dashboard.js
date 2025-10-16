@@ -3091,7 +3091,8 @@ function parseJwtPayload(tok) {
   {/* small spacer to keep content below any header/hamburger */}
   <View style={[styles.headerSpacer, { height: headerSpacerHeight }]} />
       {/* Placeholder future: group filter UI (to filter deviceList by second topic segment/group) */}
-      <ScrollView style={styles.scroll} contentContainerStyle={styles.contentContainer}>
+  {/* Add a generous bottom padding on RN so the bottom nav does not overlap content. */}
+  <ScrollView style={styles.scroll} contentContainerStyle={[styles.contentContainer, IS_REACT_NATIVE ? { paddingBottom: 140 } : {}]}>
         {!loading && (
           <>
 
