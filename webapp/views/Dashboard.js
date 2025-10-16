@@ -2,9 +2,50 @@ import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { apiFetch } from '../src/api';
 import { Image } from 'react-native';
 
-// Global debug toggle for this module. Set to true only while actively
-// troubleshooting — leave false for normal operation to avoid noisy logs.
-const DEBUG = false;
+// Global debug toggle for this module. This is runtime-aware: it will enable
+// debug logging when ?debug=1 or localStorage.brewski.debug='true' is present,
+// or when window.brewskiDebug is set. We expose helpers to toggle it from
+// the console so you can enable logs without rebuilding.
+let DEBUG = false;
+try {
+  if (typeof window !== 'undefined') {
+    try {
+      const params = new URLSearchParams(window.location.search || '');
+      if (params.get('debug') === '1' || params.get('debug') === 'true') DEBUG = true;
+    } catch (e) {}
+    try {
+      if (window.localStorage && typeof window.localStorage.getItem === 'function') {
+        const ls = window.localStorage.getItem('brewski.debug');
+        if (ls === 'true') DEBUG = true;
+      }
+    } catch (e) {}
+    try {
+      if (window.brewskiDebug) DEBUG = true;
+    } catch (e) {}
+
+    // Convenience helpers to toggle debug at runtime from the browser console.
+    try {
+      window.enableBrewskiDebug = (persist = false) => {
+        DEBUG = true;
+        try { if (persist && window.localStorage && typeof window.localStorage.setItem === 'function') window.localStorage.setItem('brewski.debug', 'true'); } catch (e) {}
+        console.log('brewski: DEBUG enabled');
+        return DEBUG;
+      };
+      window.disableBrewskiDebug = (persist = false) => {
+        DEBUG = false;
+        try { if (persist && window.localStorage && typeof window.localStorage.setItem === 'function') window.localStorage.setItem('brewski.debug', 'false'); } catch (e) {}
+        console.log('brewski: DEBUG disabled');
+        return DEBUG;
+      };
+    } catch (e) {}
+  }
+} catch (e) {}
+// Simple module-level logger to avoid runtime ReferenceErrors when debug helpers
+// are invoked before the Dashboard component mounts. This forces console output
+// (no runtime gating) so logs always appear while we diagnose issues.
+const brewskiLog = (...args) => { try { console.log('brewski:', ...args); } catch (e) {} };
+// Ensure legacy `debug(...)` calls (leftover in some places) don't crash the app.
+const debug = (...args) => { try { console.log('debug:', ...args); } catch (e) {} };
 // Detect React Native at module load time and provide a default API host
 const IS_REACT_NATIVE = (() => { try { return (typeof navigator !== 'undefined' && navigator.product === 'ReactNative'); } catch (e) { return false; } })();
 const DEFAULT_API_HOST = (typeof process !== 'undefined' && process.env && process.env.SERVER_FQDN) ? process.env.SERVER_FQDN : 'api.brewingremote.com';
@@ -293,19 +334,22 @@ function computeGaugeParams(baseKey, meta, sensorVal) {
 }
 
 export default function Dashboard({ token, onCustomerLoaded }) {
-  // Lightweight runtime debug toggle: enable with ?debug=1 in the URL or
-  // by setting localStorage.setItem('brewski.debug','true') in the console.
-  const DEBUG = (() => {
-    try {
-      if (typeof window !== 'undefined') {
+  // Initialize runtime DEBUG flag from URL/localStorage/window.brewskiDebug so
+  // the global runtime helpers (enableBrewskiDebug/disableBrewskiDebug) can
+  // control logging consistently without needing a rebuild.
+  try {
+    if (typeof window !== 'undefined') {
+      try {
         const params = new URLSearchParams(window.location.search || '');
-        if (params.get('debug') === '1' || params.get('debug') === 'true') return true;
+        if (params.get('debug') === '1' || params.get('debug') === 'true') DEBUG = true;
+      } catch (e) {}
+      try {
         const ls = window.localStorage && window.localStorage.getItem && window.localStorage.getItem('brewski.debug');
-        if (ls === 'true') return true;
-      }
-    } catch (e) {}
-    return false;
-  })();
+        if (ls === 'true') DEBUG = true;
+      } catch (e) {}
+      try { if (window.brewskiDebug) DEBUG = true; } catch (e) {}
+    }
+  } catch (e) {}
   // Power label state: { `${topic}|${powerKey}`: label }
   const [powerLabels, setPowerLabels] = useState({});
   // Grouped by canonical base: { 'SITE/DEVICE': { POWER: 'Label', POWER1: 'Label2' } }
@@ -382,7 +426,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
       
       // Debug logging
       if (DEBUG) {
-        console.log('Dashboard: Power labels fetch result:', {
+        brewskiLog('Dashboard: Power labels fetch result:', {
           labelsCount: Object.keys(labelMap).length,
           labelKeys: Object.keys(labelMap),
           fullLabelMap: labelMap
@@ -628,7 +672,7 @@ function parseJwtPayload(tok) {
         setCustomerSlug(candidate);
         setMode(norm);
       } else {
-        if (DEBUG) console.log('Dashboard: JWT fast-path rejected candidate (not a slug):', maybeSlug);
+  if (DEBUG) brewskiLog('Dashboard: JWT fast-path rejected candidate (not a slug):', maybeSlug);
       }
     } catch (e) {}
   }, [token]);
@@ -735,7 +779,7 @@ function parseJwtPayload(tok) {
           } catch (e) { record.custFetchError = String(e); try { setMeDebug(record); } catch (e) {} }
         }
       } catch (e) {
-        if (DEBUG) console.log('Dashboard: /admin/api/me hydrate error', e);
+  if (DEBUG) brewskiLog('Dashboard: /admin/api/me hydrate error', e);
         try { setMeDebug({ error: String(e) }); } catch (e) {}
       }
     })();
@@ -1479,9 +1523,6 @@ function parseJwtPayload(tok) {
   const targetRequestCounts = useRef({}); // base -> count of get requests sent
   const targetReceiveCounts = useRef({}); // base -> count of current/ message target receipts
 
-  // debug helper (reads module-level DEBUG toggle)
-  const debug = (...args) => { if (DEBUG) console.log('Dashboard DEBUG:', ...args); };
-
   const resolveHost = () => {
     if (USE_PUBLIC_WS) return PUBLIC_WS_HOST;
     if (FORCED_HOST) return FORCED_HOST;
@@ -1581,7 +1622,7 @@ function parseJwtPayload(tok) {
     const base = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
     // include token as query param (primary). We'll add a fallback retry with a single subprotocol only if needed.
     const url = `${base}?token=${encodeURIComponent(token)}`;
-    debug('[WS attempt] primary url=', url, 'token.len=', token && token.length);
+  brewskiLog('[WS attempt] primary url=', url, 'token.len=', token && token.length);
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;
@@ -1599,7 +1640,7 @@ function parseJwtPayload(tok) {
         reconnectMeta.current.attempts = 0;
         // clear any connection error state on open
         try { setConnectionError(false); } catch (e) {}
-  debug('WS open -> requesting initial gets for default devices');
+  brewskiLog('WS open -> requesting initial gets for default devices');
         // request current target and sensor for the default devices once connected
         const sendInitialGets = () => {
           defaultDevices.forEach(d => {
@@ -1669,10 +1710,10 @@ function parseJwtPayload(tok) {
         // store timer on ref for cleanup
         ws._retryTimer = retryTimer;
       };
-      ws.onmessage = (ev) => {
+  ws.onmessage = (ev) => {
         try {
           const obj = JSON.parse(ev.data);
-          debug('WS message', obj.type, obj.topic || obj.data?.topic || 'no-topic');
+          brewskiLog('WS message', obj.type, obj.topic || obj.data?.topic || 'no-topic');
           // helper to mark the connection healthy (clear the 6s timeout and overlay)
           const markConnected = () => {
             try { setConnectionError(false); setLoading(false); } catch (e) {}
@@ -2042,12 +2083,12 @@ function parseJwtPayload(tok) {
           // also accept 'current' responses from the bridge for sensor gets
           if (obj.type === 'current' && typeof obj.topic === 'string' && /\/sensor$/i.test(obj.topic)) {
             const n = obj.payload === null ? null : Number(obj.payload);
-            if (!Number.isNaN(n) && n !== null) { applySensor(obj.topic, n); markConnected(); debug('Current response (Sensor)', obj.topic, n); }
+            if (!Number.isNaN(n) && n !== null) { applySensor(obj.topic, n); markConnected(); brewskiLog('Current response (Sensor)', obj.topic, n); }
           }
           if (obj.type === 'current' && typeof obj.topic === 'string' && /\/target$/i.test(obj.topic)) {
             if (obj.payload !== null && obj.payload !== undefined && obj.payload !== '') {
               const n = Number(obj.payload);
-              if (!Number.isNaN(n)) { applyTarget(obj.topic, n); markConnected(); debug('Current response (Target)', obj.topic, n); }
+              if (!Number.isNaN(n)) { applyTarget(obj.topic, n); markConnected(); brewskiLog('Current response (Target)', obj.topic, n); }
             }
           }
           // also accept 'current' responses from the bridge for sensor gets
@@ -2628,46 +2669,22 @@ function parseJwtPayload(tok) {
     // If the WebSocket is already open, proactively request current Sensor/Target
     // values and query device power states so the UI renders immediately without
     // waiting for live MQTT messages to arrive.
-    try {
+        try {
       const ws = wsRef.current;
       if (ws && ws.readyState === 1) {
         for (const base of Array.from(newDbSet)) {
           if (!base) continue;
-          // Request Sensor and Target for the canonical base
-          try {
-            const idS = `snap-get-sensor-${base}-${Date.now()}`;
-            ws.send(JSON.stringify({ type: 'get', topic: `${base}/Sensor`, id: idS }));
-            targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
-          } catch (e) {}
-          try {
-            const idT = `snap-get-target-${base}-${Date.now()}`;
-            ws.send(JSON.stringify({ type: 'get', topic: `${base}/Target`, id: idT }));
-            targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
-          } catch (e) {}
+          // Centralized helper will request Sensor/Target/State and probe device
+          try { requestCurrentForBase(base); } catch (e) {}
 
-              // Also proactively request the device's STATE so we get fresh POWER/STATE JSON
-              try {
-                const parts = base.split('/').filter(Boolean);
-                const deviceName = parts.length >= 2 ? parts[1] : parts[0];
-                const site = parts.length >= 2 ? parts[0] : null;
-                // Ask the bridge for the State topic and also send a non-mutating Status 0 probe
-                try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state-${base}-${Date.now()}` })); } catch (e) {}
-                try { const st = buildCmdTopic(site, deviceName, 'Status'); ws.send(JSON.stringify({ type: 'publish', topic: st.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '0', id: `snap-probe-status-${base}-${Date.now()}` })); } catch (e) {}
-                // also call the local helper which sends a couple retries
-                try { probeStateForDevice(site, deviceName); } catch (e) {}
-              } catch (e) {}
-
-          // Query power states using canonical base when possible
+          // Query power states using canonical base when possible (retain previous behavior)
           try {
             const parts = base.split('/').filter(Boolean);
             const deviceName = parts.length >= 2 ? parts[1] : parts[0];
             const site = parts.length >= 2 ? parts[0] : null;
             if (deviceName) {
-              // Primary power query: prefer site-prefixed topic
               try { const primaryTopic = buildCmdTopic(site, deviceName, 'Power'); ws.send(JSON.stringify({ type: 'publish', topic: primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` })); } catch(e) {}
-                  // ask for state as well (ensure recent STATE is present)
-                  try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state2-${base}-${Date.now()}` })); } catch (e) {}
-              // Additional multi-switch queries (best-effort)
+              try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state2-${base}-${Date.now()}` })); } catch (e) {}
               for (let i = 1; i <= 3; i++) {
                 try { const t = buildCmdTopic(site, deviceName, `Power${i}`); ws.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` })); } catch(e) {}
               }
@@ -2861,12 +2878,146 @@ function parseJwtPayload(tok) {
 
   const publishTargetForDevice = (deviceKey, n) => {
     const val = Number(n);
-    if (Number.isNaN(val)) return;
-    if (!wsRef.current || wsRef.current.readyState !== 1) return;
+    if (Number.isNaN(val)) {
+      debug && debug('publishTargetForDevice: invalid numeric value', n, deviceKey);
+      return;
+    }
+    if (!wsRef.current || wsRef.current.readyState !== 1) {
+      // Try to reconnect and schedule a retry so UI actions result in a publish
+      try { brewskiLog('publishTargetForDevice: ws not open, attempting reconnect and scheduling retry', { readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
+      try { connectWebSocket(); } catch (e) {}
+      // schedule a single retry after a short delay; allow caller to move on
+      setTimeout(() => {
+        try { publishTargetForDevice(deviceKey, n); } catch (e) {}
+      }, 500);
+      return;
+    }
     const id = Date.now() + '-' + Math.random().toString(36).slice(2,8);
-    const topic = `${deviceKey}/Target`;
-    try { wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload: val, id })); debug('publish', topic, val, id); } catch (e) {}
-    setTimeout(() => { try { wsRef.current && wsRef.current.send(JSON.stringify({ type: 'get', topic, id: id + '-get' })); } catch (e) {} }, 500);
+
+    // deviceKey is expected to be canonical SITE/DEVICE or DEVICE. Derive
+    // site/device pieces and build a topic using buildCmdTopic so we honor
+    // legacy devices that historically published without a site prefix.
+    let site = null; let deviceName = null;
+    try {
+      const parts = String(deviceKey || '').split('/').filter(Boolean);
+      if (parts.length >= 2) { site = parts[0]; deviceName = parts[1]; }
+      else if (parts.length === 1) { deviceName = parts[0]; }
+    } catch (e) {}
+
+    // If site missing, prefer runtime mode (uppercase) or customerSlug when present
+    if (!site) {
+      if (mode) site = mode;
+      else if (customerSlug) site = String(customerSlug).toUpperCase();
+    }
+
+    // If we still don't have a deviceName, abort
+    if (!deviceName) return;
+
+    // BREW-specific legacy: if the original deviceKey explicitly started with 'BREW/'
+    // (exact match for the site segment) publish the raw value to `DEVICETarget`
+    // (no slash). This preserves a long-standing broker/device expectation.
+    let pubTopic = null;
+    const originalStartsWithBrew = /^\s*BREW\//i.test(String(deviceKey || ''));
+    if (originalStartsWithBrew) {
+      // Devicetarget format: e.g. FERM5Target (device name uppercased)
+      try {
+        pubTopic = `${String(deviceName || '').toUpperCase()}Target`;
+      } catch (e) {
+        pubTopic = `${deviceName}Target`;
+      }
+    } else {
+      // Build a command topic for a Tasmota-style Target command (we'll use 'Status' and 'Target' patterns where appropriate)
+      // Use buildCmdTopic to allow stripping BREW for legacy devices when appropriate, then append '/Target' to form the target topic.
+      const baseCmd = buildCmdTopic(site, deviceName, 'Target');
+      // baseCmd will be like 'cmnd/<site>/<device>/Target' or 'cmnd/<device>/Target' for legacy
+      // But for Target we publish to the raw `${site}/${device}/Target` (not cmnd prefix). Build accordingly.
+      try {
+        // If baseCmd begins with 'cmnd/', strip the 'cmnd' prefix and use the remainder as the topic path
+        if (typeof baseCmd === 'string' && baseCmd.toLowerCase().startsWith('cmnd/')) {
+          pubTopic = baseCmd.split('/').slice(1).join('/');
+        } else {
+          // Fallback to deviceKey/Target
+          pubTopic = `${deviceKey}/Target`;
+        }
+      } catch (e) {
+        pubTopic = `${deviceKey}/Target`;
+      }
+    }
+
+    // Compute a canonical base key for optimistic UI update. Prefer the provided deviceKey
+    // normalized via existing helper so we match how other parts of the app index targets.
+    let canonicalForUpdate = null;
+    try {
+      canonicalForUpdate = normalizeCanonicalBase(deviceKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || (site ? `${site}/${deviceName}` : deviceName);
+    } catch (e) { canonicalForUpdate = (site ? `${site}/${deviceName}` : deviceName); }
+
+    try {
+      if (originalStartsWithBrew) {
+        // BREW legacy: preserve exact casing (device uppercased already)
+          try { brewskiLog('[publishTarget] send', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
+          brewskiLog('publish', pubTopic, val, id);
+        // Also attempt additional legacy-compatible variants in case the bridge
+        // expects a slash-separated topic or a cmnd/ prefix for BREW devices.
+        try {
+          const withSlash = `${deviceName}/Target`;
+          const withCmnd = `cmnd/${deviceName}/Target`;
+          try { brewskiLog('[publishTarget] send fallback (slash)', { topic: withSlash, payload: val, id }); } catch (e) {}
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: withSlash, payload: val, id: id + '-s' }));
+          try { brewskiLog('[publishTarget] send fallback (cmnd)', { topic: withCmnd, payload: val, id }); } catch (e) {}
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: withCmnd, payload: val, id: id + '-c' }));
+        } catch (e) { brewskiLog('publishTargetForDevice: BREW extra sends failed', e && e.message); }
+      } else {
+        // normalize prefix to lowercase for broker expectations (site/device case preserved)
+        try {
+          const parts = pubTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const outTopic = parts.join('/');
+          try { brewskiLog('[publishTarget] send', { topic: outTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload: val, id }));
+          brewskiLog('publish', outTopic, val, id);
+        } catch (e) {
+          try { brewskiLog('[publishTarget] send fallback', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
+          brewskiLog('publish', pubTopic, val, id);
+        }
+      }
+
+      // Optimistic UI update: set local known target immediately so sliders don't wait for round-trip
+      try {
+        if (canonicalForUpdate) setGTargets(prev => ({ ...(prev || {}), [canonicalForUpdate]: val }));
+      } catch (e) {}
+    } catch (e) {}
+
+    setTimeout(() => {
+      try {
+        if (wsRef.current) {
+          const getId = id + '-get';
+          let getTopic = pubTopic;
+          // For BREW legacy, ensure GET covers additional topic variants we published above
+          if (originalStartsWithBrew) {
+            // schedule GETs for the legacy raw topic, slash variant, and cmnd variant
+            try { const t1 = pubTopic; const t2 = `${deviceName}/Target`; const t3 = `cmnd/${deviceName}/Target`; brewskiLog('publishTargetForDevice: scheduling multiple GETs for BREW', { t1, t2, t3, getId }); wsRef.current.send(JSON.stringify({ type: 'get', topic: t1, id: getId + '-a' })); wsRef.current.send(JSON.stringify({ type: 'get', topic: t2, id: getId + '-b' })); wsRef.current.send(JSON.stringify({ type: 'get', topic: t3, id: getId + '-c' })); } catch (e) {}
+            return;
+          }
+          if (!originalStartsWithBrew) {
+            const parts = pubTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); getTopic = parts.join('/');
+          }
+          brewskiLog('publishTargetForDevice: scheduling GET for', getTopic, getId);
+          wsRef.current.send(JSON.stringify({ type: 'get', topic: getTopic, id: getId }));
+        }
+      } catch (e) { brewskiLog('publishTargetForDevice: GET send failed', e && e.message); }
+    }, 500);
+    // After scheduling GETs/probes, explicitly call requestCurrentForBase so incoming
+    // variant replies are canonicalized and applied to gTargets quickly.
+    try {
+      if (originalStartsWithBrew) {
+        // call for each variant we requested
+        try { requestCurrentForBase(`${deviceName}`); } catch (e) {}
+        try { requestCurrentForBase(`${deviceName}/Target`); } catch (e) {}
+        try { requestCurrentForBase(`${deviceName}`); } catch (e) {}
+      } else {
+        try { requestCurrentForBase(canonicalForUpdate); } catch (e) {}
+      }
+    } catch (e) {}
   };
   // Build a cmnd topic, stripping the BREW site for devices we know historically published without a site.
   // Returns a string like `cmnd/<device>/<Cmd>` or `cmnd/<site>/<device>/<Cmd>`.
@@ -2943,8 +3094,10 @@ function parseJwtPayload(tok) {
         const parts = topic.split('/');
         if (parts && parts.length) parts[0] = parts[0].toLowerCase();
         const outTopic = parts.join('/');
+        brewskiLog('publishPower send', { topic: outTopic, payload, id, readyState: wsRef.current && wsRef.current.readyState });
         wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload, id }));
       } catch (e) {
+        brewskiLog('publishPower send fallback', { topic, payload, id, err: e && e.message });
         wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload, id }));
       }
 
@@ -2962,6 +3115,9 @@ function parseJwtPayload(tok) {
 
       // Ask device to publish its STATE so other clients / snapshot see authoritative state quickly
   try { probeStateForDevice(site, deviceName); } catch (e) {}
+
+      // Also proactively request current state for this base so the dashboard reconciles
+      try { requestCurrentForBase(baseKey); } catch (e) {}
 
     } catch (e) {}
   };
@@ -2982,6 +3138,42 @@ function parseJwtPayload(tok) {
       // Two retries to help with flaky networks / device latency
   setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-r1' })); } catch (e) {} }, 250);
   setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-r2' })); } catch (e) {} }, 1000);
+    } catch (e) {}
+  };
+
+  // Helper: request current Sensor/Target/State and probe device for a given canonical base
+  const requestCurrentForBase = (base) => {
+    try {
+      if (!base) return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== 1) return;
+      // Normalize base into site/device parts
+      const parts = String(base).split('/').filter(Boolean);
+      const site = parts.length >= 2 ? parts[0] : null;
+      const deviceName = parts.length >= 2 ? parts[1] : (parts[0] || null);
+      if (!deviceName) return;
+
+      // Ask the bridge for current Sensor and Target values
+      try {
+        const idS = `reqcur-sensor-${base}-${Date.now()}`;
+        ws.send(JSON.stringify({ type: 'get', topic: `${base}/Sensor`, id: idS }));
+        targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
+      } catch (e) {}
+      try {
+        const idT = `reqcur-target-${base}-${Date.now()}`;
+        ws.send(JSON.stringify({ type: 'get', topic: `${base}/Target`, id: idT }));
+        targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
+      } catch (e) {}
+
+      // Also request State/Status so POWER JSON arrives
+      try {
+        const stateTopic = `${site ? `${site}/` : ''}${deviceName}/State`;
+        const idSt = `reqcur-state-${base}-${Date.now()}`;
+        ws.send(JSON.stringify({ type: 'get', topic: stateTopic, id: idSt }));
+      } catch (e) {}
+
+      // Probe device with non-mutating Status 0 to encourage immediate STATE publish
+      try { probeStateForDevice(site, deviceName); } catch (e) {}
     } catch (e) {}
   };
 

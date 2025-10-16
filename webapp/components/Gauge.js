@@ -51,7 +51,7 @@ export default function Gauge({ title='Sensor', size=195, sensorValue=null, targ
       const pct = Math.max(0, Math.min(100, (x / w) * 100));
       setDragPct(null);
       const newVal = Math.round(0 + (pct / 100) * (220 - 0));
-      try { onSetTarget(newVal); } catch (e) {}
+      try { try { console.log('Gauge: pan release -> onSetTarget', newVal); } catch (e) {} onSetTarget(newVal); } catch (e) {}
     },
     onPanResponderTerminationRequest: () => true,
     onPanResponderTerminate: () => setDragPct(null),
@@ -248,7 +248,42 @@ export default function Gauge({ title='Sensor', size=195, sensorValue=null, targ
               <TouchableOpacity onPress={() => { try { const nv = Math.max(SENSOR_MIN, Math.round((targetValue||0) - 1)); onSetTarget(nv); } catch(e){} }} style={{ width:28, alignItems:'center', justifyContent:'center', paddingVertical:4 }}>
                 <Text style={{ fontSize:16, color:'rgba(0,0,0,0.55)' }}>{'◀'}</Text>
               </TouchableOpacity>
-              <View ref={trackRef} style={{ flex:1, marginHorizontal:8, position: 'relative' }} onLayout={(e)=>setTrackWidth(e.nativeEvent.layout.width)} {...panResponder.panHandlers}>
+              <View
+                ref={trackRef}
+                style={{ flex:1, marginHorizontal:8, position: 'relative' }}
+                onLayout={(e)=>setTrackWidth(e.nativeEvent.layout.width)}
+                {...panResponder.panHandlers}
+                // Responder fallback for web/React Native Web where PanResponder may not fire
+                onStartShouldSetResponder={() => true}
+                onMoveShouldSetResponder={() => true}
+                onResponderGrant={(e) => {
+                  try {
+                    const x = e.nativeEvent.locationX || 0;
+                    const w = trackWidth || 200;
+                    const pct = Math.max(0, Math.min(100, (x / w) * 100));
+                    setDragPct(pct);
+                  } catch (err) {}
+                }}
+                onResponderMove={(e) => {
+                  try {
+                    const x = e.nativeEvent.locationX || 0;
+                    const w = trackWidth || 200;
+                    const pct = Math.max(0, Math.min(100, (x / w) * 100));
+                    setDragPct(pct);
+                  } catch (err) {}
+                }}
+                onResponderRelease={(e) => {
+                  try {
+                    const x = e.nativeEvent.locationX || 0;
+                    const w = trackWidth || 200;
+                    const pct = Math.max(0, Math.min(100, (x / w) * 100));
+                    setDragPct(null);
+                    const newVal = Math.round(0 + (pct / 100) * (220 - 0));
+                    try { console.log('Gauge: responder release -> onSetTarget', newVal); } catch (e) {}
+                    onSetTarget(newVal);
+                  } catch (err) {}
+                }}
+              >
                 <View style={{ height:28, backgroundColor:'rgba(0,0,0,0.05)', borderRadius:14, overflow:'visible', justifyContent:'center', borderWidth:1, borderColor:'rgba(0,0,0,0.08)', paddingHorizontal:8 }}>
                   {(() => {
                     const safePct = (dragPct !== null)
