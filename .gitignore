@@ -132,6 +132,9 @@ server/.push-tokens.json
 server/.thresholds.json
 server/.latest-targets.json
 
+# Ignore server public build artifacts (Expo/web builds)
+server/public/
+
 # Backup / swap
 *~
 *.swp
@@ -174,6 +177,10 @@ scripts/local/
 # End of .gitignore
 server/cert.pem
 server/key.pem
+
+# Ignore local DB and backups (already present but keep explicit)
+server/brewski.sqlite3
+server/backups/
 
 # Ignore restored emulator scripts if recreated temporarily
 webapp/scripts/run-emulator.sh
