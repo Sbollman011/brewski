@@ -3,9 +3,41 @@ import { View, Text, Pressable, StyleSheet, SafeAreaView, Platform, StatusBar, I
 // Static import for Ionicons (package installed)
 import { Ionicons } from '@expo/vector-icons';
 
-export default function Header({ title, token, onMenuPress, onDashboardPress, onLoginPress, onLogoutPress, onSettingsPress, hideControls = false, menuOpen = false }) {
+export default function Header({ title, token, onMenuPress, onDashboardPress, onManagePress, onLoginPress, onLogoutPress, onSettingsPress, hideControls = false, menuOpen = false, hasManageAccess = true }) {
   const IS_WEB = Platform.OS === 'web';
   const IS_MOBILE = !IS_WEB;
+
+  // Default navigation handlers: prefer prop callbacks, then fall back to web navigation.
+  const handleDashboard = () => {
+    try {
+      if (typeof onDashboardPress === 'function') return onDashboardPress();
+      if (typeof window !== 'undefined' && window.location) {
+        window.location.href = '/dashboard';
+        return;
+      }
+    } catch (e) { /* swallow */ }
+  };
+
+  const handleManage = () => {
+    try {
+      if (typeof onManagePress === 'function') return onManagePress();
+      // If there's a web path, navigate there; otherwise noop.
+      if (typeof window !== 'undefined' && window.location) {
+        window.location.href = '/manage';
+        return;
+      }
+    } catch (e) { /* swallow */ }
+  };
+
+  const handleSettings = () => {
+    try {
+      if (typeof onSettingsPress === 'function') return onSettingsPress();
+      if (typeof window !== 'undefined' && window.location) {
+        window.location.href = '/settings';
+        return;
+      }
+    } catch (e) { /* swallow */ }
+  };
 
   return (
     <>
@@ -49,15 +81,17 @@ export default function Header({ title, token, onMenuPress, onDashboardPress, on
       {/* Mobile-only bottom navigation bar replacing the side menu UX. */}
       {IS_MOBILE && !hideControls && (
         <View style={[styles.bottomNav, styles.bottomNavElevated]} accessibilityRole="navigation" accessibilityLabel="App navigation">
-          <Pressable style={styles.bottomNavItem} onPress={onDashboardPress} accessibilityLabel="Home">
+          <Pressable style={styles.bottomNavItem} onPress={handleDashboard} accessibilityLabel="Dashboard">
             {Ionicons ? <Ionicons name="home-outline" size={22} color="#fff" /> : <Text style={styles.bottomIcon}>🏠</Text>}
-            <Text style={styles.bottomLabel}>Home</Text>
+            <Text style={styles.bottomLabel}>Dashboard</Text>
           </Pressable>
-          <Pressable style={styles.bottomNavItem} onPress={onMenuPress} accessibilityLabel="Devices">
-            {Ionicons ? <Ionicons name="flash-outline" size={22} color="#fff" /> : <Text style={styles.bottomIcon}>🔌</Text>}
-            <Text style={styles.bottomLabel}>Devices</Text>
-          </Pressable>
-          <Pressable style={styles.bottomNavItem} onPress={onSettingsPress} accessibilityLabel="Settings">
+          {hasManageAccess ? (
+            <Pressable style={styles.bottomNavItem} onPress={handleManage} accessibilityLabel="Manage">
+              {Ionicons ? <Ionicons name="layers-outline" size={22} color="#fff" /> : <Text style={styles.bottomIcon}>📋</Text>}
+              <Text style={styles.bottomLabel}>Manage</Text>
+            </Pressable>
+          ) : null}
+          <Pressable style={styles.bottomNavItem} onPress={handleSettings} accessibilityLabel="Settings">
             {Ionicons ? <Ionicons name="settings-outline" size={22} color="#fff" /> : <Text style={styles.bottomIcon}>⚙️</Text>}
             <Text style={styles.bottomLabel}>Settings</Text>
           </Pressable>

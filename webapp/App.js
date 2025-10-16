@@ -364,6 +364,7 @@ export default function App() {
           token={token}
           hideControls={['login', 'forgot', 'reset', 'landing'].includes(screen)}
           menuOpen={menuOpen}
+          hasManageAccess={hasManageAccess}
           onMenuPress={() => {
             const next = !menuOpen;
             setMenuOpen(next);
@@ -372,6 +373,14 @@ export default function App() {
           onDashboardPress={() => {
             setMenuOpen(false);
             openDashboard();
+          }}
+          onManagePress={() => {
+            setMenuOpen(false);
+            openScreen('admin');
+          }}
+          onSettingsPress={() => {
+            setMenuOpen(false);
+            openScreen('settings');
           }}
           onLoginPress={() => { setMenuOpen(false); setScreen('login'); }}
           onLogoutPress={() => { handleLogout(); setMenuOpen(false); }}
