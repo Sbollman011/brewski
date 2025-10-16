@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { apiFetch } from '../src/api';
+import { ImageBackground } from 'react-native';
 
 // Global debug toggle for this module. Set to true only while actively
 // troubleshooting — leave false for normal operation to avoid noisy logs.
@@ -3030,7 +3031,8 @@ function parseJwtPayload(tok) {
   // (In-app debug overlay removed after diagnosis.)
 
   return (
-    <SafeAreaView style={styles.container}>
+    <ImageBackground source={require('../assets/logo.png')} style={{ flex: 1, width: '100%' }} imageStyle={{ opacity: 0.04, resizeMode: 'contain' }}>
+      <SafeAreaView style={styles.container}>
   {/* In-app debug panel for RN / DEBUG mode (removed) */}
       {DEBUG && (
         <DebugOverlay
@@ -3335,7 +3337,8 @@ function parseJwtPayload(tok) {
           </View>
         </View>
       )}
-    </SafeAreaView>
+      </SafeAreaView>
+    </ImageBackground>
   );
 }
 

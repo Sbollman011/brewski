@@ -1,10 +1,11 @@
 import React from 'react';
-import { View, Text, Pressable, StyleSheet, SafeAreaView, Platform, StatusBar } from 'react-native';
+import { View, Text, Pressable, StyleSheet, SafeAreaView, Platform, StatusBar, ImageBackground } from 'react-native';
 
 export default function Header({ title, token, onMenuPress, onDashboardPress, onLoginPress, onLogoutPress, hideControls = false, menuOpen = false }) {
   return (
     <SafeAreaView style={styles.safeArea}>
-      <View style={styles.appBar}>
+      <ImageBackground source={require('../assets/logo.png')} style={styles.logoBg} imageStyle={{ opacity: 0.07, resizeMode: 'contain' }}>
+        <View style={styles.appBar}>
         {!hideControls && (
           <Pressable
             accessibilityLabel={menuOpen ? 'Close navigation menu' : 'Open navigation menu'}
@@ -34,7 +35,7 @@ export default function Header({ title, token, onMenuPress, onDashboardPress, on
             )
           )}
         </View>
-      </View>
+      </ImageBackground>
     </SafeAreaView>
   );
 }
@@ -50,4 +51,5 @@ const styles = StyleSheet.create({
   portalText: { color: '#fff', fontWeight: '600' },
   loginBtn: { backgroundColor: '#ffffff22', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6 },
   loginText: { color: '#fff', fontWeight: '600' },
+  logoBg: { width: '100%' }
 });
