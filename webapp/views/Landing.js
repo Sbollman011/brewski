@@ -11,7 +11,7 @@ export default function Landing({ onLoginPress, onDashboardPress, onManagePress 
       <View style={styles.hero}>
         {/* Logo + headline row */}
         <View style={styles.heroTopRow}>
-          <Image source={require('../assets/logo.svg')} style={styles.logo} resizeMode="contain" />
+          <Image source={require('../assets/logo.png')} style={styles.logo} resizeMode="contain" />
           <View style={styles.heroTitleBlock}>
             <Text style={styles.brand}>Brew Remote</Text>
             <Text style={styles.tagline}>Real-time monitoring • Smart control • Automation</Text>
