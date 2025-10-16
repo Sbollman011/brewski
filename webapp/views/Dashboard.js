@@ -9,16 +9,19 @@ const IS_REACT_NATIVE = (() => { try { return (typeof navigator !== 'undefined' 
 const DEFAULT_API_HOST = (typeof process !== 'undefined' && process.env && process.env.SERVER_FQDN) ? process.env.SERVER_FQDN : 'api.brewingremote.com';
 // In-flight promise cache for fetchPowerLabels to coalesce concurrent callers
 const _inflightFetchPowerLabels = new Map();
+// Short-lived cache for server-side power-label listings per-customer to avoid
+// repeatedly calling `/api/power-labels` when many discovered bases trigger
+// concurrent discovery flows. Keyed by `customerId` or `customerSlug`.
+const _powerLabelsFetchCache = new Map(); // key -> { ts, existingKeys: Set }
 
 // Helper to fetch power labels from the API. Accepts an optional JWT token
 // and will try multiple fallbacks to handle different hosting/proxy setups.
 async function fetchPowerLabels(token) {
   const cacheKey = token || '__anon__';
   if (_inflightFetchPowerLabels.has(cacheKey)) return await _inflightFetchPowerLabels.get(cacheKey);
-
   const doFetch = async () => {
     try {
-      // Prefer window.apiFetch when available
+      // Prefer window.apiFetch when available (web environments)
       if (typeof window !== 'undefined' && window.apiFetch) {
         try {
           const r = await window.apiFetch('/admin/api/power-labels');
@@ -29,23 +32,56 @@ async function fetchPowerLabels(token) {
         } catch (e) { /* ignore and fallthrough */ }
       }
 
-      // Try admin API helper which routes to canonical host
+      // Direct fetch to canonical API host (works in React Native and other hosts)
+      const API_HOST = DEFAULT_API_HOST || 'api.brewingremote.com';
+      const adminUrl = `https://${API_HOST}/admin/api/power-labels`;
+      const publicUrl = `https://${API_HOST}/api/power-labels`;
+
+      // Try admin endpoint with Authorization header first
       try {
-        const r = await doApiFetch('/admin/api/power-labels');
-        if (r && r.ok) {
-          const js = await r.json().catch(() => null);
+        const headers = { Accept: 'application/json' };
+        if (token) headers.Authorization = `Bearer ${token}`;
+        const res = await fetch(adminUrl, { headers });
+        if (res && res.ok) {
+          const js = await res.json().catch(() => null);
           return js && js.labels ? js.labels : [];
         }
       } catch (e) { /* ignore */ }
 
-      // Fallback to public API path
+      // Try admin endpoint with token query param (some setups accept token via query)
+      if (token) {
+        try {
+          const q = `${adminUrl}?token=${encodeURIComponent(token)}`;
+          const resQ = await fetch(q, { headers: { Accept: 'application/json' } });
+          if (resQ && resQ.ok) {
+            const jsq = await resQ.json().catch(() => null);
+            return jsq && jsq.labels ? jsq.labels : [];
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      // Fallback to public API path on canonical host (with/without token)
       try {
-        const r2 = await doApiFetch('/api/power-labels');
-        if (r2 && r2.ok) {
-          const js2 = await r2.json().catch(() => null);
+        const headers2 = { Accept: 'application/json' };
+        if (token) headers2.Authorization = `Bearer ${token}`;
+        const res2 = await fetch(publicUrl, { headers: headers2 });
+        if (res2 && res2.ok) {
+          const js2 = await res2.json().catch(() => null);
           return js2 && js2.labels ? js2.labels : [];
         }
       } catch (e) { /* ignore */ }
+
+      // As a last attempt, try public endpoint with token query param
+      if (token) {
+        try {
+          const q2 = `${publicUrl}?token=${encodeURIComponent(token)}`;
+          const rq = await fetch(q2, { headers: { Accept: 'application/json' } });
+          if (rq && rq.ok) {
+            const jsq2 = await rq.json().catch(() => null);
+            return jsq2 && jsq2.labels ? jsq2.labels : [];
+          }
+        } catch (e) { /* ignore */ }
+      }
 
       return [];
     } catch (e) {
@@ -284,56 +320,57 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         labelsArr.forEach(l => {
           try {
             if (l && l.topic && l.power_key) {
-              const key = `${l.topic}|${l.power_key}`;
-              labelMap[key] = l.label || '';
-              labelMap[key.toUpperCase()] = l.label || '';
-              // expand into canonical topic variants so lookups succeed
-              const candidates = canonicalCandidatesForTopic(l.topic);
-              candidates.forEach(t => {
-                const k1 = `${t}|${l.power_key}`;
-                const k2 = `${t}|${l.power_key.toUpperCase()}`;
-                if (!labelMap[k1]) labelMap[k1] = l.label || '';
-                if (!labelMap[k2]) labelMap[k2] = l.label || '';
-              });
+              const rawTopic = String(l.topic).trim();
+              const pk = String(l.power_key).toUpperCase();
+              const labelVal = l.label || '';
 
-              // Also add normalized SITE/DEVICE variants (e.g., RAIL/DEV or BREW/DEV)
+              // Helper to add multiple variants into the map
+              const add = (t, k) => {
+                try {
+                  const kk = `${t}|${k}`;
+                  if (labelMap[kk] === undefined) labelMap[kk] = labelVal;
+                } catch (e) {}
+              };
+
+              // Add raw topic as-is (both case forms)
+              add(rawTopic, pk);
+              add(rawTopic.toUpperCase(), pk);
+
+              // Add canonicalized SITE/DEVICE/STATE form
               try {
-                // Normalize the topic into a canonical base (SITE/DEVICE) if possible
-                const maybeParts = String(l.topic).split('/').filter(Boolean);
-                let candidateBase = null;
-                if (maybeParts.length >= 2) {
-                  // If topic is tele/<site>/<device>/STATE or similar
-                  if (/^tele$/i.test(maybeParts[0])) {
-                    candidateBase = `${maybeParts[1]}/${maybeParts[2] || maybeParts[1]}`;
-                  } else {
-                    candidateBase = `${maybeParts[0]}/${maybeParts[1]}`;
-                  }
-                } else if (maybeParts.length === 1) {
-                  candidateBase = `BREW/${maybeParts[0]}`;
+                const canon = canonicalForTopic(rawTopic) || normalizeCanonicalBase(rawTopic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || rawTopic;
+                if (canon) {
+                  add(canon, pk);
+                  add((canon.endsWith('/STATE') ? canon : `${canon}/STATE`), pk);
+                  add(canon.toUpperCase(), pk);
                 }
-                if (candidateBase) {
-                  const norm = normalizeCanonicalBase(candidateBase, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
-                  if (norm) {
-                    const kA = `${norm}|${l.power_key}`;
-                    const kB = `${norm}|${l.power_key.toUpperCase()}`;
-                    if (!labelMap[kA]) labelMap[kA] = l.label || '';
-                    if (!labelMap[kB]) labelMap[kB] = l.label || '';
-                    // also add tele variants for normalized base
-                    try {
-                      const parts = norm.split('/').filter(Boolean);
-                      if (parts.length >= 2) {
-                        const tele1 = `tele/${parts[0]}/${parts[1]}/STATE`;
-                        const tele2 = `tele/${parts[1]}/STATE`;
-                        const t1 = `${tele1}|${l.power_key}`;
-                        const t2 = `${tele2}|${l.power_key}`;
-                        if (!labelMap[t1]) labelMap[t1] = l.label || '';
-                        if (!labelMap[t2]) labelMap[t2] = l.label || '';
-                        if (!labelMap[t1.toUpperCase()]) labelMap[t1.toUpperCase()] = l.label || '';
-                        if (!labelMap[t2.toUpperCase()]) labelMap[t2.toUpperCase()] = l.label || '';
-                      }
-                    } catch (e) {}
+              } catch (e) {}
+
+              // Add tele variants for both site-prefixed and device-only forms
+              try {
+                const parts = rawTopic.split('/').filter(Boolean);
+                let site = null; let device = null;
+                if (parts.length >= 3 && /^(tele|stat)$/i.test(parts[0])) { site = parts[1]; device = parts[2]; }
+                else if (parts.length >= 2) { site = parts[0]; device = parts[1]; }
+                else if (parts.length === 1) { device = parts[0]; }
+                if (device) {
+                  if (site) {
+                    add(`tele/${site}/${device}/STATE`, pk);
+                    add(`tele/${site}/${device}/STATE`.toUpperCase(), pk);
                   }
+                  add(`tele/${device}/STATE`, pk);
+                  add(`tele/${device}/STATE`.toUpperCase(), pk);
                 }
+              } catch (e) {}
+
+              // Also add device-only BREW-prefixed variant (legacy storage)
+              try {
+                const maybeParts = rawTopic.split('/').filter(Boolean);
+                const candidateBase = maybeParts.length >= 2 ? `${maybeParts[0]}/${maybeParts[1]}` : `BREW/${maybeParts[0] || rawTopic}`;
+                const norm = normalizeCanonicalBase(candidateBase, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || candidateBase;
+                add(norm, pk);
+                add(`${norm}/STATE`, pk);
+                add(norm.toUpperCase(), pk);
               } catch (e) {}
             }
           } catch (e) { /* ignore */ }
@@ -847,41 +884,68 @@ function parseJwtPayload(tok) {
         // that would otherwise create duplicate/overlapping rows.
         let existingKeys = new Set(); // set of POWER keys already present for this device
         try {
-          let fetchPath = null;
-          if (customerId) fetchPath = `/admin/api/power-labels?customer_id=${encodeURIComponent(customerId)}`;
-          else if (customerSlug) fetchPath = `/api/power-labels?customer_slug=${encodeURIComponent(customerSlug)}`;
-          else fetchPath = `/api/power-labels`;
+          // Use a short-lived cache keyed by numeric customerId or customerSlug to avoid
+          // hammering the /api/power-labels endpoint during discovery bursts.
+          const cacheKey = customerId ? `id:${customerId}` : (customerSlug ? `slug:${customerSlug}` : '__anon__');
+          const ttlMs = 10_000; // 10 seconds
+          const cached = _powerLabelsFetchCache.get(cacheKey);
+          let js = null;
+          if (cached && (Date.now() - cached.ts) < ttlMs) {
+            js = { labels: Array.from(cached.existing || []) };
+          } else {
+            let fetchPath = null;
+            if (customerId) fetchPath = `/admin/api/power-labels?customer_id=${encodeURIComponent(customerId)}`;
+            else if (customerSlug) fetchPath = `/api/power-labels?customer_slug=${encodeURIComponent(customerSlug)}`;
+            else fetchPath = `/api/power-labels`;
 
-          let r = null;
-          try { r = await doApiFetch(fetchPath); } catch (e) { r = null; }
-          if (!r || !r.ok) {
-            // Try public fallback
-            try { r = await doApiFetch(`/api/power-labels`); } catch (e) { r = r || null; }
-          }
-          if (r && r.ok) {
-            const js = await r.json().catch(() => null);
-            if (js && Array.isArray(js.labels)) {
-              // Determine device name for incoming canonical base
-              const targetParts = String(canonicalBase || '').split('/').filter(Boolean);
-              const targetDevice = targetParts.length >= 2 ? String(targetParts[1]).toUpperCase() : (targetParts[0] || '').toUpperCase();
-              js.labels.forEach(l => {
-                try {
-                  if (!l || !l.topic || !l.power_key) return;
-                  const raw = String(l.topic || '');
-                  // canonicalize stored topic locally (strip tele/stat, drop trailing STATE)
-                  let s = raw.replace(/^(tele|stat)\//i, '');
-                  const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
-                  while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
-                  if (!parts.length) return;
-                  const storedDevice = parts.length >= 2 ? parts[1] : parts[0];
-                  if (!storedDevice) return;
-                  const upk = String(l.power_key).toUpperCase();
-                  const hasLabel = String(l.label || '').trim().length > 0;
-                  // If any non-empty label exists for the same device+power_key, mark it present
-                  if (hasLabel && storedDevice === targetDevice) existingKeys.add(upk);
-                } catch (e) {}
-              });
+            let r = null;
+            try { r = await doApiFetch(fetchPath); } catch (e) { r = null; }
+            if (!r || !r.ok) {
+              try { r = await doApiFetch(`/api/power-labels`); } catch (e) { r = r || null; }
             }
+            if (r && r.ok) js = await r.json().catch(() => null);
+
+            // Populate simple cache set of existing non-empty label keys by device/power_key
+            try {
+              if (js && Array.isArray(js.labels)) {
+                const cacheSet = new Set();
+                js.labels.forEach(l => {
+                  try {
+                    if (!l || !l.topic || !l.power_key) return;
+                    const raw = String(l.topic || '');
+                    let s = raw.replace(/^(tele|stat)\//i, '');
+                    const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
+                    while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
+                    if (!parts.length) return;
+                    const storedDevice = parts.length >= 2 ? parts[1] : parts[0];
+                    const upk = String(l.power_key).toUpperCase();
+                    const hasLabel = String(l.label || '').trim().length > 0;
+                    if (hasLabel && storedDevice) cacheSet.add(`${storedDevice}|${upk}`);
+                  } catch (e) {}
+                });
+                _powerLabelsFetchCache.set(cacheKey, { ts: Date.now(), existing: cacheSet });
+              }
+            } catch (e) {}
+          }
+
+          if (js && Array.isArray(js.labels)) {
+            const targetParts = String(canonicalBase || '').split('/').filter(Boolean);
+            const targetDevice = targetParts.length >= 2 ? String(targetParts[1]).toUpperCase() : (targetParts[0] || '').toUpperCase();
+            js.labels.forEach(l => {
+              try {
+                if (!l || !l.topic || !l.power_key) return;
+                const raw = String(l.topic || '');
+                let s = raw.replace(/^(tele|stat)\//i, '');
+                const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
+                while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
+                if (!parts.length) return;
+                const storedDevice = parts.length >= 2 ? parts[1] : parts[0];
+                if (!storedDevice) return;
+                const upk = String(l.power_key).toUpperCase();
+                const hasLabel = String(l.label || '').trim().length > 0;
+                if (hasLabel && storedDevice === targetDevice) existingKeys.add(upk);
+              } catch (e) {}
+            });
           }
         } catch (e) { /* ignore fetch errors and proceed to attempt posts */ }
 
@@ -1551,14 +1615,16 @@ function parseJwtPayload(tok) {
         setTimeout(sendInitialGets, 3000);
         
         // Query power states for known devices
-        const queryAllPowerStates = () => {
+            const queryAllPowerStates = () => {
           const devices = ['FERM2', 'FERM4', 'FERM5', 'MASH', 'HLT', 'BOIL'];
           devices.forEach(deviceName => {
             try {
               // Prefer explicit runtime mode/customer slug when available
               const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
               const primaryTopic = buildCmdTopic(site, deviceName, 'Power');
-              safeSend(ws, { type: 'publish', topic: primaryTopic.toLowerCase().startsWith('cmnd/') ? primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/') : primaryTopic, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
+              // normalize prefix to lowercase while preserving site/device case
+              const parts = primaryTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const outTopic = parts.join('/');
+              safeSend(ws, { type: 'publish', topic: outTopic, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
             } catch (e) {}
 
             // Query additional power states for multi-switch devices
@@ -1568,7 +1634,8 @@ function parseJwtPayload(tok) {
                 try {
                   const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
                   const t = buildCmdTopic(site, deviceName, `Power${i}`);
-                  safeSend(ws, { type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` });
+                  const parts = t.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const out = parts.join('/');
+                  safeSend(ws, { type: 'publish', topic: out, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` });
                 } catch (e) {}
               }
             }
@@ -2801,16 +2868,36 @@ function parseJwtPayload(tok) {
     setTimeout(() => { try { wsRef.current && wsRef.current.send(JSON.stringify({ type: 'get', topic, id: id + '-get' })); } catch (e) {} }, 500);
   };
   // Build a cmnd topic, stripping the BREW site for devices we know historically published without a site.
+  // Returns a string like `cmnd/<device>/<Cmd>` or `cmnd/<site>/<device>/<Cmd>`.
   const buildCmdTopic = (site, deviceName, cmdKey) => {
     try {
-      const s = site ? String(site).toUpperCase() : null;
+      const sRaw = site ? String(site) : null;
+      const s = sRaw ? String(sRaw).toUpperCase() : null;
       const d = deviceName ? String(deviceName) : '';
-      // If this device is known to be legacy-nosite and we're operating under BREW, omit the prefix
-      if (s === 'BREW' && legacyNoSiteDevicesRef.current && legacyNoSiteDevicesRef.current.has(String(d).toUpperCase())) {
-  return buildCmdTopic(s, d, cmdKey);
+      const cmd = cmdKey ? String(cmdKey) : '';
+
+      // Defensive: ensure we have a device and a command
+      if (!d || !cmd) return `cmnd/${d}/${cmd}`;
+
+      // If this device is known to be legacy-nosite and the site is BREW (or missing), omit the site prefix
+      try {
+        if ((s === 'BREW' || !s) && legacyNoSiteDevicesRef.current && legacyNoSiteDevicesRef.current.has(String(d).toUpperCase())) {
+          return `cmnd/${d}/${cmd}`;
+        }
+      } catch (e) {
+        // ignore and fall through
       }
-  return buildCmdTopic(s, d, cmdKey);
-  } catch (e) { return buildCmdTopic(site, deviceName, cmdKey); }
+
+      // If we have a non-empty site, include it
+      if (s && s.length) {
+        return `cmnd/${s}/${d}/${cmd}`;
+      }
+
+      // Fallback: device-only topic
+      return `cmnd/${d}/${cmd}`;
+    } catch (e) {
+      return `cmnd/${deviceName}/${cmdKey}`;
+    }
   };
 
   const publishPower = (baseKey, powerKey, nextOn) => {
@@ -3083,14 +3170,21 @@ function parseJwtPayload(tok) {
                       {powerSwitches && (
                         <View style={{ width: '100%', marginTop: 8, alignItems: 'center' }}>
                           <View style={{ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'center', gap: 6 }}>
-                            {Object.entries(powerSwitches[1])
-                              .sort(([a], [b]) => {
-                                // Sort POWER before POWER1, POWER2, etc.
-                                if (a === 'POWER' && b !== 'POWER') return -1;
-                                if (b === 'POWER' && a !== 'POWER') return 1;
-                                return a.localeCompare(b);
-                              })
-                              .map(([powerKey, isOn], idx, arr) => {
+                            {(() => {
+                              const entries = Object.entries(powerSwitches[1] || {});
+                              // If any numbered POWERn (POWER1/POWER2/..) exists, prefer those and
+                              // omit the generic POWER entry to avoid duplicate buttons for the
+                              // same physical device which can happen due to legacy topic variants.
+                              const hasNumbered = entries.some(([k]) => /^POWER\d+$/i.test(k));
+                              const filteredEntries = entries.filter(([k]) => !(k === 'POWER' && hasNumbered));
+                              return filteredEntries
+                                .sort(([a], [b]) => {
+                                  // Sort POWER before POWER1, POWER2, etc. (if POWER still present)
+                                  if (a === 'POWER' && b !== 'POWER') return -1;
+                                  if (b === 'POWER' && a !== 'POWER') return 1;
+                                  return a.localeCompare(b);
+                                })
+                                .map(([powerKey, isOn], idx, arr) => {
                                 // Resolve label via helper that tries canonical + tele/ variants and device-name fallbacks
                                 const baseKey = powerSwitches[0]; // e.g., "RAIL/FERM2" or "BREW/FERM2"
                                 let label = getPowerLabel(baseKey, powerKey);
@@ -3098,8 +3192,10 @@ function parseJwtPayload(tok) {
 
                                 // Support special label suffixes like "HEATING-heatingindicator"
                                 // where the suffix after '-' names a registered indicator renderer.
+                                // Also support a special suffix `-hide` which causes the button to be omitted.
                                 let indicatorRenderer = null;
                                 let displayLabel = label;
+                                let hideButton = false;
                                 try {
                                   // Split on common dash characters (hyphen-minus, en-dash, em-dash)
                                   // Preserve empty left-side segments so labels like "-heatingindicator"
@@ -3112,7 +3208,11 @@ function parseJwtPayload(tok) {
                                     if (rawParts.length >= 2 || (rawParts.length === 1 && startsWithDash)) {
                                       // right-most is indicator key; left side(s) form displayLabel (may be empty)
                                       const indicatorKey = String(rawParts[rawParts.length - 1] || '').toLowerCase();
-                                      if (indicatorKey && INDICATOR_RENDERERS[indicatorKey]) {
+                                      if (indicatorKey === 'hide') {
+                                        // Hide this button entirely (useful for placeholder/administrative labels)
+                                        hideButton = true;
+                                        displayLabel = '';
+                                      } else if (indicatorKey && INDICATOR_RENDERERS[indicatorKey]) {
                                         indicatorRenderer = INDICATOR_RENDERERS[indicatorKey];
                                         displayLabel = rawParts.slice(0, rawParts.length - 1).join(' - ');
                                         // ensure empty displayLabel is represented as an empty string (not undefined)
@@ -3130,6 +3230,9 @@ function parseJwtPayload(tok) {
                                 // Get device name for context when multiple switches
                                 const deviceName = powerSwitches[0].split('/')[1] || '';
                                 const showDeviceContext = arr.length > 1;
+
+                                // If label instructed to hide the button, skip rendering entirely
+                                if (hideButton) return null;
 
                                 return (
                                   <Pressable
@@ -3188,7 +3291,7 @@ function parseJwtPayload(tok) {
                                   </Pressable>
                                 );
                               })
-                            }
+                            })()}
                           </View>
                           {/* Show device name context for multi-switch devices */}
                           {Object.keys(powerSwitches[1]).length > 1 && (

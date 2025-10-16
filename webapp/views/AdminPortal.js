@@ -252,6 +252,7 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   const [powerStates, setPowerStates] = useState([]); // [{ topic, powerKeys: { POWER1: 'ON', ... }, labels: { POWER1: 'Pump', ... } }]
   const [powerLabels, setPowerLabels] = useState({}); // { topic|powerKey: label }
   const [editedPowerLabels, setEditedPowerLabels] = useState({}); // local drafts while typing
+  const [editedHideFlags, setEditedHideFlags] = useState({}); // local hide toggles keyed by `${topic}|${powerKey}` -> boolean
   const [loadingPower, setLoadingPower] = useState(false);
 
   // Provide Authorization header for same-origin window.fetch attempts
@@ -556,6 +557,22 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           if (!topicToKeys[storedRep]) topicToKeys[storedRep] = {};
           for (const pk of Array.from(entry.powerKeys)) topicToKeys[storedRep][pk] = '';
         });
+        // initialize hide flags from labelMap for UI toggles
+        try {
+          const hideInit = {};
+          Object.keys(labelMap || {}).forEach(k => {
+            try {
+              const [topicPart, pk] = k.split('|');
+              if (!topicPart || !pk) return;
+              const val = labelMap[k] || labelMap[k.toUpperCase()] || '';
+              if (typeof val === 'string' && /(-|\u2013|\u2014)?hide$/i.test(String(val).trim())) {
+                const uiKey = `${topicPart}|${pk}`;
+                hideInit[uiKey] = true;
+              }
+            } catch (e) {}
+          });
+          if (Object.keys(hideInit).length) setEditedHideFlags(prev => ({ ...(prev||{}), ...hideInit }));
+        } catch (e) {}
       }
 
       // Build powerRows from topicToKeys. For each representative topic, expand
@@ -599,6 +616,19 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           }
           return next;
         });
+        // Also clear any hide flags for keys that the server now reports (they became authoritative)
+        setEditedHideFlags(prev => {
+          try {
+            const next = { ...prev };
+            for (const k of Object.keys(next)) {
+              try {
+                const serverVal = labelMap[k] !== undefined ? labelMap[k] : (labelMap[k.toUpperCase()] !== undefined ? labelMap[k.toUpperCase()] : undefined);
+                if (serverVal !== undefined) delete next[k];
+              } catch (e) {}
+            }
+            return next;
+          } catch (e) { return prev; }
+        });
       } catch (e) {}
     } catch (e) { 
       // On error, preserve existing local powerLabels instead of clearing them.
@@ -613,8 +643,21 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
     try {
       // Prefer admin API; fall back to public API if admin is not accessible to this caller
   const storedTopic = canonicalizeForStorage(topic);
-  const bodyById = initial && initial.id ? { topic: storedTopic, power_key: powerKey, label, customer_id: initial.id } : null;
-  const bodyBySlug = initial && initial.slug ? { topic: storedTopic, power_key: powerKey, label, customer_slug: initial.slug } : null;
+  // Determine hide flag from local editedHideFlags or suffix in label
+  const uiKey = `${topic}|${powerKey}`;
+  const hideFlagLocal = editedHideFlags[uiKey];
+  let finalLabel = String(label || '');
+  // If local hide toggle enabled, ensure '-hide' suffix present
+  if (hideFlagLocal) {
+    if (!/[-]hide$/i.test(finalLabel) && !/(-|\u2013|\u2014)hide$/i.test(finalLabel)) {
+      finalLabel = finalLabel ? `${finalLabel}-hide` : '-hide';
+    }
+  } else {
+    // Strip any existing -hide suffix when not set
+    finalLabel = finalLabel.replace(/[-]?hide$/i, '').trim();
+  }
+  const bodyById = initial && initial.id ? { topic: storedTopic, power_key: powerKey, label: finalLabel, customer_id: initial.id } : null;
+  const bodyBySlug = initial && initial.slug ? { topic: storedTopic, power_key: powerKey, label: finalLabel, customer_slug: initial.slug } : null;
       let saved = false;
       const tryPost = async (path, body) => {
         try { await doFetch(path, { method: 'POST', body }); return true; } catch (e) { if (DEBUG) console.warn('AdminPortal: post failed', path, e && e.message); return false; }
@@ -693,10 +736,10 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           if (candidates.indexOf(String(storedTopic).toUpperCase()) === -1) candidates.push(String(storedTopic).toUpperCase());
           candidates.forEach(t => {
             // normal and uppercased topic variants
-            next[`${t}|${powerKey}`] = label;
-            next[`${t}|${upKey}`] = label;
-            next[`${t.toUpperCase()}|${powerKey}`] = label;
-            next[`${t.toUpperCase()}|${upKey}`] = label;
+            next[`${t}|${powerKey}`] = finalLabel;
+            next[`${t}|${upKey}`] = finalLabel;
+            next[`${t.toUpperCase()}|${powerKey}`] = finalLabel;
+            next[`${t.toUpperCase()}|${upKey}`] = finalLabel;
             // also add tele-prefixed STATE variants if topic looks like SITE/DEVICE/STATE or SITE/DEVICE
             try {
               const base = String(t).replace(/\/STATE$/i, '');
@@ -752,10 +795,21 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
           const uiKey = `${row.topic}|${pk}`;
           // Prefer local draft edits for immediate UX
           const candidate = (editedPowerLabels && editedPowerLabels[uiKey] !== undefined) ? editedPowerLabels[uiKey] : ((powerLabels && (powerLabels[uiKey] || powerLabels[`${uiKey.toUpperCase()}`])) || '');
+          const hideLocal = editedHideFlags && editedHideFlags[uiKey];
           const current = lookupPowerLabel(row.topic, pk) || '';
-          // Only persist when the UI value is non-empty and differs from the server-known label
-          if ((candidate || '').trim() && String(candidate).trim() !== String(current).trim()) {
-            toSave.push({ topic: row.topic, powerKey: pk, label: String(candidate).trim() });
+          // Construct final label taking hide flag into account
+          let finalCandidate = String(candidate || '').trim();
+          if (hideLocal) {
+            if (!finalCandidate.match(/(-|\u2013|\u2014)?hide$/i)) finalCandidate = finalCandidate ? `${finalCandidate}-hide` : '-hide';
+          } else {
+            finalCandidate = finalCandidate.replace(/(-|\u2013|\u2014)?hide$/i, '').trim();
+          }
+          // Only persist when the final UI value differs from the server-known label
+          if (String(finalCandidate).trim() !== String(current).trim()) {
+            // Only persist non-empty labels or explicit hide markers; otherwise skip blank no-op saves
+            if (String(finalCandidate).trim() !== '') {
+              toSave.push({ topic: row.topic, powerKey: pk, label: finalCandidate });
+            }
           }
         }
       }
@@ -820,16 +874,17 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
             try {
               const stored = canonicalizeForStorage(item.topic);
               const upKey = String(item.powerKey).toUpperCase();
+              const lab = item.label;
               // Add canonical stored entries and tele variants
-              const addKey = (t, k) => { try { next[`${t}|${k}`] = item.label; next[`${t}|${String(k).toUpperCase()}`] = item.label; } catch (e) {} };
-              addKey(stored, item.powerKey);
-              addKey(stored.toUpperCase(), item.powerKey);
+              const addKey = (t, k, v) => { try { next[`${t}|${k}`] = v; next[`${t}|${String(k).toUpperCase()}`] = v; } catch (e) {} };
+              addKey(stored, item.powerKey, lab);
+              addKey(stored.toUpperCase(), item.powerKey, lab);
               // Also add candidate variants so UI lookup (which uses many permutations)
               const candidates = canonicalCandidatesForTopic(stored);
               if (candidates.indexOf(stored) === -1) candidates.push(stored);
               for (const c of candidates) {
-                addKey(c, item.powerKey);
-                addKey(String(c).toUpperCase(), item.powerKey);
+                addKey(c, item.powerKey, lab);
+                addKey(String(c).toUpperCase(), item.powerKey, lab);
                 // add tele variants
                 try {
                   const base = String(c).replace(/\/STATE$/i, '');
@@ -837,8 +892,8 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
                   if (parts.length >= 2) {
                     const tele1 = `tele/${parts[0]}/${parts[1]}/STATE`;
                     const tele2 = `tele/${parts[1]}/STATE`;
-                    addKey(tele1, item.powerKey);
-                    addKey(tele2, item.powerKey);
+                    addKey(tele1, item.powerKey, lab);
+                    addKey(tele2, item.powerKey, lab);
                   }
                 } catch (e) {}
               }
@@ -846,8 +901,8 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
               try {
                 const base = String(stored).replace(/\/STATE$/i, '');
                 if (base && base !== stored) {
-                  addKey(base, item.powerKey);
-                  addKey(base.toUpperCase(), item.powerKey);
+                  addKey(base, item.powerKey, lab);
+                  addKey(base.toUpperCase(), item.powerKey, lab);
                 }
               } catch (e) {}
             } catch (e) {}
@@ -1302,6 +1357,17 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
                         placeholderTextColor={PLACEHOLDER_COLOR}
                         style={[styles.input, { flex: 1, marginLeft: 8, minWidth: 80 }]}
                       />
+                      {/* Hide toggle: mark label as hidden (-hide suffix) */}
+                      <TouchableOpacity
+                        onPress={() => {
+                          const key = `${row.topic}|${pk}`;
+                          setEditedHideFlags(h => ({ ...(h||{}), [key]: !h[key] }));
+                        }}
+                        style={{ marginLeft: 8, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6, borderWidth: 1, borderColor: '#ddd', backgroundColor: (editedHideFlags[`${row.topic}|${pk}`] ? '#eee' : 'transparent') }}
+                        accessibilityLabel={`Toggle hide for ${pk}`}
+                      >
+                        <Text style={{ color: editedHideFlags[`${row.topic}|${pk}`] ? '#b71c1c' : '#444', fontWeight: '700' }}>{editedHideFlags[`${row.topic}|${pk}`] ? 'Hidden' : 'Hide'}</Text>
+                      </TouchableOpacity>
                       <View style={{ flexDirection: 'row', marginLeft: 8, gap: 8 }}>
                         <TouchableOpacity
                           onPress={() => confirmDeletePowerLabel(row.topic, pk)}
