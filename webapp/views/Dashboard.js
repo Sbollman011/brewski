@@ -3031,7 +3031,7 @@ function parseJwtPayload(tok) {
   // (In-app debug overlay removed after diagnosis.)
 
   return (
-    <ImageBackground source={require('../assets/logo.png')} style={{ flex: 1, width: '100%' }} imageStyle={{ opacity: 0.04, resizeMode: 'contain' }}>
+    <ImageBackground source={require('../assets/logo.png')} style={{ flex: 1, width: '100%', alignItems: 'center' }} imageStyle={{ opacity: 0.12, resizeMode: 'contain' }}>
       <SafeAreaView style={styles.container}>
   {/* In-app debug panel for RN / DEBUG mode (removed) */}
       {DEBUG && (

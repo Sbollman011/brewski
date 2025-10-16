@@ -4,7 +4,7 @@ import { View, Text, Pressable, StyleSheet, SafeAreaView, Platform, StatusBar, I
 export default function Header({ title, token, onMenuPress, onDashboardPress, onLoginPress, onLogoutPress, hideControls = false, menuOpen = false }) {
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ImageBackground source={require('../assets/logo.png')} style={styles.logoBg} imageStyle={{ opacity: 0.07, resizeMode: 'contain' }}>
+  <ImageBackground source={require('../assets/logo.png')} style={styles.logoBg} imageStyle={{ opacity: 0.18, resizeMode: 'contain' }}>
         <View style={styles.appBar}>
         {!hideControls && (
           <Pressable
@@ -35,6 +35,7 @@ export default function Header({ title, token, onMenuPress, onDashboardPress, on
             )
           )}
         </View>
+        </View>
       </ImageBackground>
     </SafeAreaView>
   );
@@ -51,5 +52,5 @@ const styles = StyleSheet.create({
   portalText: { color: '#fff', fontWeight: '600' },
   loginBtn: { backgroundColor: '#ffffff22', paddingVertical: 6, paddingHorizontal: 10, borderRadius: 6 },
   loginText: { color: '#fff', fontWeight: '600' },
-  logoBg: { width: '100%' }
+  logoBg: { width: '100%', justifyContent: 'center', paddingHorizontal: 8 }
 });
