@@ -3172,10 +3172,28 @@ function parseJwtPayload(tok) {
         ws.send(JSON.stringify({ type: 'get', topic: stateTopic, id: idSt }));
       } catch (e) {}
 
+      // If the base looks like a legacy BREW (no site or BREW site), also probe
+      // raw device-target variants (e.g., FERM3Target) and slash/cmnd fallbacks.
+      try {
+        const isBrewish = !site || String(site).toUpperCase() === 'BREW';
+        if (isBrewish && deviceName) {
+          // Raw DEVICETarget (legacy tasmota/bridge behavior)
+          try {
+            const rawTarget = `${String(deviceName).toUpperCase()}Target`;
+            ws.send(JSON.stringify({ type: 'get', topic: rawTarget, id: `reqcur-raw-target-${base}-${Date.now()}` }));
+          } catch (e) {}
+          // Slash variant: device/Target
+          try { ws.send(JSON.stringify({ type: 'get', topic: `${deviceName}/Target`, id: `reqcur-slash-target-${base}-${Date.now()}` })); } catch (e) {}
+          // cmnd prefixed variant
+          try { ws.send(JSON.stringify({ type: 'get', topic: `cmnd/${deviceName}/Target`, id: `reqcur-cmnd-target-${base}-${Date.now()}` })); } catch (e) {}
+        }
+      } catch (e) {}
+
       // Probe device with non-mutating Status 0 to encourage immediate STATE publish
       try { probeStateForDevice(site, deviceName); } catch (e) {}
     } catch (e) {}
   };
+
 
   const doReconnect = () => {
     setConnectionError(false);
