@@ -1657,55 +1657,6 @@ function parseJwtPayload(tok) {
     try { return (typeof navigator !== 'undefined' && navigator.product === 'ReactNative'); } catch (e) { return false; }
   })();
 
-  // Persistent logging helper available at component scope so we can capture
-  // global errors and events that happen before the WS connects. Uses dynamic
-  // import of AsyncStorage so web builds are unaffected.
-  const persistentLog = {
-    key: '@brewski:runtimeLogs',
-    maxEntries: 200,
-    async push(entry) {
-      try {
-        if (isReactNative) {
-          let AsyncStorage;
-          try { AsyncStorage = (await import('@react-native-async-storage/async-storage')).default; } catch (e) { AsyncStorage = null; }
-          if (!AsyncStorage) return;
-          const raw = await AsyncStorage.getItem(this.key);
-          const arr = raw ? JSON.parse(raw) : [];
-          arr.push({ t: Date.now(), entry });
-          if (arr.length > this.maxEntries) arr.splice(0, arr.length - this.maxEntries);
-          await AsyncStorage.setItem(this.key, JSON.stringify(arr));
-        }
-      } catch (e) {
-        try { console.warn('persistentLog.push failed', e); } catch (_) {}
-      }
-    }
-  };
-
-  // Install global error handlers to persist unhandled exceptions/rejections
-  useEffect(() => {
-    try {
-      if (!isReactNative) return;
-      // Preserve any existing global handler
-      const existingGlobalHandler = (global && global.ErrorUtils && global.ErrorUtils.getGlobalHandler) ? global.ErrorUtils.getGlobalHandler() : null;
-      if (global && global.ErrorUtils && global.ErrorUtils.setGlobalHandler) {
-        global.ErrorUtils.setGlobalHandler((error, isFatal) => {
-          try { persistentLog.push({ type: 'global.error', message: String(error && error.message), stack: error && error.stack, isFatal }); } catch (e) {}
-          try { if (existingGlobalHandler) existingGlobalHandler(error, isFatal); } catch (e) {}
-        });
-      }
-      // Unhandled promise rejections
-      try {
-        if (typeof global !== 'undefined' && global.process && typeof global.process.on === 'function') {
-          try { global.process.on('unhandledRejection', (reason) => { persistentLog.push({ type: 'unhandledRejection', reason: String((reason && reason.message) || reason) }); }); } catch (e) {}
-        } else if (typeof window !== 'undefined' && window.addEventListener) {
-          try { window.addEventListener('unhandledrejection', (ev) => { persistentLog.push({ type: 'unhandledRejection', reason: (ev && ev.reason && ev.reason.message) ? ev.reason.message : String(ev && ev.reason) }); }); } catch (e) {}
-        }
-      } catch (e) {}
-    } catch (e) {}
-    // no cleanup to restore previous handlers to avoid losing crash capture
-    return () => {};
-  }, []);
-
   const connectWebSocket = async () => {
     if (!token) return false; // don't attempt without JWT
     const host = resolveHost();
@@ -1716,28 +1667,6 @@ function parseJwtPayload(tok) {
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;
-      // Aggressive persistent logging for native builds: keep recent events in AsyncStorage
-      // Use dynamic import so web builds don't require native AsyncStorage module at bundle time.
-      const persistentLog = {
-        key: '@brewski:runtimeLogs',
-        maxEntries: 200,
-        async push(entry) {
-          try {
-            if (typeof navigator !== 'undefined' && navigator.product === 'ReactNative') {
-              let AsyncStorage;
-              try { AsyncStorage = (await import('@react-native-async-storage/async-storage')).default; } catch (e) { AsyncStorage = null; }
-              if (!AsyncStorage) return;
-              const raw = await AsyncStorage.getItem(this.key);
-              const arr = raw ? JSON.parse(raw) : [];
-              arr.push({ t: Date.now(), entry });
-              if (arr.length > this.maxEntries) arr.splice(0, arr.length - this.maxEntries);
-              await AsyncStorage.setItem(this.key, JSON.stringify(arr));
-            }
-          } catch (e) {
-            try { console.warn('persistentLog.push failed', e); } catch (_) {}
-          }
-        }
-      };
       // helper to avoid sending on sockets that are not OPEN
       const safeSend = (socket, payload) => {
         try {
@@ -1753,7 +1682,6 @@ function parseJwtPayload(tok) {
         // clear any connection error state on open
         try { setConnectionError(false); } catch (e) {}
   brewskiLog('WS open -> requesting initial gets for default devices');
-  try { persistentLog.push('WS onopen'); } catch (e) {}
         // request current target and sensor for the default devices once connected
         const sendInitialGets = () => {
           defaultDevices.forEach(d => {
@@ -1826,8 +1754,7 @@ function parseJwtPayload(tok) {
   ws.onmessage = (ev) => {
         try {
           const obj = JSON.parse(ev.data);
-          // lightweight persistent trace for native crash diagnosis
-          try { persistentLog.push({ type: 'ws.message', payload: { t: Date.now(), type: obj.type, topic: obj.topic || obj.data?.topic || null } }); } catch (e) {}
+          brewskiLog('WS message', obj.type, obj.topic || obj.data?.topic || 'no-topic');
           // helper to mark the connection healthy (clear the 6s timeout and overlay)
           const markConnected = () => {
             try { setConnectionError(false); setLoading(false); } catch (e) {}
@@ -2198,13 +2125,11 @@ function parseJwtPayload(tok) {
           if (obj.type === 'current' && typeof obj.topic === 'string' && /\/sensor$/i.test(obj.topic)) {
             const n = obj.payload === null ? null : Number(obj.payload);
             if (!Number.isNaN(n) && n !== null) { applySensor(obj.topic, n); markConnected(); brewskiLog('Current response (Sensor)', obj.topic, n); }
-            try { persistentLog.push({ type: 'ws.current.sensor', topic: obj.topic, value: n }); } catch (e) {}
           }
           if (obj.type === 'current' && typeof obj.topic === 'string' && /\/target$/i.test(obj.topic)) {
             if (obj.payload !== null && obj.payload !== undefined && obj.payload !== '') {
               const n = Number(obj.payload);
               if (!Number.isNaN(n)) { applyTarget(obj.topic, n); markConnected(); brewskiLog('Current response (Target)', obj.topic, n); }
-              try { persistentLog.push({ type: 'ws.current.target', topic: obj.topic, value: obj.payload }); } catch (e) {}
             }
           }
           // also accept 'current' responses from the bridge for sensor gets
@@ -2357,17 +2282,14 @@ function parseJwtPayload(tok) {
             if (Object.keys(metaAdds).length) setGMeta(prev => ({ ...prev, ...metaAdds }));
             debug('Applied inventory snapshot (parsed)', Object.keys(sensorAdds).length, 'sensors,', Object.keys(targetAdds).length, 'targets');
           }
-          } catch (e) {
-            // log parse errors persistently to help diagnose native crash paths
-            try { persistentLog.push({ type: 'ws.parse.error', message: String(e && e.message), stack: e && e.stack }); } catch (ie) {}
-            // ignore per-message parse errors
-          }
+        } catch (e) {
+          // ignore per-message parse errors
+        }
       };
       ws.onclose = () => {
         // clear any retry timer associated with this socket so it won't try to send on a closed socket
         try { if (ws && ws._retryTimer) { clearInterval(ws._retryTimer); ws._retryTimer = null; } } catch (e) {}
         wsRef.current = null;
-        try { persistentLog.push('WS onclose'); } catch (e) {}
         // attempt reconnect if token still valid and user hasn't logged out
         if (token) {
           reconnectMeta.current.attempts += 1;
@@ -2376,11 +2298,9 @@ function parseJwtPayload(tok) {
       };
       ws.onerror = () => {
         wsRef.current = null;
-        try { persistentLog.push('WS onerror'); } catch (e) {}
       };
       return true;
     } catch (e) {
-      try { persistentLog.push({ type: 'ws.connect.error', message: String(e && e.message), stack: e && e.stack }); } catch (ie) {}
       return false;
     }
   };
