@@ -1754,7 +1754,6 @@ function parseJwtPayload(tok) {
   ws.onmessage = (ev) => {
         try {
           const obj = JSON.parse(ev.data);
-          brewskiLog('WS message', obj.type, obj.topic || obj.data?.topic || 'no-topic');
           // helper to mark the connection healthy (clear the 6s timeout and overlay)
           const markConnected = () => {
             try { setConnectionError(false); setLoading(false); } catch (e) {}
