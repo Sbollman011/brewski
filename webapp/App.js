@@ -19,6 +19,64 @@ try {
 } catch (e) {
   NativeAsyncStorage = null;
 }
+// Platform-safe synchronous local storage shim. Many code paths expect a
+// synchronous localStorage API (getItem/setItem/removeItem). In React Native
+// those globals don't exist and referencing `localStorage` directly throws a
+// ReferenceError. Provide `safeLocal` which prefers window.localStorage when
+// available and otherwise falls back to a fast in-memory Map (non-persistent).
+const _inMemoryLocal = new Map();
+const safeLocal = {
+  getItem: (k) => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.getItem === 'function') return window.localStorage.getItem(k);
+    } catch (e) {}
+    try { return _inMemoryLocal.has(k) ? _inMemoryLocal.get(k) : null; } catch (e) { return null; }
+  },
+  setItem: (k, v) => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.setItem === 'function') return window.localStorage.setItem(k, v);
+    } catch (e) {}
+    try { _inMemoryLocal.set(k, String(v)); } catch (e) {}
+  },
+  removeItem: (k) => {
+    try {
+      if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.removeItem === 'function') return window.localStorage.removeItem(k);
+    } catch (e) {}
+    try { _inMemoryLocal.delete(k); } catch (e) {}
+  }
+};
+// Defensive polyfills: some JS runtimes (Hermes) may not expose `atob`/`btoa` or
+// the global Buffer helper. Provide safe fallbacks that avoid throwing so code
+// that attempts to parse JWTs or base64 data won't crash the app.
+try {
+  if (typeof globalThis.atob === 'undefined') {
+    try {
+      // Prefer Node-like Buffer when available
+      if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
+        globalThis.atob = (s) => Buffer.from(String(s), 'base64').toString('binary');
+      } else {
+        // no-op safe fallback that returns empty string rather than throwing
+        globalThis.atob = (s) => '';
+      }
+    } catch (e) {
+      globalThis.atob = (s) => '';
+    }
+    // NOTE: do not redefine `safeLocal` here (top-level shim above is used across file).
+  }
+} catch (e) {}
+try {
+  if (typeof globalThis.btoa === 'undefined') {
+    try {
+      if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
+        globalThis.btoa = (s) => Buffer.from(String(s), 'binary').toString('base64');
+      } else {
+        globalThis.btoa = (s) => '';
+      }
+    } catch (e) {
+      globalThis.btoa = (s) => '';
+    }
+  }
+} catch (e) {}
 import { apiFetch } from './src/api';
 
 // Error boundary to catch rendering errors and provide a friendly fallback UI
@@ -38,9 +96,7 @@ class ErrorBoundary extends React.Component {
       // Persist minimal crash info for later retrieval (web-friendly)
       try {
         const payload = { message: String(error && error.message), stack: (error && error.stack) || null, info: info && info.componentStack, ts: Date.now() };
-        if (typeof window !== 'undefined' && window.localStorage) {
-          window.localStorage.setItem('brewski_last_error', JSON.stringify(payload));
-        }
+        try { safeLocal.setItem('brewski_last_error', JSON.stringify(payload)); } catch (e) {}
       } catch (e) {}
     } catch (e) {}
     this.setState({ info });
@@ -60,7 +116,7 @@ class ErrorBoundary extends React.Component {
             <Pressable onPress={() => { try { if (this.props.onReset) this.props.onReset(); else if (typeof window !== 'undefined' && window.location) window.location.reload(); } catch (e) {} }} style={{ backgroundColor: '#1976d2', padding: 10, borderRadius: 8 }}>
               <Text style={{ color: '#fff' }}>Reload / Reset</Text>
             </Pressable>
-            <Pressable onPress={() => { try { const payload = typeof window !== 'undefined' && window.localStorage ? window.localStorage.getItem('brewski_last_error') : null; if (payload && typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(payload); Alert.alert && Alert.alert('Copied'); } catch (e) {} }} style={{ backgroundColor: '#6c757d', padding: 10, borderRadius: 8 }}>
+            <Pressable onPress={() => { try { const payload = safeLocal.getItem && safeLocal.getItem('brewski_last_error'); if (payload && typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(payload); Alert.alert && Alert.alert('Copied'); } catch (e) {} }} style={{ backgroundColor: '#6c757d', padding: 10, borderRadius: 8 }}>
               <Text style={{ color: '#fff' }}>Copy Error</Text>
             </Pressable>
           </View>
@@ -137,7 +193,7 @@ export default function App() {
       try { js = await res.json(); } catch (e) { js = null; }
       if (js && js.user) {
         setCachedUser(js.user);
-        try { localStorage.setItem('brewski_me', JSON.stringify(js.user)); } catch (e) {}
+        try { safeLocal.setItem('brewski_me', JSON.stringify(js.user)); } catch (e) {}
       }
     } catch (e) {
       // swallow
@@ -148,10 +204,10 @@ export default function App() {
 
   useEffect(() => {
     try {
-      const t = localStorage.getItem('brewski_jwt');
+      const t = safeLocal.getItem('brewski_jwt');
       if (t) setToken(t);
       // attempt to hydrate cached user
-      const meRaw = localStorage.getItem('brewski_me');
+      const meRaw = safeLocal.getItem('brewski_me');
       if (meRaw) {
         try { setCachedUser(JSON.parse(meRaw)); } catch (e) {}
       }
@@ -168,7 +224,7 @@ export default function App() {
       const qp = new URLSearchParams(window.location.search || '');
       const t = qp.get('token');
       if (t) {
-        try { localStorage.setItem('brewski_jwt', t); } catch (e) {}
+        try { safeLocal.setItem('brewski_jwt', t); } catch (e) {}
         setToken(t);
         // remove token from URL for cleanliness
         qp.delete('token');
@@ -183,9 +239,7 @@ export default function App() {
   // that read localStorage will include the current token.
   useEffect(() => {
     try {
-      if (typeof window !== 'undefined') {
-        if (token) localStorage.setItem('brewski_jwt', token); else localStorage.removeItem('brewski_jwt');
-      }
+      try { if (token) safeLocal.setItem('brewski_jwt', token); else safeLocal.removeItem('brewski_jwt'); } catch (e) {}
     } catch (e) { }
     tokenRef.current = token;
   }, [token]);
@@ -276,8 +330,8 @@ export default function App() {
         // Prefer native AsyncStorage on native platforms if available so release APKs persist crashes
         if (NativeAsyncStorage && Platform.OS !== 'web') {
           try { NativeAsyncStorage.setItem('brewski_last_error', JSON.stringify(payload)); } catch (e) {}
-        } else if (typeof window !== 'undefined' && window.localStorage) {
-          try { window.localStorage.setItem('brewski_last_error', JSON.stringify(payload)); } catch (e) {}
+        } else {
+          try { safeLocal.setItem('brewski_last_error', JSON.stringify(payload)); } catch (e) {}
         }
         console.error('Global captured error', payload);
       } catch (e) {}
@@ -324,10 +378,7 @@ export default function App() {
         const v = await NativeAsyncStorage.getItem('brewski_last_error');
         return v ? JSON.parse(v) : null;
       }
-      if (typeof window !== 'undefined' && window.localStorage) {
-        const v = window.localStorage.getItem('brewski_last_error');
-        return v ? JSON.parse(v) : null;
-      }
+      try { const v = safeLocal.getItem('brewski_last_error'); return v ? JSON.parse(v) : null; } catch (e) {}
     } catch (e) {}
     return null;
   };
@@ -338,10 +389,7 @@ export default function App() {
         await NativeAsyncStorage.removeItem('brewski_last_error');
         return true;
       }
-      if (typeof window !== 'undefined' && window.localStorage) {
-        window.localStorage.removeItem('brewski_last_error');
-        return true;
-      }
+      try { safeLocal.removeItem('brewski_last_error'); return true; } catch (e) {}
     } catch (e) { }
     return false;
   };
@@ -397,7 +445,7 @@ export default function App() {
       if (!token) return;
       try {
         // Check current user's role by calling /admin/api/me — prefer SPA-local stored user if present
-        const meRaw = localStorage.getItem('brewski_me');
+        const meRaw = safeLocal.getItem('brewski_me');
         if (meRaw) {
           const me = JSON.parse(meRaw);
           if (me && (Number(me.is_admin) === 1 || me.role === 'manager')) {
@@ -412,7 +460,7 @@ export default function App() {
           return r.json();
         }).then(json => {
           if (json && json.user && (Number(json.user.is_admin) === 1 || json.user.role === 'manager')) {
-            try { localStorage.setItem('brewski_me', JSON.stringify(json.user)); } catch (e) {}
+            try { safeLocal.setItem('brewski_me', JSON.stringify(json.user)); } catch (e) {}
             setScreen('admin');
             try { window.history.replaceState({}, document.title, '/manage'); } catch (e) {}
           } else {
@@ -480,8 +528,8 @@ export default function App() {
   }
 
   function handleLogout() {
-    try { localStorage.removeItem('brewski_jwt'); } catch (e) { }
-    try { localStorage.removeItem('brewski_me'); } catch (e) { }
+    try { safeLocal.removeItem('brewski_jwt'); } catch (e) { }
+    try { safeLocal.removeItem('brewski_me'); } catch (e) { }
     setCachedUser(null);
     setCustomerInfo(null);
     setToken(null);
@@ -600,7 +648,7 @@ export default function App() {
               try {
                 if (typeof window !== 'undefined' && window.location && String(window.location.pathname).startsWith('/admin')) {
                   // Set token locally and update the URL without reloading the page.
-                  try { localStorage.setItem('brewski_jwt', t); } catch (e) {}
+                  try { safeLocal.setItem('brewski_jwt', t); } catch (e) {}
                   setToken(t);
                   try { window.history.replaceState({}, document.title, '/admin'); } catch (e) {}
                   setScreen('admin');

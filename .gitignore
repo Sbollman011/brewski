@@ -1,6 +1,7 @@
 node_modules/
 server/brewski.sqlite3
 server/backups/
+server/brewski.sqlite3-journal
 server/web-admin/
 dist/
 .env# ---- Node / Expo / React Native base ----

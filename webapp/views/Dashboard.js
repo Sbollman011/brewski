@@ -7,39 +7,48 @@ import { Image } from 'react-native';
 // or when window.brewskiDebug is set. We expose helpers to toggle it from
 // the console so you can enable logs without rebuilding.
 let DEBUG = false;
-try {
-  if (typeof window !== 'undefined') {
     try {
-      const params = new URLSearchParams(window.location.search || '');
-      if (params.get('debug') === '1' || params.get('debug') === 'true') DEBUG = true;
-    } catch (e) {}
-    try {
-      if (window.localStorage && typeof window.localStorage.getItem === 'function') {
-        const ls = window.localStorage.getItem('brewski.debug');
-        if (ls === 'true') DEBUG = true;
+      if (typeof window !== 'undefined') {
+        try {
+          const params = new URLSearchParams(window.location.search || '');
+          if (params.get('debug') === '1' || params.get('debug') === 'true') DEBUG = true;
+        } catch (e) {}
+        try {
+          // Prefer the module-safe storage shim when available; fall back to window.localStorage
+          const ls = (typeof safeLocal !== 'undefined' && safeLocal && typeof safeLocal.getItem === 'function') ? safeLocal.getItem('brewski.debug') : (window.localStorage && typeof window.localStorage.getItem === 'function' ? window.localStorage.getItem('brewski.debug') : null);
+          if (ls === 'true') DEBUG = true;
+        } catch (e) {}
+        try {
+          if (window.brewskiDebug) DEBUG = true;
+        } catch (e) {}
+
+        // Convenience helpers to toggle debug at runtime from the browser console.
+        try {
+          window.enableBrewskiDebug = (persist = false) => {
+            DEBUG = true;
+            try {
+              if (persist) {
+                if (typeof safeLocal !== 'undefined' && safeLocal && typeof safeLocal.setItem === 'function') safeLocal.setItem('brewski.debug', 'true');
+                else if (window.localStorage && typeof window.localStorage.setItem === 'function') window.localStorage.setItem('brewski.debug', 'true');
+              }
+            } catch (e) {}
+            console.log('brewski: DEBUG enabled');
+            return DEBUG;
+          };
+          window.disableBrewskiDebug = (persist = false) => {
+            DEBUG = false;
+            try {
+              if (persist) {
+                if (typeof safeLocal !== 'undefined' && safeLocal && typeof safeLocal.setItem === 'function') safeLocal.setItem('brewski.debug', 'false');
+                else if (window.localStorage && typeof window.localStorage.setItem === 'function') window.localStorage.setItem('brewski.debug', 'false');
+              }
+            } catch (e) {}
+            console.log('brewski: DEBUG disabled');
+            return DEBUG;
+          };
+        } catch (e) {}
       }
     } catch (e) {}
-    try {
-      if (window.brewskiDebug) DEBUG = true;
-    } catch (e) {}
-
-    // Convenience helpers to toggle debug at runtime from the browser console.
-    try {
-      window.enableBrewskiDebug = (persist = false) => {
-        DEBUG = true;
-        try { if (persist && window.localStorage && typeof window.localStorage.setItem === 'function') window.localStorage.setItem('brewski.debug', 'true'); } catch (e) {}
-        console.log('brewski: DEBUG enabled');
-        return DEBUG;
-      };
-      window.disableBrewskiDebug = (persist = false) => {
-        DEBUG = false;
-        try { if (persist && window.localStorage && typeof window.localStorage.setItem === 'function') window.localStorage.setItem('brewski.debug', 'false'); } catch (e) {}
-        console.log('brewski: DEBUG disabled');
-        return DEBUG;
-      };
-    } catch (e) {}
-  }
-} catch (e) {}
 // Simple module-level logger to avoid runtime ReferenceErrors when debug helpers
 // are invoked before the Dashboard component mounts. This forces console output
 // (no runtime gating) so logs always appear while we diagnose issues.
@@ -49,6 +58,23 @@ const debug = (...args) => { try { console.log('debug:', ...args); } catch (e) {
 // Detect React Native at module load time and provide a default API host
 const IS_REACT_NATIVE = (() => { try { return (typeof navigator !== 'undefined' && navigator.product === 'ReactNative'); } catch (e) { return false; } })();
 const DEFAULT_API_HOST = (typeof process !== 'undefined' && process.env && process.env.SERVER_FQDN) ? process.env.SERVER_FQDN : 'api.brewingremote.com';
+// Platform-safe synchronous local storage shim (used to avoid referencing
+// window.localStorage directly which throws in some RN/Hermes environments).
+const _inMemoryLocal_dashboard = new Map();
+const safeLocal = {
+  getItem: (k) => {
+    try { if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.getItem === 'function') return window.localStorage.getItem(k); } catch (e) {}
+    try { return _inMemoryLocal_dashboard.has(k) ? _inMemoryLocal_dashboard.get(k) : null; } catch (e) { return null; }
+  },
+  setItem: (k, v) => {
+    try { if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.setItem === 'function') return window.localStorage.setItem(k, v); } catch (e) {}
+    try { _inMemoryLocal_dashboard.set(k, String(v)); } catch (e) {}
+  },
+  removeItem: (k) => {
+    try { if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.removeItem === 'function') return window.localStorage.removeItem(k); } catch (e) {}
+    try { _inMemoryLocal_dashboard.delete(k); } catch (e) {}
+  }
+};
 // In-flight promise cache for fetchPowerLabels to coalesce concurrent callers
 const _inflightFetchPowerLabels = new Map();
 // Short-lived cache for server-side power-label listings per-customer to avoid
@@ -276,6 +302,26 @@ import { SafeAreaView, View, Text, StyleSheet, Pressable, Animated, Easing, Text
 import Constants from 'expo-constants';
 import Gauge from '../components/Gauge';
 
+// Defensive polyfills for atob/btoa to avoid ReferenceErrors on Hermes / RN runtimes
+try {
+  if (typeof globalThis.atob === 'undefined') {
+    if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
+      globalThis.atob = (s) => Buffer.from(String(s), 'base64').toString('binary');
+    } else {
+      globalThis.atob = (s) => '';
+    }
+  }
+} catch (e) {}
+try {
+  if (typeof globalThis.btoa === 'undefined') {
+    if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
+      globalThis.btoa = (s) => Buffer.from(String(s), 'binary').toString('base64');
+    } else {
+      globalThis.btoa = (s) => '';
+    }
+  }
+} catch (e) {}
+
 // try to load react-native-svg for a nicer circular gauge; fall back if not installed
 let Svg = null, Circle = null, Line = null, SvgText = null, G = null;
 try {
@@ -337,19 +383,19 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // Initialize runtime DEBUG flag from URL/localStorage/window.brewskiDebug so
   // the global runtime helpers (enableBrewskiDebug/disableBrewskiDebug) can
   // control logging consistently without needing a rebuild.
-  try {
-    if (typeof window !== 'undefined') {
-      try {
-        const params = new URLSearchParams(window.location.search || '');
-        if (params.get('debug') === '1' || params.get('debug') === 'true') DEBUG = true;
-      } catch (e) {}
-      try {
-        const ls = window.localStorage && window.localStorage.getItem && window.localStorage.getItem('brewski.debug');
-        if (ls === 'true') DEBUG = true;
-      } catch (e) {}
-      try { if (window.brewskiDebug) DEBUG = true; } catch (e) {}
-    }
-  } catch (e) {}
+    try {
+      if (typeof window !== 'undefined') {
+        try {
+          const params = new URLSearchParams(window.location.search || '');
+          if (params.get('debug') === '1' || params.get('debug') === 'true') DEBUG = true;
+        } catch (e) {}
+        try {
+          const ls = safeLocal.getItem && safeLocal.getItem('brewski.debug');
+          if (ls === 'true') DEBUG = true;
+        } catch (e) {}
+        try { if (window.brewskiDebug) DEBUG = true; } catch (e) {}
+      }
+    } catch (e) {}
   // Power label state: { `${topic}|${powerKey}`: label }
   const [powerLabels, setPowerLabels] = useState({});
   // Grouped by canonical base: { 'SITE/DEVICE': { POWER: 'Label', POWER1: 'Label2' } }
@@ -723,20 +769,8 @@ function parseJwtPayload(tok) {
             const r2 = await doApiFetch(qPath);
             record.attempts.push({ method: 'doApiFetch?token', url: qPath, ok: r2 && r2.ok, status: r2 && r2.status });
             if (r2 && r2.ok) res = r2;
-            else {
-              try { const txt = await (r2 && r2.text ? r2.text() : Promise.resolve(null)); record.attempts.push({ method: 'doApiFetch?token', bodyText: txt }); } catch (e) {}
-            }
           } catch (e) { record.attempts.push({ method: 'doApiFetch?token', ok: false, error: String(e) }); }
         }
-
-        // Parse response JSON if available
-        let js = null;
-        if (res) {
-          try { js = await res.json(); record.attempts.push({ method: 'parseJson', ok: true }); } catch (e) { record.attempts.push({ method: 'parseJson', ok: false, error: String(e) }); }
-        }
-
-        if (!mounted) return;
-        record.final = js || null;
         try { setMeDebug(record); } catch (e) {}
 
         if (js && js.customer && js.customer.slug) {
@@ -751,16 +785,23 @@ function parseJwtPayload(tok) {
         const custId = js && js.user && js.user.customer_id ? js.user.customer_id : (js && js.customer && js.customer.id ? js.customer.id : null);
         if (custId) {
           try {
-            const custUrl = `${base}/admin/api/customers/${encodeURIComponent(custId)}`;
             let cres = null;
-            try { cres = await fetch(custUrl, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }); record.attempts.push({ method: 'custFetch', url: custUrl, ok: cres && cres.ok, status: cres && cres.status }); } catch (e) { record.attempts.push({ method: 'custFetch', url: custUrl, ok: false, error: String(e) }); }
+            try {
+              // Use centralized helper so requests go to canonical API host and follow same routing as other calls
+              cres = await doApiFetch(`/admin/api/customers/${encodeURIComponent(custId)}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
+              record.attempts.push({ method: 'custFetch', url: `/admin/api/customers/${encodeURIComponent(custId)}`, ok: cres && cres.ok, status: cres && cres.status });
+            } catch (e) { record.attempts.push({ method: 'custFetch', url: `/admin/api/customers/${encodeURIComponent(custId)}`, ok: false, error: String(e) }); }
+
+            // If that failed, try the token query-string fallback via the same helper
             if ((!cres || !cres.ok)) {
               try {
-                const custQ = `${base}/admin/api/customers/${encodeURIComponent(custId)}?token=${encodeURIComponent(token)}`;
-                const cres2 = await fetch(custQ); record.attempts.push({ method: 'custFetch?token', url: custQ, ok: cres2 && cres2.ok, status: cres2 && cres2.status });
+                const qPath = `/admin/api/customers/${encodeURIComponent(custId)}?token=${encodeURIComponent(token)}`;
+                const cres2 = await doApiFetch(qPath);
+                record.attempts.push({ method: 'custFetch?token', url: qPath, ok: cres2 && cres2.ok, status: cres2 && cres2.status });
                 if (cres2 && cres2.ok) cres = cres2;
               } catch (e) { record.attempts.push({ method: 'custFetch?token', ok: false, error: String(e) }); }
             }
+
             if (cres && cres.ok) {
               try {
                 const cjs = await cres.json();
@@ -2318,16 +2359,24 @@ function parseJwtPayload(tok) {
     if (!token) return;
     debug('[TOKEN ready] len=', token.length, 'head=', token.slice(0,10));
     try {
-      if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.setItem === 'function') {
-        const cur = window.localStorage.getItem('brewski_jwt');
-        if (cur !== token) {
-          window.localStorage.setItem('brewski_jwt', token);
-          if (DEBUG) console.log('Dashboard: persisted token to localStorage.brewski_jwt');
+      try {
+        if (typeof safeLocal !== 'undefined' && safeLocal && typeof safeLocal.setItem === 'function') {
+          const cur = safeLocal.getItem && safeLocal.getItem('brewski_jwt');
+          if (cur !== token) {
+            safeLocal.setItem('brewski_jwt', token);
+            if (DEBUG) console.log('Dashboard: persisted token to safeLocal (brewski_jwt)');
+          }
+        } else if (typeof window !== 'undefined' && window.localStorage && typeof window.localStorage.setItem === 'function') {
+          const cur = window.localStorage.getItem('brewski_jwt');
+          if (cur !== token) {
+            window.localStorage.setItem('brewski_jwt', token);
+            if (DEBUG) console.log('Dashboard: persisted token to localStorage.brewski_jwt');
+          }
         }
+      } catch (e) {
+        if (DEBUG) console.warn('Dashboard: failed to persist token to storage', e && e.message);
       }
-    } catch (e) {
-      if (DEBUG) console.warn('Dashboard: failed to persist token to localStorage', e && e.message);
-    }
+    } catch (e) {}
   }, [token]);
 
   useEffect(() => {
@@ -3649,8 +3698,18 @@ const styles = StyleSheet.create({
 // Debug overlay component (visible when DEBUG=true)
 function DebugOverlay({ mode, customerSlug, knownSlugs, gMeta, gSensors, gTargets, gPower, deviceList, filteredDevices, pendingSensorMessages, pendingPowerMessages, clearPending, dumpToConsole }) {
   const small = { fontSize: 11, color: '#222' };
+  // Platform-aware container style: React Native does not support 'position: fixed',
+  // string-based sizes like '60vh' or 'overflow: auto'. Use numeric fallbacks for
+  // native and CSS-friendly values for web to avoid runtime style errors.
+  const isWeb = (typeof window !== 'undefined' && typeof document !== 'undefined');
+  const containerStyle = isWeb ? {
+    position: 'fixed', right: 12, top: 72, width: 420, maxHeight: '60vh', backgroundColor: 'rgba(255,255,255,0.95)', borderWidth: 1, borderColor: '#ddd', padding: 8, borderRadius: 6, overflow: 'auto', zIndex: 9999
+  } : {
+    position: 'absolute', right: 12, top: 72, width: 340, maxHeight: 300, backgroundColor: 'rgba(255,255,255,0.95)', borderWidth: 1, borderColor: '#ddd', padding: 8, borderRadius: 6, overflow: 'hidden', zIndex: 9999
+  };
+
   return (
-    <View style={{ position: 'fixed', right: 12, top: 72, width: 420, maxHeight: '60vh', backgroundColor: 'rgba(255,255,255,0.95)', borderWidth: 1, borderColor: '#ddd', padding: 8, borderRadius: 6, overflow: 'auto', zIndex: 9999 }}>
+    <View style={containerStyle}>
       <Text style={{ fontWeight: '700', marginBottom: 6 }}>Debug</Text>
       <Text style={small}>mode: {String(mode)}</Text>
       <Text style={small}>customerSlug: {String(customerSlug)}</Text>
