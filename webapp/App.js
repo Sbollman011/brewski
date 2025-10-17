@@ -11,7 +11,65 @@ import LoginScreen from './components/LoginScreen';
 import ForgotPasswordScreen from './components/ForgotPasswordScreen';
 import ResetPasswordScreen from './components/ResetPasswordScreen';
 import { Linking, Platform } from 'react-native';
+// Try to load native AsyncStorage if available (guarded so web builds don't break)
+let NativeAsyncStorage = null;
+try {
+  // eslint-disable-next-line import/no-extraneous-dependencies, global-require
+  NativeAsyncStorage = require('@react-native-async-storage/async-storage').default;
+} catch (e) {
+  NativeAsyncStorage = null;
+}
 import { apiFetch } from './src/api';
+
+// Error boundary to catch rendering errors and provide a friendly fallback UI
+class ErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, error: null, info: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error, info) {
+    try {
+      console.error('App ErrorBoundary caught error', error, info);
+      // Persist minimal crash info for later retrieval (web-friendly)
+      try {
+        const payload = { message: String(error && error.message), stack: (error && error.stack) || null, info: info && info.componentStack, ts: Date.now() };
+        if (typeof window !== 'undefined' && window.localStorage) {
+          window.localStorage.setItem('brewski_last_error', JSON.stringify(payload));
+        }
+      } catch (e) {}
+    } catch (e) {}
+    this.setState({ info });
+  }
+
+  render() {
+    if (this.state.hasError) {
+      const err = this.state.error;
+      return (
+        <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: 16 }}>
+          <Text style={{ fontSize: 18, fontWeight: '700', marginBottom: 8 }}>Something went wrong</Text>
+          <Text style={{ color: '#444', marginBottom: 12 }}>{err && err.message ? String(err.message) : 'An unexpected error occurred.'}</Text>
+          <View style={{ maxHeight: 240, width: '100%', padding: 8, backgroundColor: '#fff', borderRadius: 8, borderWidth: 1, borderColor: '#eee' }}>
+            <Text style={{ fontSize: 11, color: '#333' }}>{(err && err.stack) || (this.state.info && this.state.info.componentStack) || ''}</Text>
+          </View>
+          <View style={{ flexDirection: 'row', marginTop: 12, gap: 12 }}>
+            <Pressable onPress={() => { try { if (this.props.onReset) this.props.onReset(); else if (typeof window !== 'undefined' && window.location) window.location.reload(); } catch (e) {} }} style={{ backgroundColor: '#1976d2', padding: 10, borderRadius: 8 }}>
+              <Text style={{ color: '#fff' }}>Reload / Reset</Text>
+            </Pressable>
+            <Pressable onPress={() => { try { const payload = typeof window !== 'undefined' && window.localStorage ? window.localStorage.getItem('brewski_last_error') : null; if (payload && typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(payload); Alert.alert && Alert.alert('Copied'); } catch (e) {} }} style={{ backgroundColor: '#6c757d', padding: 10, borderRadius: 8 }}>
+              <Text style={{ color: '#fff' }}>Copy Error</Text>
+            </Pressable>
+          </View>
+        </View>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // Removed push notification registration logic per request
 
@@ -210,6 +268,84 @@ export default function App() {
     return () => clearTimeout(h);
   }, [token]);
 
+  // Register global JS/RN error handlers to capture runtime crashes in APKs
+  useEffect(() => {
+    const saveError = (err, info) => {
+      try {
+        const payload = { message: String(err && (err.message || err)), stack: (err && err.stack) || null, info: (info && info.componentStack) || null, ts: Date.now() };
+        // Prefer native AsyncStorage on native platforms if available so release APKs persist crashes
+        if (NativeAsyncStorage && Platform.OS !== 'web') {
+          try { NativeAsyncStorage.setItem('brewski_last_error', JSON.stringify(payload)); } catch (e) {}
+        } else if (typeof window !== 'undefined' && window.localStorage) {
+          try { window.localStorage.setItem('brewski_last_error', JSON.stringify(payload)); } catch (e) {}
+        }
+        console.error('Global captured error', payload);
+      } catch (e) {}
+    };
+
+    // React Native global error handler (ErrorUtils is RN global)
+    try {
+      if (typeof global !== 'undefined' && global.ErrorUtils && typeof global.ErrorUtils.setGlobalHandler === 'function') {
+        const prev = global.ErrorUtils.getGlobalHandler && global.ErrorUtils.getGlobalHandler();
+        global.ErrorUtils.setGlobalHandler((err, isFatal) => {
+          saveError(err, { componentStack: isFatal ? 'Uncaught fatal' : 'Uncaught' });
+          if (prev && typeof prev === 'function') try { prev(err, isFatal); } catch (e) {}
+        });
+      }
+    } catch (e) {}
+
+    // window.onerror for web contexts
+    const oldOnErr = (typeof window !== 'undefined' && window.onerror) ? window.onerror : null;
+    try {
+      if (typeof window !== 'undefined') {
+        window.onerror = function (message, source, lineno, colno, error) {
+          saveError(error || message, { componentStack: `${source}:${lineno}:${colno}` });
+          if (oldOnErr) try { return oldOnErr(message, source, lineno, colno, error); } catch (e) {}
+          return false;
+        };
+      }
+    } catch (e) {}
+
+    const onRejection = (ev) => {
+      try { saveError(ev.reason || ev, { componentStack: 'UnhandledPromiseRejection' }); } catch (e) {}
+    };
+    try { if (typeof window !== 'undefined') window.addEventListener('unhandledrejection', onRejection); } catch (e) {}
+
+    return () => {
+      try { if (typeof window !== 'undefined') window.removeEventListener('unhandledrejection', onRejection); } catch (e) {}
+      try { if (typeof window !== 'undefined' && oldOnErr) window.onerror = oldOnErr; } catch (e) {}
+    };
+  }, []);
+
+  // Helpers to read/clear saved crash payload (works on native via AsyncStorage or web via localStorage)
+  const readSavedCrash = async () => {
+    try {
+      if (NativeAsyncStorage && Platform.OS !== 'web') {
+        const v = await NativeAsyncStorage.getItem('brewski_last_error');
+        return v ? JSON.parse(v) : null;
+      }
+      if (typeof window !== 'undefined' && window.localStorage) {
+        const v = window.localStorage.getItem('brewski_last_error');
+        return v ? JSON.parse(v) : null;
+      }
+    } catch (e) {}
+    return null;
+  };
+
+  const clearSavedCrash = async () => {
+    try {
+      if (NativeAsyncStorage && Platform.OS !== 'web') {
+        await NativeAsyncStorage.removeItem('brewski_last_error');
+        return true;
+      }
+      if (typeof window !== 'undefined' && window.localStorage) {
+        window.localStorage.removeItem('brewski_last_error');
+        return true;
+      }
+    } catch (e) { }
+    return false;
+  };
+
   // On web, if the path is /admin open the admin screen by default
   useEffect(() => {
     try {
@@ -219,6 +355,38 @@ export default function App() {
       }
     } catch (e) { }
   }, []);
+
+  // Crash banner state and loader
+  const [savedCrash, setSavedCrash] = useState(null);
+  useEffect(() => {
+    let mounted = true;
+    readSavedCrash().then(r => { if (mounted) setSavedCrash(r); }).catch(() => {});
+    return () => { mounted = false; };
+  }, []);
+
+  const CrashBanner = ({ payload }) => {
+    if (!payload) return null;
+    const summary = payload.message ? String(payload.message).slice(0, 120) : 'Saved crash payload';
+    return (
+      <View style={{ position: 'absolute', right: 12, top: 12, zIndex: 9999 }}>
+        <View style={{ backgroundColor: '#fff3cd', borderColor: '#ffeeba', borderWidth: 1, padding: 8, borderRadius: 8, maxWidth: 420 }}>
+          <Text style={{ fontSize: 12, color: '#856404', fontWeight: '700' }}>Last crash detected</Text>
+          <Text style={{ fontSize: 11, color: '#856404', marginTop: 6 }}>{summary}</Text>
+          <View style={{ flexDirection: 'row', marginTop: 8, gap: 8 }}>
+            <Pressable onPress={async () => { try { const full = JSON.stringify(payload, null, 2); if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(full); Alert.alert && Alert.alert('Copied crash payload'); } else if (Platform.OS !== 'web' && NativeAsyncStorage) { try { await NativeAsyncStorage.setItem('__brewski_temp_copy', full); Alert.alert && Alert.alert('Copied to device storage'); } catch (e) {} } } catch (e) {} }} style={{ backgroundColor: '#1976d2', padding: 6, borderRadius: 6 }}>
+              <Text style={{ color: '#fff', fontSize: 12 }}>Copy</Text>
+            </Pressable>
+            <Pressable onPress={async () => { try { Alert.alert && Alert.alert('Crash details', (payload.stack || payload.info || payload.message) + '\n\nTimestamp: ' + new Date(payload.ts).toISOString()); } catch (e) {} }} style={{ backgroundColor: '#6c757d', padding: 6, borderRadius: 6 }}>
+              <Text style={{ color: '#fff', fontSize: 12 }}>View</Text>
+            </Pressable>
+            <Pressable onPress={async () => { try { const ok = await clearSavedCrash(); if (ok) { setSavedCrash(null); Alert.alert && Alert.alert('Cleared'); } } catch (e) {} }} style={{ backgroundColor: '#c82333', padding: 6, borderRadius: 6 }}>
+              <Text style={{ color: '#fff', fontSize: 12 }}>Clear</Text>
+            </Pressable>
+          </View>
+        </View>
+      </View>
+    );
+  };
 
   // On web, if the path is /manage, open the manager portal if token maps to admin or manager
   useEffect(() => {
@@ -354,7 +522,10 @@ export default function App() {
   // Push notification registration removed
 
   return (
+    <ErrorBoundary onReset={() => { try { handleLogout(); if (typeof window !== 'undefined' && window.location) window.location.reload(); } catch (e) {} }}>
     <SafeAreaProvider>
+      {/* Crash banner: shows persisted crash payload from previous runs (native or web) */}
+      {savedCrash ? <CrashBanner payload={savedCrash} /> : null}
       <StatusBar style="light" backgroundColor="#1b5e20" />
       <SafeAreaView edges={["top"]} style={[styles.topInset, { backgroundColor: '#1b5e20' }]} />
       <SafeAreaView style={styles.root} edges={["left", "right", "bottom"]}>
@@ -475,6 +646,7 @@ export default function App() {
         </View>
       </SafeAreaView>
     </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
 
