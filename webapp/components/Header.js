@@ -80,7 +80,7 @@ export default function Header({ title, token, onMenuPress, onDashboardPress, on
 
       {/* Mobile-only bottom navigation bar replacing the side menu UX. */}
       {IS_MOBILE && !hideControls && (
-        <View style={[styles.bottomNav, styles.bottomNavElevated]} accessibilityRole="navigation" accessibilityLabel="App navigation">
+        <View style={[styles.bottomNav, styles.bottomNavElevated]} accessibilityRole={IS_WEB ? 'navigation' : undefined} accessibilityLabel="App navigation">
           <Pressable style={styles.bottomNavItem} onPress={handleDashboard} accessibilityLabel="Dashboard">
             {Ionicons ? <Ionicons name="home-outline" size={22} color="#fff" /> : <Text style={styles.bottomIcon}>🏠</Text>}
             <Text style={styles.bottomLabel}>Dashboard</Text>
