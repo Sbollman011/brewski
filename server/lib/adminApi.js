@@ -50,7 +50,7 @@ function extractBearerToken(req, url) {
 // Canonicalize incoming topic strings into SITE/DEVICE/STATE
 // - strip leading tele/ or stat/
 // - remove any trailing STATE token(s)
-// - default site to BREW when omitted
+// - REQUIRE an explicit SITE token (do not default to BREW)
 // - uppercase site/device
 function canonicalizeTopic(raw) {
   try {
@@ -60,19 +60,14 @@ function canonicalizeTopic(raw) {
     const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
     // remove trailing STATE tokens if present
     while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
-    if (parts.length === 0) return raw;
-    let site = 'BREW';
-    let device = '';
-    if (parts.length === 1) {
-      device = parts[0];
-    } else {
-      site = parts[0] || 'BREW';
-      device = parts[1] || '';
+    if (parts.length < 2) {
+      // Require SITE/DEVICE form. If site is missing, treat as uncanonicalizable.
+      return null;
     }
-    site = String(site).toUpperCase();
-    device = String(device).toUpperCase();
+    const site = String(parts[0]).toUpperCase();
+    const device = String(parts[1]).toUpperCase();
     return `${site}/${device}/STATE`;
-  } catch (e) { return raw; }
+  } catch (e) { return null; }
 }
 
 function handleAdminApi(req, res, url) {
@@ -222,11 +217,12 @@ function handleAdminApi(req, res, url) {
         const db = new Database(DB_PATH);
         const topic = url.searchParams.get('topic');
         const requestedCustomerId = url.searchParams.get('customer_id');
+        const requestedCustomerSlug = url.searchParams.get('customer_slug');
         
         let rows;
         const isAdmin = Number(me.is_admin) === 1;
         
-        if (isAdmin && !requestedCustomerId) {
+        if (isAdmin && !requestedCustomerId && !requestedCustomerSlug) {
           // Admin requesting all labels across all customers
           if (topic) {
             rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE topic = ? ORDER BY customer_id, topic, power_key').all(topic);
@@ -240,6 +236,20 @@ function handleAdminApi(req, res, url) {
             rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(customerId, topic);
           } else {
             rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(customerId);
+          }
+        } else if (isAdmin && requestedCustomerSlug) {
+          // Admin requesting labels for specific customer via slug
+          const slug = String(requestedCustomerSlug);
+          const row = db.prepare('SELECT id FROM customers WHERE slug = ? LIMIT 1').get(slug);
+          const customerId = row && row.id ? Number(row.id) : null;
+          if (customerId) {
+            if (topic) {
+              rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? AND topic = ? ORDER BY topic, power_key').all(customerId, topic);
+            } else {
+              rows = db.prepare('SELECT id, customer_id, topic, power_key, label, created_at, updated_at FROM power_labels WHERE customer_id = ? ORDER BY topic, power_key').all(customerId);
+            }
+          } else {
+            rows = [];
           }
         } else {
           // Regular user - only their own customer's labels
@@ -273,8 +283,24 @@ function handleAdminApi(req, res, url) {
           } catch (e) { /* ignore per-row errors */ }
         }
         const out = Array.from(dedupeMap.values());
+        // Build grouped canonical map: { canonicalTopic: { POWER: label, POWER1: label } }
+        const labelsByCanonical = {};
+        for (const r of out) {
+          try {
+            const canon = canonicalizeTopic(r.topic);
+            if (!canon) continue;
+            const base = String(canon).replace(/\/STATE$/i, '');
+            if (!labelsByCanonical[base]) labelsByCanonical[base] = {};
+            labelsByCanonical[base][String(r.power_key || '').toUpperCase()] = r.label || '';
+            // also attach customer_slug for convenience
+            try {
+              const cRow = db.prepare('SELECT slug FROM customers WHERE id = ? LIMIT 1').get(Number(r.customer_id));
+              r.customer_slug = cRow && cRow.slug ? cRow.slug : null;
+            } catch (e) { r.customer_slug = null; }
+          } catch (e) {}
+        }
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, labels: out }));
+        res.end(JSON.stringify({ ok: true, labels: out, labels_by_canonical: labelsByCanonical }));
       } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: 'server_error', detail: String(e && e.message) })); }
       return true;
     }
@@ -284,6 +310,8 @@ function handleAdminApi(req, res, url) {
       parseBodyJson(req, res, (err, obj) => {
         if (err) { res.writeHead(400); res.end(JSON.stringify({ error: 'bad_json' })); return; }
         let { topic, power_key, label, customer_id } = obj || {};
+        // Support customer_slug in POST body for slug-based clients
+        const customer_slug = obj && obj.customer_slug ? String(obj.customer_slug) : null;
         if (!topic || !power_key) { res.writeHead(400); res.end(JSON.stringify({ error: 'missing_fields' })); return; }
         // Normalize incoming topic to a canonical stored form to avoid duplicates and
         // make client lookups reliable. Rules (best-effort):
@@ -311,9 +339,13 @@ function handleAdminApi(req, res, url) {
           
           // Determine target customer ID
           let targetCustomerId;
-          if (Number(me.is_admin) === 1 && customer_id) {
-            // Admin can specify customer_id
-            targetCustomerId = Number(customer_id);
+          if (Number(me.is_admin) === 1 && (customer_id || customer_slug)) {
+            // Admin can specify customer_id or customer_slug
+            if (customer_id) targetCustomerId = Number(customer_id);
+            else if (customer_slug) {
+              const row = db.prepare('SELECT id FROM customers WHERE slug = ? LIMIT 1').get(customer_slug);
+              if (row && row.id) targetCustomerId = Number(row.id);
+            }
           } else {
             // Regular users use their own customer_id
             if (!me.customer_id) { res.writeHead(401, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'unauthorized' })); return; }

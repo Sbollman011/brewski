@@ -97,7 +97,8 @@ function startWsBridge(opts = {}) {
             if (claims) authed = true;
           } catch (e) {}
           if (!authed && BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
-            authed = true; claims = { sub: 'bridge', username: 'bridge-token', legacy: true };
+            // Bridge token matched; treat as a valid token but do not mark it as a legacy flag
+            authed = true; claims = { sub: 'bridge', username: 'bridge-token' };
           }
         }
         if (!authed) {
@@ -117,7 +118,7 @@ function startWsBridge(opts = {}) {
           return;
         }
 
-        req.user = { id: claims.sub, username: claims.username, legacy: !!claims.legacy };
+  req.user = { id: claims.sub, username: claims.username };
 
         wss.handleUpgrade(req, socket, head, ws => {
           try { wss.emit('connection', ws, req); } catch (e) { try { ws.close(); } catch (e) {} }

@@ -10,7 +10,10 @@ import { apiFetch } from '../src/api';
 const DEBUG = false;
 
 const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
-  const API_HOST = 'api.brewingremote.com';
+  // use shared host config
+  const { API_HOST } = (() => {
+    try { return require('../src/hosts'); } catch (e) { return { API_HOST: 'api.brewingremote.com' }; }
+  })();
   const token = typeof tokenProvider === 'function' ? tokenProvider() : tokenProvider;
   const headers = Object.assign({}, opts.headers || {});
   if (token && !headers['Authorization']) headers['Authorization'] = `Bearer ${token}`;
@@ -272,39 +275,18 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   // topic strings (without the "|POWERx" suffix). Consumers will append
   // the power key as needed.
   const canonicalCandidatesForTopic = (topic) => {
+    // Only allow canonical stored form and exact topic (no legacy permutations)
     if (!topic) return [];
-    const candidates = new Set();
+    const candidates = [];
     try {
-      candidates.add(topic);
-      candidates.add(topic.toUpperCase());
-
-      // tele/<cust>/<device>/STATE -> tele/<device>/STATE (legacy)
-      const m = topic.match(/^tele\/([^/]+)\/([^/]+)\/STATE$/i);
-      if (m) {
-        const device = m[2];
-        candidates.add(`tele/${device}/STATE`);
-        candidates.add(`tele/${device}/STATE`.toUpperCase());
+      const stored = canonicalizeForStorage(topic);
+      if (stored) {
+        candidates.push(stored);
       }
-
-      // Swap common customer tokens RAIL <-> BREW
-      if (/\/RAIL\//i.test(topic)) {
-        candidates.add(topic.replace(/\/RAIL\//i, '/BREW/'));
-        candidates.add(topic.replace(/\/RAIL\//i, '/BREW/').toUpperCase());
-      } else if (/\/BREW\//i.test(topic)) {
-        candidates.add(topic.replace(/\/BREW\//i, '/RAIL/'));
-        candidates.add(topic.replace(/\/BREW\//i, '/RAIL/').toUpperCase());
-      }
-
-      // Try topic without leading tele/
-      if (/^tele\//i.test(topic)) {
-        const noTele = topic.replace(/^tele\//i, '');
-        candidates.add(noTele);
-        candidates.add(noTele.toUpperCase());
-      }
-    } catch (e) {
-      // swallow
-    }
-    return Array.from(candidates);
+      // Also allow exact topic as fallback
+      candidates.push(topic);
+    } catch (e) {}
+    return candidates;
   };
 
   // Flexible lookup for label variants — topics may be stored with/without "tele/",
@@ -312,40 +294,38 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
   // set of likely permutations and return the first non-empty label found.
   const lookupPowerLabel = (topic, powerKey) => {
     if (!topic || !powerKey) return '';
-    const upKey = powerKey.toUpperCase();
-    // Build candidates by combining canonical topic variants with both key cases
-    const topicCandidates = canonicalCandidatesForTopic(topic);
-    for (const t of topicCandidates) {
-      const rawKey = `${t}|${powerKey}`;
-      const upKeyRaw = `${t}|${upKey}`;
-      if (powerLabels[rawKey] && String(powerLabels[rawKey]).trim()) return String(powerLabels[rawKey]).trim();
-      if (powerLabels[upKeyRaw] && String(powerLabels[upKeyRaw]).trim()) return String(powerLabels[upKeyRaw]).trim();
-    }
-    // As a last resort, try original topic with both key casings
-    const trial1 = `${topic}|${powerKey}`;
-    const trial2 = `${topic}|${upKey}`;
-    if (powerLabels[trial1] && String(powerLabels[trial1]).trim()) return String(powerLabels[trial1]).trim();
-    if (powerLabels[trial2] && String(powerLabels[trial2]).trim()) return String(powerLabels[trial2]).trim();
+    const pkUp = String(powerKey).toUpperCase();
+    // Only allow canonical stored form and exact topic (no legacy permutations)
+    try {
+      const stored = canonicalizeForStorage(topic);
+      if (stored) {
+        const k1 = `${stored}|${pkUp}`;
+        if (powerLabels[k1] !== undefined && String(powerLabels[k1] || '').trim().length) return String(powerLabels[k1]).trim();
+      }
+      // Direct exact match
+      const direct = `${topic}|${pkUp}`;
+      if (powerLabels[direct] !== undefined && String(powerLabels[direct] || '').trim().length) return String(powerLabels[direct]).trim();
+    } catch (e) {}
     return '';
   };
 
   // Canonicalize a topic for storage/readability before sending to the server.
   // Matches server-side normalization: strip leading tele/ or stat/, ensure
-  // SITE/DEVICE/STATE format, and uppercase SITE and DEVICE for consistency.
+  // SITE/DEVICE/STATE format with an explicit SITE. Do NOT default missing
+  // site tokens to 'BREW' — require callers to provide a full SITE/DEVICE form.
   const canonicalizeForStorage = (topic) => {
     try {
-      if (!topic || typeof topic !== 'string') return topic;
+      if (!topic || typeof topic !== 'string') return null;
       let s = String(topic).trim();
       s = s.replace(/^(tele|stat)\//i, '');
       const parts = s.split('/').filter(Boolean);
-      let site = 'BREW';
-      let device = '';
-      if (parts.length >= 2) { site = parts[0]; device = parts[1]; }
-      else if (parts.length === 1) { device = parts[0]; }
-      site = String(site).toUpperCase();
-      device = String(device).toUpperCase();
+      // Require explicit site and device
+      if (parts.length < 2) return null;
+      const site = String(parts[0] || '').toUpperCase();
+      const device = String(parts[1] || '').toUpperCase();
+      if (!site || !device) return null;
       return `${site}/${device}/STATE`;
-    } catch (e) { return topic; }
+    } catch (e) { return null; }
   };
 
   // Fetch latest STATE topics and power labels
@@ -431,25 +411,42 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
         }
       }
       const labelMap = {};
+      // Prefer server-provided canonical grouping when available
+      const serverCanonical = labelRes && labelRes.labels_by_canonical ? labelRes.labels_by_canonical : null;
+      if (serverCanonical && typeof serverCanonical === 'object') {
+        // flatten canonical map into labelMap for backward compatibility (canonical only)
+        try {
+          Object.keys(serverCanonical).forEach(can => {
+            const m = serverCanonical[can] || {};
+            Object.keys(m).forEach(pk => {
+              try {
+                const labelVal = m[pk] || '';
+                // store under canonical|POWER (canonical forms are authoritative)
+                labelMap[`${can}|${pk}`] = labelVal;
+                labelMap[`${can.toUpperCase()}|${pk}`] = labelVal;
+              } catch (e) {}
+            });
+          });
+        } catch (e) {}
+      }
       if (labelRes && labelRes.labels) {
         if (DEBUG) console.log(`AdminPortal: Received ${labelRes.labels.length} power labels`, labelRes.labels);
         labelRes.labels.forEach(l => {
           const key = `${l.topic}|${l.power_key}`;
+          // store raw topic and uppercase variant
           labelMap[key] = l.label;
           labelMap[key.toUpperCase()] = l.label;
           try {
-            const candidates = canonicalCandidatesForTopic(l.topic);
-            candidates.forEach(t => {
-              const k1 = `${t}|${l.power_key}`;
-              const k2 = `${t}|${l.power_key.toUpperCase()}`;
-              if (!labelMap[k1]) labelMap[k1] = l.label;
-              if (!labelMap[k2]) labelMap[k2] = l.label;
-              if (!labelMap[`${t.toUpperCase()}|${l.power_key}`]) labelMap[`${t.toUpperCase()}|${l.power_key}`] = l.label;
-              if (!labelMap[`${t.toUpperCase()}|${l.power_key.toUpperCase()}`]) labelMap[`${t.toUpperCase()}|${l.power_key.toUpperCase()}`] = l.label;
-            });
+            // also store canonicalized form when canonicalizeForStorage yields a value
+            const storedCanon = canonicalizeForStorage(l.topic);
+            if (storedCanon) {
+              labelMap[`${storedCanon}|${l.power_key}`] = l.label;
+              labelMap[`${storedCanon.toUpperCase()}|${l.power_key}`] = l.label;
+            }
           } catch (e) {}
         });
-      } else {
+        }
+        else {
         if (DEBUG) console.log('AdminPortal: No power labels received or invalid response:', labelRes);
       }
 
@@ -487,27 +484,26 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
               }
               return `${parts[1].toUpperCase()}/${parts[2]}`;
             }
-            // tele/<device>/STATE (legacy no slug) -> attribute to current customer
-            if (parts.length === 3 && parts[0].toLowerCase() === 'tele' && /state/i.test(parts[2])) {
-              const device = parts[1];
-              if (!device || /^(STATE|BREW|RAIL)$/i.test(String(device))) return null;
-              const slug = initial && initial.slug ? initial.slug.toUpperCase() : 'BREW';
-              return `${slug}/${device}`;
-            }
+                // tele/<device>/STATE (legacy no slug) -> legacy no-site topics are
+                // considered ambiguous. We no longer attribute missing-site topics
+                // to the current customer — require explicit site tokens instead.
+                if (parts.length === 3 && parts[0].toLowerCase() === 'tele' && /state/i.test(parts[2])) {
+                  // Do not attempt to infer a slug here; return null so callers
+                  // ignore ambiguous legacy rows.
+                  return null;
+                }
             // <slug>/<device>/STATE
             if (parts.length >= 3 && /state/i.test(parts[parts.length - 1])) {
               const devicePart = parts[1] || '';
               if (!devicePart || /^(STATE|BREW|RAIL)$/i.test(String(devicePart))) return null;
               return `${parts[0].toUpperCase()}/${parts[1]}`;
             }
-            // fallback: strip tele/ and trailing /STATE when present
+            // fallback: strip tele/ and trailing /STATE when present. Do NOT
+            // attribute single-segment device names to any slug — require
+            // explicit SITE/DEVICE form.
             let t = topic.replace(/^tele\//i, '').replace(/\/STATE$/i, '');
-            // if it's just a device (e.g. "FERM2"), attribute to current slug
             const tparts = t.split('/').filter(Boolean);
-            if (tparts.length === 1) {
-              const slug = initial && initial.slug ? initial.slug.toUpperCase() : 'BREW';
-              return `${slug}/${tparts[0]}`;
-            }
+            if (tparts.length < 2) return null;
             return `${tparts[0].toUpperCase()}/${tparts[1] || ''}`;
           } catch (e) { return null; }
         };
@@ -527,9 +523,10 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
             const slugLower = String(slugCandidate || '').toLowerCase();
 
             if (knownSlugsLower.length > 0 && slugLower && knownSlugsLower.indexOf(slugLower) === -1) {
-              // non-matching slug token — if editing BREW, treat it as BREW so we
-              // surface orphaned legacy topics; otherwise skip
-              if (initialSlugLower !== 'brew') continue;
+              // Non-matching slug token — skip topics that don't explicitly
+              // belong to the customer being edited. We no longer treat missing
+              // or mismatched slugs as BREW; only explicit matches are allowed.
+              continue;
             }
             // Final check: topic must resolve to this initial slug (case-insensitive)
             // Accept legacy tele/<device>/STATE by mapping to current initial slug.
@@ -629,6 +626,12 @@ function CustomerEditor({ initial, onCancel, onSave, onDeleted, doFetch, token }
             return next;
           } catch (e) { return prev; }
         });
+      } catch (e) {}
+      // Broadcast server-provided canonical grouping globally so other views can prefer it
+      try {
+        if (labelRes && labelRes.labels_by_canonical && typeof window !== 'undefined' && typeof window.dispatchEvent === 'function') {
+          window.dispatchEvent(new CustomEvent('brewski:power-labels-canonical', { detail: { labels_by_canonical: labelRes.labels_by_canonical, ts: Date.now() } }));
+        }
       } catch (e) {}
     } catch (e) { 
       // On error, preserve existing local powerLabels instead of clearing them.

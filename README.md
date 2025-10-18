@@ -17,6 +17,26 @@ Unified MQTT bridge + Admin/Manager web portal + React Native (Expo) client.
 
 Both are fronted by Cloudflare Tunnel -> local Node server (port 8080). Expo dev server (8081) is only used during development and no longer fronts production.
 
+````markdown
+# Brewski Platform
+
+Unified MQTT bridge + Admin/Manager web portal + React Native (Expo) client.
+
+## Components
+
+- **Node server**: HTTP/HTTPS API, WebSocket bridge, MQTT client (`server/`, entry `bin/server.js`).
+- **Expo app**: Cross‑platform dashboard + admin/manager portal (`webapp/`).
+- **Production web build**: Static export served from `server/public` (preferred) or fallback `webapp/web-build`.
+
+## Hosts / Domains
+
+| Purpose | Host |
+|---------|------|
+| API + WebSocket | https://api.brewingremote.com |
+| Public Web UI   | https://brewingremote.com |
+
+Both are fronted by Cloudflare Tunnel -> local Node server (port 8080). Expo dev server (8081) is only used during development and no longer fronts production.
+
 ## Development Quick Start
 
 ```bash
@@ -120,3 +140,45 @@ webapp/views/Landing.js    # landing with SPA-managed Manage button
 
 ## License
 Proprietary (internal use). © 2025 Brewski.
+
+----
+
+Additional local dev host configuration
+---------------------------------------
+
+To support running the client against local or remote API and WebSocket hosts without touching many files,
+the project includes a small helper at `webapp/src/hosts.js` and the following runtime/build-time overrides.
+
+Client helpers
+
+- `webapp/src/hosts.js` exposes:
+  - `API_HOST` — resolved from `window.__SERVER_FQDN` (runtime) or `process.env.SERVER_FQDN` (build-time) or falls back to `api.brewingremote.com`.
+  - `MQTT_WS_HOST` — resolved from `window.__MQTT_WS_HOST` or `process.env.MQTT_WS_HOST` or defaults to `API_HOST`.
+  - `MQTT_WS_PATH` and `MQTT_WS_LEGACY_PATH` — default to `/_ws` and `/ws` respectively.
+  - `apiUrl(path)` — helper returning an `https://` absolute URL to the API host.
+  - `wsUrl(opts)` — helper returning a `wss://` or `ws://` websocket URL.
+
+How to override (examples)
+
+- Browser temporary override (DevTools Console):
+
+  window.__SERVER_FQDN = '192.168.1.50:3000';
+  window.__MQTT_WS_HOST = '192.168.1.50:8080';
+  window.__MQTT_WS_PATH = '/_ws';
+  window.location.reload();
+
+- Build-time env (native builds / CI):
+
+  SERVER_FQDN=192.168.1.50:3000 MQTT_WS_HOST=192.168.1.50:8080 npm run start
+
+Server CORS / allowed origins
+
+- Default allowed origins derive from `process.env.SERVER_FQDN` when set.
+- Override by providing `APP_ORIGINS` (comma-separated origins list).
+- Allow localhost origins for development with `ALLOW_LOCALHOST_ORIGINS=1`.
+
+Security note: do not set `RELAX_CORS=1` in production.
+
+If you'd like, I can also:
+- Add a small dev script to inject `window.__SERVER_FQDN` automatically into the SPA HTML when running a local static server.
+- Replace any remaining hard-coded host strings across the repo with `apiUrl()` calls.

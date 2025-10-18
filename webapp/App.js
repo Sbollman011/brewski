@@ -78,6 +78,7 @@ try {
   }
 } catch (e) {}
 import { apiFetch } from './src/api';
+import { apiUrl } from './src/hosts';
 
 // Error boundary to catch rendering errors and provide a friendly fallback UI
 class ErrorBoundary extends React.Component {
@@ -185,7 +186,7 @@ export default function App() {
       // On native (no window, no localStorage), apiFetch should still send Authorization, but defensively retry with explicit token
       if (res && res.status === 401 && tokenRef.current) {
         try {
-          res = await fetch('https://api.brewingremote.com/admin/api/me', { headers: { 'Authorization': 'Bearer ' + tokenRef.current, 'Accept': 'application/json' } });
+          res = await fetch(apiUrl('/admin/api/me'), { headers: { 'Authorization': 'Bearer ' + tokenRef.current, 'Accept': 'application/json' } });
         } catch (_) {}
       }
       if (!res || !res.ok) return;

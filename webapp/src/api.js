@@ -1,3 +1,5 @@
+import { API_HOST, apiUrl } from './hosts';
+
 export async function apiFetch(path, opts = {}) {
   // default options
   const init = Object.assign({ headers: {} }, opts);
@@ -6,7 +8,8 @@ export async function apiFetch(path, opts = {}) {
     if (token) init.headers['Authorization'] = `Bearer ${token}`;
   } catch (e) { /* ignore missing localStorage */ }
 
-  const API_HOST = 'api.brewingremote.com'; // central API host
+  // Use API_HOST from centralized hosts.js
+  const API_HOST = API_HOST || 'api.brewingremote.com'; // fallback for environments that ignore imports
 
   // Normalize path -> always prefix with leading slash for join safety
   let rel = typeof path === 'string' ? path : '';
@@ -22,25 +25,25 @@ export async function apiFetch(path, opts = {}) {
       // If we are on brewingremote.com (app host) use same-origin to avoid CORS and leverage tunnel.
       // If we're on api host OR a mobile/native runtime (non-web) then use the central API host.
       if (isCentral) {
-        finalPath = `https://${API_HOST}${rel}`;
+        finalPath = apiUrl(rel);
       } else {
         // Force absolute URL for login endpoint so we never accidentally
         // fetch the SPA HTML when requesting JSON.
         if (rel.startsWith('/admin/api/login') || rel.startsWith('/admin/api/register') || rel.startsWith('/admin/api/forgot') || rel.startsWith('/admin/api/reset')) {
-          finalPath = `https://${API_HOST}${rel}`;
+          finalPath = apiUrl(rel);
         }
         // Also route any central API paths to the API host to avoid same-origin
         // HTML responses when the SPA server doesn't serve API routes.
         else if (rel.startsWith('/admin/api/') || rel.startsWith('/api/')) {
           // For authenticated admin API calls and public API calls prefer the API host
-          finalPath = `https://${API_HOST}${rel}`;
+          finalPath = apiUrl(rel);
         } else {
           finalPath = rel; // same-origin for non-api paths
         }
       }
     } else {
       // native context -> central host
-      finalPath = `https://${API_HOST}${rel}`;
+      finalPath = apiUrl(rel);
     }
   } catch (e) {
     finalPath = rel; // fallback same-origin

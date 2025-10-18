@@ -193,8 +193,9 @@ class NextMqttClient extends EventEmitter {
               if (typeof ingestNumeric === 'function') {
                 // Derive a sensor key: use the topic without trailing /Sensor
                 const baseKey = topic.replace(/\/Sensor$/i, '');
-                // Dynamic customer resolution: extract level 2 segment and map to customer by slug
-                let customerId = Number(process.env.DEFAULT_CUSTOMER_ID || 1); // fallback
+                // Dynamic customer resolution: extract level 2 segment and map to customer by slug.
+                // Require an explicit slug — do not fall back to a default customer like 'BREW'.
+                let customerId = null;
                 const topicParts = topic.split('/');
                 if (topicParts.length >= 2) {
                   const potentialSlug = topicParts[1]; // level 2 segment (0-indexed, so index 1)
@@ -204,15 +205,16 @@ class NextMqttClient extends EventEmitter {
                       const customer = findCustomerBySlug(potentialSlug);
                       if (customer && customer.id) {
                         customerId = customer.id;
-                      } else {
-                        // If no customer found for slug, try to find/create BREW customer as catch-all
-                        const brewCustomer = findCustomerBySlug('BREW');
-                        if (brewCustomer && brewCustomer.id) customerId = brewCustomer.id;
                       }
-                    } catch (e) { /* auth module unavailable, use fallback */ }
+                    } catch (e) { /* auth module unavailable or lookup failed */ }
                   }
                 }
-                ingestNumeric({ customerId, key: baseKey, topicKey: baseKey, value: numeric, raw: rawForStore });
+                if (!customerId) {
+                  // No explicit customer mapping — skip ingestion under new policy
+                  if (this.DEBUG) this.dlog('Skipping ingestion: no explicit customer slug for topic', topic);
+                } else {
+                  ingestNumeric({ customerId, key: baseKey, topicKey: baseKey, value: numeric, raw: rawForStore });
+                }
               }
             }
           }

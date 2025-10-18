@@ -50,34 +50,29 @@ function startHttpServer(opts = {}) {
       if (url.pathname === '/api/latest' && req.method === 'GET') {
         setSecurityHeadersLocal();
         try {
-          // Auth: Bearer JWT or bridge token
+          // Auth: Bearer JWT only. Legacy bridge-token shortcuts removed.
           const authHeader = (req.headers['authorization'] || '').toString();
           const parts = authHeader.split(' ');
           let token = null;
-            if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
+          if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
           if (!token) token = url.searchParams.get('token');
-          const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
           let user = null;
           if (token) {
-            if (BRIDGE_TOKEN && token === BRIDGE_TOKEN) {
-              user = { id: 'bridge', customer_id: 1, is_admin: 1 };
-            } else {
-              try {
-                const { verifyToken, findUserById } = require('./lib/auth');
-                const claims = verifyToken(token);
-                if (claims) {
-                  const u = findUserById(claims.sub);
-                  if (u) user = u;
-                }
-              } catch (e) {}
-            }
+            try {
+              const { verifyToken, findUserById } = require('./lib/auth');
+              const claims = verifyToken(token);
+              if (claims) {
+                const u = findUserById(claims.sub);
+                if (u) user = u;
+              }
+            } catch (e) {}
           }
-          if (!user) {
+          if (!user || !user.customer_id) {
             res.writeHead(401, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
             return;
           }
-          const customerId = Number(user.customer_id || 1);
+          const customerId = Number(user.customer_id);
           const Database = require('better-sqlite3');
           const dbPath = process.env.BREWSKI_DB_FILE || process.env.BREWSKI_DB_PATH || path.join(__dirname, 'brewski.sqlite3');
           const db = new Database(dbPath);
@@ -179,12 +174,54 @@ function startHttpServer(opts = {}) {
             Object.keys(latestMap).forEach(k => latestStats.push(latestMap[k]));
           } catch (e) { /* ignore whole-lot errors */ }
 
+          // Build labels_by_canonical map from power_labels table for this customer
+          let labelsByCanonical = {};
+          try {
+            try {
+              const plRows = db.prepare('SELECT topic, power_key, label FROM power_labels WHERE customer_id = ?').all(customerId);
+              for (const r of plRows) {
+                try {
+                  const t = String(r.topic || '').replace(/\/(STATE)?$/i, '').replace(/^(tele|stat)\//i, '');
+                  const parts = t.split('/').filter(Boolean).map(p => String(p).toUpperCase());
+                  if (parts.length < 2) continue;
+                  const base = `${parts[0]}/${parts[1]}`;
+                  if (!labelsByCanonical[base]) labelsByCanonical[base] = {};
+                  labelsByCanonical[base][String(r.power_key || '').toUpperCase()] = r.label || '';
+                } catch (e) {}
+              }
+            } catch (e) {}
+          } catch (e) {}
+
+          // Build sensor_bases set from sensors table so clients can derive dbSensorBases
+          let sensorBases = [];
+          try {
+            try {
+              const srows = db.prepare('SELECT topic_key, `key`, sensor_key FROM sensors WHERE customer_id = ?').all(customerId);
+              const baseSet = new Set();
+              for (const r of srows) {
+                try {
+                  const topic = r.topic_key || r.sensor_key || r.key || '';
+                  if (!topic) continue;
+                  let s = String(topic).trim();
+                  s = s.replace(/^(tele|stat)\//i, '');
+                  s = s.replace(/\/(STATE|SENSOR|RESULT)$/i, '');
+                  const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
+                  if (parts.length >= 2) baseSet.add(`${parts[0]}/${parts[1]}`);
+                  else if (parts.length === 1) baseSet.add(`BREW/${parts[0]}`);
+                } catch (e) {}
+              }
+              sensorBases = Array.from(baseSet);
+            } catch (e) {}
+          } catch (e) {}
+
           res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' });
           res.end(JSON.stringify({ 
             ok: true, 
             sensors: rows,
             latest_stats: latestStats,
-            customer: customerInfo || { slug: 'default', name: 'Default Customer' }
+            customer: customerInfo || { slug: 'default', name: 'Default Customer' },
+            labels_by_canonical: labelsByCanonical,
+            sensor_bases: sensorBases
           }));
           try { db.close(); } catch (e) {}
         } catch (e) {
@@ -195,16 +232,10 @@ function startHttpServer(opts = {}) {
       }
 
       if (url.pathname === '/info') {
-        const BRIDGE_TOKEN = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : process.env.BRIDGE_TOKEN || null;
-        const auth = (req.headers['authorization'] || '').split(' ')[1] || url.searchParams.get('token');
+        // Return standard server info. No legacy bridge-token debug flag.
         setSecurityHeadersLocal();
-        if (BRIDGE_TOKEN && auth === BRIDGE_TOKEN) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ server: 'brewski', ok: true, debug: true }));
-        } else {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ server: 'brewski', ok: true }));
-        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ server: 'brewski', ok: true }));
         return;
       }
 
@@ -281,11 +312,9 @@ function startHttpServer(opts = {}) {
               if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
               if (!token) token = url.searchParams && url.searchParams.get('token');
 
-              // Allow a legacy bridge token via env
-              const BRIDGE = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
+              // Require a valid JWT to access the admin SPA index
               let ok = false;
-              if (BRIDGE && token === BRIDGE) ok = true;
-              if (!ok && token) {
+              if (token) {
                 try {
                   const { verifyToken } = require('./lib/auth');
                   const claims = verifyToken(token);
@@ -373,13 +402,8 @@ function startHttpServer(opts = {}) {
             let token = null;
             if (parts.length === 2 && /^Bearer$/i.test(parts[0])) token = parts[1];
             if (!token) token = url.searchParams && url.searchParams.get('token');
-            const BRIDGE = process.env.DISABLE_BRIDGE_TOKEN === '1' ? null : (process.env.BRIDGE_TOKEN || null);
             let ok = false;
-            if (BRIDGE && token === BRIDGE) {
-              // legacy bridge token — allow (bridge considered privileged)
-              ok = true;
-            }
-            if (!ok && token) {
+            if (token) {
               try {
                 const { verifyToken, findUserById } = require('./lib/auth');
                 const claims = verifyToken(token);

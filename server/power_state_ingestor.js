@@ -26,7 +26,7 @@ function extractSlugFromTopic(topic) {
 // Canonicalize incoming topic strings into SITE/DEVICE/STATE
 // - strip leading tele/ or stat/
 // - remove any trailing STATE token(s)
-// - default site to BREW when omitted
+// - require explicit site (do NOT default to BREW)
 // - uppercase site/device
 function canonicalizeTopic(raw) {
   try {
@@ -35,15 +35,10 @@ function canonicalizeTopic(raw) {
     s = s.replace(/^(tele|stat)\//i, '');
     const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
     while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
-    if (parts.length === 0) return raw;
-    let site = 'BREW';
-    let device = '';
-    if (parts.length === 1) {
-      device = parts[0];
-    } else {
-      site = parts[0] || 'BREW';
-      device = parts[1] || '';
-    }
+    // Require explicit site; if only device is present (legacy no-site), return null
+    if (parts.length < 2) return null;
+    let site = parts[0];
+    let device = parts[1] || '';
     site = String(site).toUpperCase();
     device = String(device).toUpperCase();
     return `${site}/${device}/STATE`;
@@ -127,10 +122,6 @@ function startPowerStateIngestor() {
   try { if (!process.env.DEBUG_BRIDGE) process.env.DEBUG_BRIDGE = '1'; } catch (e) {}
   const customerMap = getCustomerSlugMap();
   let customerMapLocal = customerMap;
-  const catchAllId = customerMapLocal['BREW'];
-  if (!catchAllId) {
-    return;
-  }
   mqttClient.registerMessageHandler(({ topic, payload }) => {
     // Handle both tele/.../STATE JSON messages and per-key stat/.../POWER or stat/.../POWER1 topics
     let raw = null;
@@ -176,8 +167,13 @@ function startPowerStateIngestor() {
           // Synthesize a STATE-like raw object so downstream logic can reuse canonical handlers
           raw = {};
           raw[powerKey] = isOn ? 'ON' : 'OFF';
-          // rewrite topic into canonical tele/<site?>/<device>/STATE form for ingestion
-          const canonicalTopic = site ? `tele/${site}/${device}/STATE` : `tele/${device}/STATE`;
+          // Only synthesize a canonical topic if an explicit site is present.
+          if (!site) {
+            // Legacy no-site stat topic; ignore under new policy
+            return;
+          }
+          // rewrite topic into canonical tele/<site>/<device>/STATE form for ingestion
+          const canonicalTopic = `tele/${site}/${device}/STATE`;
           if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: stat->STATE synth', { incoming: topic, canonicalTopic, powerKey, payload, synthesized: raw });
           topic = canonicalTopic;
           fromStat = true;
@@ -189,47 +185,25 @@ function startPowerStateIngestor() {
       return;
     }
   const slug = extractSlugFromTopic(topic);
-    // ensure we match slug keys case-insensitively by using uppercase keys
-    let customerId = catchAllId;
-    try {
-      if (slug) {
-        // refresh the map if we miss (handles newly-created customers without restart)
-        if (!customerMapLocal[slug]) {
-          customerMapLocal = getCustomerSlugMap();
-        }
-        customerId = (slug && customerMapLocal[slug]) ? customerMapLocal[slug] : catchAllId;
-      }
-    } catch (e) { customerId = catchAllId; }
+  // Require explicit site (slug) and a matching customer mapping; otherwise ignore
+  if (!slug) return;
+  let customerId = null;
+  try {
+    if (!customerMapLocal[slug]) customerMapLocal = getCustomerSlugMap();
+    customerId = (slug && customerMapLocal[slug]) ? customerMapLocal[slug] : null;
+  } catch (e) { customerId = null; }
+  if (!customerId) return;
     Object.keys(raw).forEach(k => {
         if (/^POWER(\d*)$/i.test(k)) {
           const val = raw[k] === 'ON' ? 1 : 0;
           // Use canonical topic as the sensor key/topicKey so we create/look up
           // a consistent sensor row instead of many legacy variants.
           let canonical = canonicalizeTopic(topic);
+          if (!canonical) return; // skip legacy no-site variants
           // Use the same sensor key that upsertPowerState/ingestNumeric will write: strip trailing /STATE
           let keyBase = String(canonical).replace(/\/STATE$/i, '');
 
-          // Defensive normalization: if the incoming topic includes an explicit site
-          // (e.g., RAIL/FERM2) but we already have a canonical BREW/<device> sensor row,
-          // prefer the existing BREW/<device> so we don't create a separate SITE/<device>
-          // row for legacy no-site devices. This keeps legacy devices namespaced under
-          // BREW and avoids collisions across tenants.
-          try {
-            const parts = String(keyBase || '').split('/').filter(Boolean);
-            const device = parts.length ? parts[parts.length - 1] : null;
-            if (device && parts.length > 1) {
-              const brewKey = `BREW/${device}`;
-              // case-insensitive search for existing BREW/<device>
-              try {
-                const existing = db.prepare('SELECT id FROM sensors WHERE UPPER(key)=? LIMIT 1').get(String(brewKey).toUpperCase());
-                if (existing && existing.id) {
-                  canonical = `${brewKey}/STATE`;
-                  keyBase = brewKey;
-                  if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: remapping to existing BREW row', { incoming: topic, brewKey, canonical });
-                }
-              } catch (e) { /* ignore DB lookup errors */ }
-            }
-          } catch (e) { /* ignore normalization errors */ }
+          // (Removed legacy remapping to BREW/<device> — we now require explicit site and keep site-scoped keys.)
           // Read last_value and last_ts for debugging to decide why we may skip upserts
           let lastRow = null;
           try {

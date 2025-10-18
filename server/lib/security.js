@@ -3,7 +3,10 @@ const path = require('path');
 // CORS whitelist
 // Default allowed origins; can be overridden via APP_ORIGINS. Note: localhost
 // is only allowed when ALLOW_LOCALHOST_ORIGINS=1 (dev only).
-const allowedOrigins = (process.env.APP_ORIGINS || 'https://api.brewingremote.com,https://brewingremote.com')
+// If SERVER_FQDN is configured prefer that for default origins.
+const defaultFqdn = process.env.SERVER_FQDN || 'api.brewingremote.com';
+const defaultOrigins = [`https://${defaultFqdn}`, `https://${defaultFqdn.replace(/^api\./, '')}`];
+const allowedOrigins = (process.env.APP_ORIGINS || defaultOrigins.join(','))
   .split(',').map(s => s.trim()).filter(Boolean);
 
 // Optional: enable a relaxed CORS mode for debugging. When RELAX_CORS=1 the
