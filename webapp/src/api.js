@@ -1,4 +1,4 @@
-import { API_HOST, apiUrl } from './hosts';
+import { API_HOST as IMPORTED_API_HOST, apiUrl } from './hosts';
 
 export async function apiFetch(path, opts = {}) {
   // default options
@@ -8,8 +8,8 @@ export async function apiFetch(path, opts = {}) {
     if (token) init.headers['Authorization'] = `Bearer ${token}`;
   } catch (e) { /* ignore missing localStorage */ }
 
-  // Use API_HOST from centralized hosts.js
-  const API_HOST = API_HOST || 'api.brewingremote.com'; // fallback for environments that ignore imports
+  // Resolve API_HOST from the imported hosts module, with a safe fallback
+  const resolvedApiHost = IMPORTED_API_HOST || 'api.brewingremote.com';
 
   // Normalize path -> always prefix with leading slash for join safety
   let rel = typeof path === 'string' ? path : '';
@@ -21,7 +21,7 @@ export async function apiFetch(path, opts = {}) {
     const isWeb = (typeof window !== 'undefined' && typeof window.document !== 'undefined');
     if (isWeb) {
       const host = window.location.hostname || '';
-      const isCentral = host === API_HOST;
+  const isCentral = host === resolvedApiHost;
       // If we are on brewingremote.com (app host) use same-origin to avoid CORS and leverage tunnel.
       // If we're on api host OR a mobile/native runtime (non-web) then use the central API host.
       if (isCentral) {
@@ -43,7 +43,7 @@ export async function apiFetch(path, opts = {}) {
       }
     } else {
       // native context -> central host
-      finalPath = apiUrl(rel);
+  finalPath = apiUrl(rel);
     }
   } catch (e) {
     finalPath = rel; // fallback same-origin

@@ -89,6 +89,11 @@ function handleAdminApi(req, res, url) {
     if (url.pathname === '/admin/api/login' && req.method === 'POST') {
       parseBodyJson(req, res, (err, obj) => {
         if (err) { res.writeHead(500); res.end('server error'); return; }
+        // Log the arrival of a login attempt (do NOT log passwords)
+        try {
+          const originHdr = req.headers && (req.headers.origin || req.headers.referer) ? (req.headers.origin || req.headers.referer) : '<none>';
+          console.log('[admin-api] login attempt username=', obj && obj.username ? obj.username : '<missing>', 'origin=', originHdr);
+        } catch (e) {}
         if (!obj.username || !obj.password) { res.writeHead(400); res.end('username,password required'); return; }
         const user = findUserByUsername(obj.username);
         if (!user || !verifyPassword(user, obj.password)) { res.writeHead(401); res.end('invalid'); return; }
@@ -391,8 +396,20 @@ function handleAdminApi(req, res, url) {
                     if (String(storedCanon).toUpperCase() === String(incomingCanon).toUpperCase()) {
                       if (r.label && String(r.label).trim().length > 0) {
                         try { console.log('[admin-api] SKIP blank label upsert due to existing canonical match with non-empty label user=', me && me.username ? me.username : me && me.id ? me.id : '<unknown>', 'customer=', targetCustomerId, 'topic=', topic, 'power_key=', power_key, 'stored_id=', r.id); } catch (e) {}
-                        res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ ok: true, skipped: true }));
+                        // If incoming label is blank, skip upsert unless server explicitly
+                        // allows auto-creating blank placeholder labels via ALLOW_AUTO_LABELS=1.
+                        if (process.env.ALLOW_AUTO_LABELS === '1') {
+                          res.writeHead(200, { 'Content-Type': 'application/json' });
+                          res.end(JSON.stringify({ ok: true, skipped: true }));
+                          try { db.close && db.close(); } catch (e) {}
+                          return;
+                        } else {
+                          // Default: reject blank label upsert to avoid creating placeholder rows
+                          res.writeHead(400, { 'Content-Type': 'application/json' });
+                          res.end(JSON.stringify({ error: 'blank_label_not_allowed' }));
+                          try { db.close && db.close(); } catch (e) {}
+                          return;
+                        }
                         try { db.close && db.close(); } catch (e) {}
                         return;
                       }
@@ -482,18 +499,8 @@ function handleAdminApi(req, res, url) {
           const candidates = db.prepare('SELECT id, topic, power_key FROM power_labels WHERE customer_id = ?').all(targetCustomerId);
           // reuse canonicalizeTopic for per-row normalization
           // Consider equivalent canonical topics where site token may differ
-          const swapSite = (t) => {
-            try {
-              if (!t || typeof t !== 'string') return t;
-              if (t.startsWith('BREW/')) return t.replace(/^BREW\//, 'RAIL/');
-              if (t.startsWith('RAIL/')) return t.replace(/^RAIL\//, 'BREW/');
-              return t;
-            } catch (e) { return t; }
-          };
-
-          const targets = new Set();
-          targets.add(String(canonicalTopic));
-          try { targets.add(String(swapSite(canonicalTopic))); } catch (e) {}
+          // Treat canonical topics literally; do not consider BREW/RAIL interchangeable.
+          const targets = new Set([String(canonicalTopic)]);
 
           let deletedCount = 0;
           for (const row of candidates) {

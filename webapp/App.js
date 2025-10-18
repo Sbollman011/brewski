@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { Animated, Easing } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { View, Text, StyleSheet, Pressable, TextInput, Alert } from 'react-native';
@@ -166,6 +167,26 @@ export default function App() {
   const intendedScreenRef = useRef(null); // remembers where user wanted to go pre-auth
   const [customerInfo, setCustomerInfo] = useState(null); // customer info for dynamic header title
 
+  // Spinner for dashboard loading (must be after state declarations)
+  const spinAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (screen === 'dashboard' && token && !customerInfo) {
+      ensureUserLoaded(true);
+      Animated.loop(
+        Animated.timing(spinAnim, {
+          toValue: 1,
+          duration: 1000,
+          useNativeDriver: true,
+          easing: Easing.linear,
+        })
+      ).start();
+    }
+  }, [screen, token, customerInfo]);
+  const spin = spinAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0deg', '360deg'],
+  });
+
   // Dynamic header title based on customer, fallback to default
   const getHeaderTitle = () => {
     if (customerInfo && customerInfo.name) {
@@ -195,6 +216,24 @@ export default function App() {
       if (js && js.user) {
         setCachedUser(js.user);
         try { safeLocal.setItem('brewski_me', JSON.stringify(js.user)); } catch (e) {}
+        // Hydrate customerInfo if present
+        if (js.customer) {
+          setCustomerInfo(js.customer);
+        } else if (js.user && js.user.customer) {
+          setCustomerInfo(js.user.customer);
+        } else if (js.user && js.user.customer_id) {
+          // Fetch customer object if only customer_id is present
+          try {
+            const cres = await apiFetch(`/admin/api/customers/${encodeURIComponent(js.user.customer_id)}`);
+            if (cres && cres.ok) {
+              let cjs = null;
+              try { cjs = await cres.json(); } catch (e) { cjs = null; }
+              if (cjs && cjs.customer) {
+                setCustomerInfo(cjs.customer);
+              }
+            }
+          } catch (e) { /* swallow */ }
+        }
       }
     } catch (e) {
       // swallow
@@ -406,36 +445,7 @@ export default function App() {
   }, []);
 
   // Crash banner state and loader
-  const [savedCrash, setSavedCrash] = useState(null);
-  useEffect(() => {
-    let mounted = true;
-    readSavedCrash().then(r => { if (mounted) setSavedCrash(r); }).catch(() => {});
-    return () => { mounted = false; };
-  }, []);
-
-  const CrashBanner = ({ payload }) => {
-    if (!payload) return null;
-    const summary = payload.message ? String(payload.message).slice(0, 120) : 'Saved crash payload';
-    return (
-      <View style={{ position: 'absolute', right: 12, top: 12, zIndex: 9999 }}>
-        <View style={{ backgroundColor: '#fff3cd', borderColor: '#ffeeba', borderWidth: 1, padding: 8, borderRadius: 8, maxWidth: 420 }}>
-          <Text style={{ fontSize: 12, color: '#856404', fontWeight: '700' }}>Last crash detected</Text>
-          <Text style={{ fontSize: 11, color: '#856404', marginTop: 6 }}>{summary}</Text>
-          <View style={{ flexDirection: 'row', marginTop: 8, gap: 8 }}>
-            <Pressable onPress={async () => { try { const full = JSON.stringify(payload, null, 2); if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) { await navigator.clipboard.writeText(full); Alert.alert && Alert.alert('Copied crash payload'); } else if (Platform.OS !== 'web' && NativeAsyncStorage) { try { await NativeAsyncStorage.setItem('__brewski_temp_copy', full); Alert.alert && Alert.alert('Copied to device storage'); } catch (e) {} } } catch (e) {} }} style={{ backgroundColor: '#1976d2', padding: 6, borderRadius: 6 }}>
-              <Text style={{ color: '#fff', fontSize: 12 }}>Copy</Text>
-            </Pressable>
-            <Pressable onPress={async () => { try { Alert.alert && Alert.alert('Crash details', (payload.stack || payload.info || payload.message) + '\n\nTimestamp: ' + new Date(payload.ts).toISOString()); } catch (e) {} }} style={{ backgroundColor: '#6c757d', padding: 6, borderRadius: 6 }}>
-              <Text style={{ color: '#fff', fontSize: 12 }}>View</Text>
-            </Pressable>
-            <Pressable onPress={async () => { try { const ok = await clearSavedCrash(); if (ok) { setSavedCrash(null); Alert.alert && Alert.alert('Cleared'); } } catch (e) {} }} style={{ backgroundColor: '#c82333', padding: 6, borderRadius: 6 }}>
-              <Text style={{ color: '#fff', fontSize: 12 }}>Clear</Text>
-            </Pressable>
-          </View>
-        </View>
-      </View>
-    );
-  };
+  // Crash banner and state removed as requested
 
   // On web, if the path is /manage, open the manager portal if token maps to admin or manager
   useEffect(() => {
@@ -573,8 +583,7 @@ export default function App() {
   return (
     <ErrorBoundary onReset={() => { try { handleLogout(); if (typeof window !== 'undefined' && window.location) window.location.reload(); } catch (e) {} }}>
     <SafeAreaProvider>
-      {/* Crash banner: shows persisted crash payload from previous runs (native or web) */}
-      {savedCrash ? <CrashBanner payload={savedCrash} /> : null}
+      {/* Crash banner removed as requested */}
       <StatusBar style="light" backgroundColor="#1b5e20" />
       <SafeAreaView edges={["top"]} style={[styles.topInset, { backgroundColor: '#1b5e20' }]} />
       <SafeAreaView style={styles.root} edges={["left", "right", "bottom"]}>
@@ -671,7 +680,16 @@ export default function App() {
             }} onForgot={() => setScreen('forgot')} />}
             {screen === 'forgot' && !token && <ForgotPasswordScreen onBack={() => setScreen('login')} />}
             {screen === 'reset' && !token && <ResetPasswordScreen initialToken={initialResetToken} onBack={() => setScreen('login')} />}
-            {screen === 'dashboard' && token && <Dashboard token={token} onCustomerLoaded={setCustomerInfo} />}
+            {screen === 'dashboard' && token && (
+              !customerInfo ? (
+                <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', paddingTop: 80 }}>
+                  <Animated.View style={{ width: 48, height: 48, borderRadius: 24, borderWidth: 4, borderColor: '#eee', borderTopColor: '#4caf50', marginBottom: 12, transform: [{ rotate: spin }] }} />
+                  <Text style={{ color: '#444', fontSize: 16 }}>Loading dashboard…</Text>
+                </View>
+              ) : (
+                <Dashboard token={token} onCustomerLoaded={setCustomerInfo} />
+              )
+            )}
             {screen === 'admin' && token && (
               hasManageAccess ? (
                 <AdminPortal currentUser={cachedUser} loadingUser={userLoading} token={token} />

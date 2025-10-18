@@ -1,3 +1,54 @@
+// In-flight promise caches for deduping user and latest snapshot fetches
+const _inflightFetchMe = { promise: null, result: null };
+const _inflightFetchLatest = { promise: null, result: null };
+
+// Helper to fetch /admin/api/me with deduplication
+async function fetchMeDedupe(token, doApiFetch) {
+  if (_inflightFetchMe.result) return _inflightFetchMe.result;
+  if (_inflightFetchMe.promise) return _inflightFetchMe.promise;
+  _inflightFetchMe.promise = (async () => {
+    let res = null;
+    try {
+      res = await doApiFetch('/admin/api/me', { headers: token ? { Authorization: `Bearer ${token}`, Accept: 'application/json' } : undefined });
+      if (res && res.ok) {
+        const js = await res.json();
+        _inflightFetchMe.result = js;
+        return js;
+      }
+    } catch (e) {}
+    _inflightFetchMe.result = null;
+    return null;
+  })();
+  try {
+    return await _inflightFetchMe.promise;
+  } finally {
+    _inflightFetchMe.promise = null;
+  }
+}
+
+// Helper to fetch /api/latest with deduplication (if used)
+async function fetchLatestDedupe(token, doApiFetch) {
+  if (_inflightFetchLatest.result) return _inflightFetchLatest.result;
+  if (_inflightFetchLatest.promise) return _inflightFetchLatest.promise;
+  _inflightFetchLatest.promise = (async () => {
+    let res = null;
+    try {
+      res = await doApiFetch('/api/latest', { headers: token ? { Authorization: `Bearer ${token}`, Accept: 'application/json' } : undefined });
+      if (res && res.ok) {
+        const js = await res.json();
+        _inflightFetchLatest.result = js;
+        return js;
+      }
+    } catch (e) {}
+    _inflightFetchLatest.result = null;
+    return null;
+  })();
+  try {
+    return await _inflightFetchLatest.promise;
+  } finally {
+    _inflightFetchLatest.promise = null;
+  }
+}
 import React, { useEffect, useState, useRef, useMemo } from 'react';
 import { apiFetch } from '../src/api';
 import { API_HOST, MQTT_WS_HOST, MQTT_WS_PATH, MQTT_WS_LEGACY_PATH, apiUrl, wsUrl } from '../src/hosts';
@@ -53,9 +104,15 @@ let DEBUG = false;
 // Simple module-level logger to avoid runtime ReferenceErrors when debug helpers
 // are invoked before the Dashboard component mounts. This forces console output
 // (no runtime gating) so logs always appear while we diagnose issues.
-const brewskiLog = (...args) => { try { console.log('brewski:', ...args); } catch (e) {} };
 // Ensure legacy `debug(...)` calls (leftover in some places) don't crash the app.
 const debug = (...args) => { try { console.log('debug:', ...args); } catch (e) {} };
+// Toggle to control whether the dashboard will automatically persist discovered
+// canonical bases and placeholder power labels back to the server. Default is
+// true to enable production-like behavior where discovered bases become
+// authoritative in the topics DB. Developers may override by setting
+// `window.__BREWSKI_ENABLE_AUTO_PERSIST__ = false` in the console for testing.
+const ENABLE_AUTO_PERSIST = (typeof window !== 'undefined' && typeof window.__BREWSKI_ENABLE_AUTO_PERSIST__ !== 'undefined') ? !!window.__BREWSKI_ENABLE_AUTO_PERSIST__ : true;
+const brewskiLog = (...args) => { try { console.log('brewski:', ...args); } catch (e) {} };
 // Detect React Native at module load time and provide a default API host
 const IS_REACT_NATIVE = (() => { try { return (typeof navigator !== 'undefined' && navigator.product === 'ReactNative'); } catch (e) { return false; } })();
 const DEFAULT_API_HOST = API_HOST || 'api.brewingremote.com';
@@ -104,8 +161,8 @@ async function fetchPowerLabels(token) {
 
       // Direct fetch to canonical API host (works in React Native and other hosts)
       const API_HOST = DEFAULT_API_HOST || 'api.brewingremote.com';
-      const adminUrl = `https://${API_HOST}/admin/api/power-labels`;
-      const publicUrl = `https://${API_HOST}/api/power-labels`;
+  const adminUrl = apiUrl('/admin/api/power-labels');
+  const publicUrl = apiUrl('/api/power-labels');
 
       // Try admin endpoint with Authorization header first
       try {
@@ -205,34 +262,10 @@ function normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, cus
       if (!device || /^(STATE|BREW|RAIL)$/i.test(String(device)) || String(device).toUpperCase() === String(site).toUpperCase()) {
         return null;
       }
-      if (site.toUpperCase() !== 'BREW') {
-        return metric ? `${site}/${device}/${metric}` : `${site}/${device}`;
-      }
-      // If site is BREW, see if a non-BREW variant exists in dbSensorBases or gMeta
-      try {
-        if (dbSensorBases && dbSensorBases.size) {
-          for (const b of Array.from(dbSensorBases)) {
-            if (!b) continue;
-            const bp = String(b).split('/').filter(Boolean);
-            if (bp.length >= 2 && bp[1].toUpperCase() === device.toUpperCase() && bp[0].toUpperCase() !== 'BREW') {
-              return bp.length >= 3 ? `${bp[0]}/${bp[1]}/${bp[2]}` : `${bp[0]}/${bp[1]}`;
-            }
-          }
-        }
-      } catch (e) {}
-      try {
-        if (gMeta) {
-          for (const k of Object.keys(gMeta || {})) {
-            if (!k) continue;
-            const kp = String(k).split('/').filter(Boolean);
-            if (kp.length >= 2 && kp[1].toUpperCase() === device.toUpperCase() && kp[0].toUpperCase() !== 'BREW') {
-              return kp.length >= 3 ? `${kp[0]}/${kp[1]}/${kp[2]}` : `${kp[0]}/${kp[1]}`;
-            }
-          }
-        }
-      } catch (e) {}
-  // fallback: preserve BREW/device (if site explicitly BREW was present)
-  return metric ? `${site}/${device}/${metric}` : `${site}/${device}`;
+      // If site is non-BREW, accept it. If site is BREW, do not attempt to
+      // substitute a non-BREW variant from db/gMeta; preserve the explicit
+      // BREW site as provided and let server-side canonicalization be authoritative.
+      return metric ? `${site}/${device}/${metric}` : `${site}/${device}`;
     }
 
     // If single-segment or tele/stat legacy, extract device and prefer discovered sites
@@ -247,27 +280,9 @@ function normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, cus
         if (String(device).toUpperCase() === String(maybeSite).toUpperCase()) return null;
         return `${maybeSite}/${device}`;
       }
-      // Search DB/gMeta for a preferred non-BREW site
-      try {
-        if (dbSensorBases && dbSensorBases.size) {
-          for (const b of Array.from(dbSensorBases)) {
-            if (!b) continue;
-            const bp = String(b).split('/').filter(Boolean);
-            if (bp.length >= 2 && bp[1].toUpperCase() === device.toUpperCase() && bp[0].toUpperCase() !== 'BREW') return bp.length >= 3 ? `${bp[0]}/${bp[1]}/${bp[2]}` : `${bp[0]}/${bp[1]}`;
-          }
-        }
-      } catch (e) {}
-      try {
-        if (gMeta) {
-          for (const k of Object.keys(gMeta || {})) {
-            if (!k) continue;
-            const kp = String(k).split('/').filter(Boolean);
-            if (kp.length >= 2 && kp[1].toUpperCase() === device.toUpperCase() && kp[0].toUpperCase() !== 'BREW') return kp.length >= 3 ? `${kp[0]}/${kp[1]}/${kp[2]}` : `${kp[0]}/${kp[1]}`;
-          }
-        }
-      } catch (e) {}
-
-  // Prefer explicit mode/customerSlug if available
+      // Prefer explicit mode/customerSlug if available. Do not attempt to
+      // infer a non-BREW site from DB or gMeta here; that introduces implicit
+      // legacy fallbacks.
       if (!device || /^(STATE|BREW|RAIL)$/i.test(String(device))) return null;
   // When no site is known, prefer mode/customerSlug if provided. If neither
   // is available, return null to indicate a canonical base cannot be determined.
@@ -364,6 +379,19 @@ function computeGaugeParams(baseKey, meta, sensorVal) {
 }
 
 export default function Dashboard({ token, onCustomerLoaded }) {
+  // ...existing code...
+
+  // ...existing code...
+
+  // ...existing code...
+
+  // DEBUG: Log key state for diagnosing empty dashboard (after all state/memo declarations)
+  if (typeof window !== 'undefined') {
+    try { console.log('[Dashboard DEBUG] dbSensorBases:', Array.from(dbSensorBases)); } catch (e) {}
+    try { console.log('[Dashboard DEBUG] deviceList:', deviceList); } catch (e) {}
+    try { console.log('[Dashboard DEBUG] filteredDevices:', filteredDevices); } catch (e) {}
+    try { console.log('[Dashboard DEBUG] customerSlug:', customerSlug, 'mode:', mode); } catch (e) {}
+  }
   // Initialize runtime DEBUG flag from URL/localStorage/window.brewskiDebug so
   // the global runtime helpers (enableBrewskiDebug/disableBrewskiDebug) can
   // control logging consistently without needing a rebuild.
@@ -635,7 +663,6 @@ export default function Dashboard({ token, onCustomerLoaded }) {
 
   // Fetch known company slugs from the server so canonicalization scales as new companies are added.
   async function fetchCompanySlugs(token) {
-
 // Lightweight JWT payload parser (no verification) to surface customer slug early
 function parseJwtPayload(tok) {
   try {
@@ -653,37 +680,15 @@ function parseJwtPayload(tok) {
   }
 }
     try {
-      let res;
-      const pathPublic = '/api/companies';
-      const pathAdmin = '/admin/api/companies';
-      // Prefer window.apiFetch when available
-      if (typeof window !== 'undefined' && window.apiFetch) {
-        try { res = await window.apiFetch(pathPublic); } catch (e) { /* try admin */ }
+      // Derive known slugs from JWT payload if possible. Avoid calling /api/companies
+      // which may be legacy or removed.
+      if (token) {
+        const p = parseJwtPayload(token);
+        const maybe = (p && ((p.customer && p.customer.slug) || p.customer_slug || p.site || p.org)) ? (p.customer && p.customer.slug ? p.customer.slug : (p.customer_slug || p.site || p.org)) : null;
+        if (maybe && typeof maybe === 'string') return new Set([String(maybe).toUpperCase()]);
       }
-      // Prefer the component helper which will route admin/public paths to the
-      // canonical API host (avoids hitting the web SPA host and getting HTML).
-      if (!res) {
-        try {
-          const urlPath = token ? `${pathAdmin}?token=${encodeURIComponent(token)}` : pathPublic;
-          res = await doApiFetch(urlPath, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
-        } catch (e) {
-          // fall back to direct absolute URL if doApiFetch is unavailable for some reason
-          const urlPath = token ? `${pathAdmin}?token=${encodeURIComponent(token)}` : pathPublic;
-          const API_HOST = 'api.brewingremote.com';
-          const useApiHost = String(urlPath || '').startsWith('/admin/api') || String(urlPath || '').startsWith('/api/');
-          const base = `https://${useApiHost ? API_HOST : resolveHost()}`;
-          const url = `${base}${urlPath}`;
-          res = await fetch(url, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
-        }
-      }
-      if (!res || !res.ok) return new Set();
-      const js = await res.json();
-      if (!js || !Array.isArray(js.companies)) return new Set();
-      const s = new Set(js.companies.map(c => String(c.slug || c).toUpperCase()));
-      return s;
-    } catch (e) {
       return new Set();
-    }
+    } catch (e) { return new Set(); }
   }
 
   useEffect(() => {
@@ -753,96 +758,15 @@ function parseJwtPayload(tok) {
     let mounted = true;
     (async () => {
       try {
-        const record = { attempts: [] };
-
-        // 1) Try window.apiFetch (may return parsed JSON)
-        if (typeof window !== 'undefined' && window.apiFetch) {
-          try {
-            const r = await window.apiFetch('/admin/api/me', { headers: token ? { Authorization: `Bearer ${token}` } : undefined });
-            record.attempts.push({ method: 'window.apiFetch', ok: true, body: r });
-            if (mounted && r) {
-              // apply if we got customer info
-              try { setMeDebug(record); } catch (e) {}
-              const js = r;
-              if (js.customer && js.customer.slug) {
-                if (!customerSlug) setCustomerSlug(js.customer.slug);
-                if (!mode) setMode(String(js.customer.slug).toUpperCase());
-                if (js.customer.id && !customerId) setCustomerId(js.customer.id);
-                if (onCustomerLoaded) onCustomerLoaded(js.customer);
-                return;
-              }
-              // fallthrough to further attempts if js.user only or minimal
-            }
-          } catch (e) { record.attempts.push({ method: 'window.apiFetch', ok: false, error: String(e) }); }
-        }
-
-        // Use doApiFetch (prefers window.apiFetch) so we hit the canonical API host
-        // and avoid getting the SPA HTML from the web host.
-        let res = null;
-        try {
-          res = await doApiFetch('/admin/api/me', { headers: token ? { Authorization: `Bearer ${token}`, Accept: 'application/json' } : undefined });
-          record.attempts.push({ method: 'doApiFetch', url: '/admin/api/me', ok: res && res.ok, status: res && res.status });
-        } catch (e) { record.attempts.push({ method: 'doApiFetch', ok: false, error: String(e) }); }
-
-        // If that failed, try ?token fallback using doApiFetch as well
-        if (!res || !res.ok) {
-          try {
-            const qPath = `/admin/api/me?token=${encodeURIComponent(token)}`;
-            const r2 = await doApiFetch(qPath);
-            record.attempts.push({ method: 'doApiFetch?token', url: qPath, ok: r2 && r2.ok, status: r2 && r2.status });
-            if (r2 && r2.ok) res = r2;
-          } catch (e) { record.attempts.push({ method: 'doApiFetch?token', ok: false, error: String(e) }); }
-        }
-        try { setMeDebug(record); } catch (e) {}
-
-        if (js && js.customer && js.customer.slug) {
+        const js = await fetchMeDedupe(token, doApiFetch);
+        if (mounted && js && js.customer && js.customer.slug) {
           if (!customerSlug) setCustomerSlug(js.customer.slug);
           if (!mode) setMode(String(js.customer.slug).toUpperCase());
           if (js.customer.id && !customerId) setCustomerId(js.customer.id);
           if (onCustomerLoaded) onCustomerLoaded(js.customer);
-          return;
-        }
-
-        // If we only have a numeric customer_id (e.g., js.user.customer_id), try fetching the customer
-        const custId = js && js.user && js.user.customer_id ? js.user.customer_id : (js && js.customer && js.customer.id ? js.customer.id : null);
-        if (custId) {
-          try {
-            let cres = null;
-            try {
-              // Use centralized helper so requests go to canonical API host and follow same routing as other calls
-              cres = await doApiFetch(`/admin/api/customers/${encodeURIComponent(custId)}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
-              record.attempts.push({ method: 'custFetch', url: `/admin/api/customers/${encodeURIComponent(custId)}`, ok: cres && cres.ok, status: cres && cres.status });
-            } catch (e) { record.attempts.push({ method: 'custFetch', url: `/admin/api/customers/${encodeURIComponent(custId)}`, ok: false, error: String(e) }); }
-
-            // If that failed, try the token query-string fallback via the same helper
-            if ((!cres || !cres.ok)) {
-              try {
-                const qPath = `/admin/api/customers/${encodeURIComponent(custId)}?token=${encodeURIComponent(token)}`;
-                const cres2 = await doApiFetch(qPath);
-                record.attempts.push({ method: 'custFetch?token', url: qPath, ok: cres2 && cres2.ok, status: cres2 && cres2.status });
-                if (cres2 && cres2.ok) cres = cres2;
-              } catch (e) { record.attempts.push({ method: 'custFetch?token', ok: false, error: String(e) }); }
-            }
-
-            if (cres && cres.ok) {
-              try {
-                const cjs = await cres.json();
-                record.customer = cjs;
-                try { setMeDebug(record); } catch (e) {}
-                if (cjs && cjs.customer && cjs.customer.slug) {
-                  const cs = cjs.customer;
-                  if (!customerSlug) setCustomerSlug(cs.slug);
-                  if (!customerId && cs.id) setCustomerId(cs.id);
-                  if (!mode && cs.slug) setMode(String(cs.slug).toUpperCase());
-                  if (onCustomerLoaded) onCustomerLoaded(cs);
-                  return;
-                }
-              } catch (e) { record.customerParseError = String(e); try { setMeDebug(record); } catch (e) {} }
-            }
-          } catch (e) { record.custFetchError = String(e); try { setMeDebug(record); } catch (e) {} }
         }
       } catch (e) {
-  if (DEBUG) brewskiLog('Dashboard: /admin/api/me hydrate error', e);
+        if (DEBUG) brewskiLog('Dashboard: /admin/api/me hydrate error', e);
         try { setMeDebug({ error: String(e) }); } catch (e) {}
       }
     })();
@@ -973,8 +897,14 @@ function parseJwtPayload(tok) {
     // Persist a discovered base (canonical) into the server topics DB via admin API.
     // This attempts a single POST and on success adds the base to dbSensorBases so
     // the UI treats it as authoritative immediately.
-    const persistBaseToDB = async (baseKey, rawTopic, meta) => {
+  const persistBaseToDB = async (baseKey, rawTopic, meta, { force = false } = {}) => {
       try {
+        // Short-circuit when auto-persist is disabled unless explicitly forced
+        // by a user action (force=true). This allows manual persistence from UI.
+        if (!ENABLE_AUTO_PERSIST && !force) {
+          if (DEBUG) console.debug('Dashboard: persistBaseToDB skipped (auto-persist disabled)', baseKey);
+          return false;
+        }
         if (!token) return false; // need admin/auth token to persist
         if (!baseKey) return false;
         if (persistedBasesRef.current.has(baseKey)) return false;
@@ -1033,8 +963,13 @@ function parseJwtPayload(tok) {
     // can render editable slots for POWER/POWER1/.. keys even if labels don't yet exist.
     // This implementation is intentionally concise and defensive to avoid nested
     // control-flow that previously led to a mismatched-brace syntax error.
-    const persistDiscoveredPowerKeys = async (baseKey, powerStates) => {
+  const persistDiscoveredPowerKeys = async (baseKey, powerStates, { force = false } = {}) => {
       try {
+        // Respect auto-persist gate unless forced by a user action
+        if (!ENABLE_AUTO_PERSIST && !force) {
+          if (DEBUG) console.debug('Dashboard: persistDiscoveredPowerKeys skipped (auto-persist disabled)', baseKey);
+          return false;
+        }
         if (!token) return false;
         if (!baseKey || !powerStates || typeof powerStates !== 'object') return false;
         if (!customerId && !customerSlug) return false;
@@ -1183,6 +1118,38 @@ function parseJwtPayload(tok) {
         return savedAny;
       } catch (e) { return false; }
     };
+
+      // Explicit user-triggered persistence: persist all discovered canonical bases
+      // and power keys. This is intended to be invoked from an admin UI control
+      // so discovery remains read-only by default.
+      const persistAllDiscovered = async () => {
+        if (!token) return false;
+        try {
+          // Build a set of canonical bases from current gPower keys
+          const bases = new Set();
+          Object.keys(gPower || {}).forEach(k => {
+            try {
+              const norm = normalizeCanonicalBase(k, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || k;
+              if (norm) bases.add(norm);
+            } catch (e) {}
+          });
+          // Also include deviceList canonical keys
+          (deviceList || []).forEach(d => { try { if (d && d.key) bases.add(d.key); } catch (e) {} });
+
+          for (const b of Array.from(bases)) {
+            try {
+              // Attempt to persist base (force)
+              await persistBaseToDB(b, b, null, { force: true });
+              // Persist any discovered power keys for this base
+              const states = gPower[b] || gPower[b + '/STATE'] || gPower[b.replace(/^BREW\//i, '')] || null;
+              if (states) await persistDiscoveredPowerKeys(b, states, { force: true });
+            } catch (e) { /* per-base non-fatal */ }
+          }
+          // Refresh labels cache after posts
+          try { const labelsArr = await fetchPowerLabels(token); if (labelsArr) { /* no-op: fetchPowerLabels caches */ } } catch (e) {}
+          return true;
+        } catch (e) { return false; }
+      };
     
   const anim = useRef(new Animated.Value(0)).current;
   const needleAnim = useRef(new Animated.Value(0)).current;
@@ -1212,20 +1179,10 @@ function parseJwtPayload(tok) {
   // For now this is hardcoded to your laptop LAN IP so the phone can reach the local WS bridge.
   const FORCED_HOST = '172.20.10.5'; // <-- hardcoded LAN IP (left for dev overrides)
   // Use centralized MQTT WS host/path defaults from hosts.js
+  const USE_PUBLIC_WS = true; // flip to `false` for local LAN development
   const PUBLIC_WS_HOST = MQTT_WS_HOST || API_HOST || 'api.brewingremote.com';
   const PUBLIC_WS_PATH = MQTT_WS_PATH || '/_ws';
 
-  // default devices (kept for initial get requests). We'll also dynamically discover devices
-  // from incoming sensor/target topics and render gauges for those as they appear.
-  const defaultDevices = [
-    { key: 'DUMMYBOIL', label: 'Boil' },
-    { key: 'DUMMYHLT', label: 'HLT' },
-    { key: 'DUMMYMASH', label: 'Mash' },
-    { key: 'DUMMYFERM2', label: 'Ferm 2' },
-    { key: 'DUMMYFERM3', label: 'Ferm 3' },
-    { key: 'DUMMYFERM4', label: 'Ferm 4' },
-    { key: 'DUMMYFERM5', label: 'Ferm 5' },
-  ];
   const connTimeoutRef = useRef(null);
   // Set of canonical base keys (e.g., "BREW/Device" or "RAIL/Device[/Metric]") derived
   // from the server-side topics DB via /api/latest. This is authoritative for which
@@ -1248,10 +1205,13 @@ function parseJwtPayload(tok) {
               if (/\bDUMMY/i.test(baseKey)) continue;
               const cacheKey = `${baseKey}|${Object.keys(states || {}).join(',')}`;
               if (syncedPowerRef.current.has(cacheKey)) continue;
-              // Persist canonical base (topics DB) if missing
-              await persistBaseToDB(baseKey, baseKeyRaw, gMeta && gMeta[baseKeyRaw] ? gMeta[baseKeyRaw] : null);
-              // Persist discovered POWER keys as empty power_label rows so AdminPortal can edit them
-              await persistDiscoveredPowerKeys(baseKey, states);
+                  // Persist canonical base and discovered power keys only when auto-persist is enabled.
+                  if (ENABLE_AUTO_PERSIST) {
+                    await persistBaseToDB(baseKey, baseKeyRaw, gMeta && gMeta[baseKeyRaw] ? gMeta[baseKeyRaw] : null);
+                    await persistDiscoveredPowerKeys(baseKey, states);
+                  } else {
+                    if (DEBUG) console.debug('Dashboard: auto-persist disabled; skipping persist for', baseKey);
+                  }
               syncedPowerRef.current.add(cacheKey);
             } catch (e) { /* swallow per-entry errors */ }
           }
@@ -1655,8 +1615,20 @@ function parseJwtPayload(tok) {
   const connectWebSocket = async () => {
     if (!token) return false; // don't attempt without JWT
     const host = resolveHost();
-  // prefer secure wss with the configured path; allow legacy path when needed
-  const base = `wss://${host}${PUBLIC_WS_PATH}`;
+    // Prefer secure wss for non-local hosts. For local development (localhost/127.x)
+    // use plain ws so the client doesn't attempt TLS against a non-TLS dev server.
+    const isLocalHost = (() => {
+      try {
+        if (!host) return false;
+        const h = String(host).toLowerCase();
+        if (h.startsWith('localhost') || h.startsWith('127.') || h.startsWith('0.0.0.0')) return true;
+        // allow explicit IPv4 localhost with port (127.0.0.1:8080)
+        if (h.indexOf('127.') === 0) return true;
+        return false;
+      } catch (e) { return false; }
+    })();
+    const proto = isLocalHost ? 'ws' : 'wss';
+    const base = `${proto}://${host}${PUBLIC_WS_PATH}`;
     // include token as query param (primary). We'll add a fallback retry with a single subprotocol only if needed.
     const url = `${base}?token=${encodeURIComponent(token)}`;
   brewskiLog('[WS attempt] primary url=', url, 'token.len=', token && token.length);
@@ -1677,26 +1649,18 @@ function parseJwtPayload(tok) {
         reconnectMeta.current.attempts = 0;
         // clear any connection error state on open
         try { setConnectionError(false); } catch (e) {}
-  brewskiLog('WS open -> requesting initial gets for default devices');
-        // request current target and sensor for the default devices once connected
-        const sendInitialGets = () => {
-          defaultDevices.forEach(d => {
-            safeSend(ws, { type: 'get', topic: `${d.key}/Target`, id: `${d.key}-init-target` });
-            safeSend(ws, { type: 'get', topic: `${d.key}/Sensor`, id: `${d.key}-init-sensor` });
-            targetRequestCounts.current[d.key] = (targetRequestCounts.current[d.key] || 0) + 1;
-          });
-        };
+
         // ask bridge for a snapshot inventory to populate cache without extra GET churn
   safeSend(ws, { type: 'inventory', id: 'initial-inventory' });
         // initial burst, plus retries after 1s and 3s to handle missed replies
-        setTimeout(sendInitialGets, 200);
-        setTimeout(sendInitialGets, 1000);
-        setTimeout(sendInitialGets, 3000);
         
-        // Query power states for known devices
+        // Query power states for known devices (derive device list dynamically)
             const queryAllPowerStates = () => {
-          const devices = ['FERM2', 'FERM4', 'FERM5', 'MASH', 'HLT', 'BOIL'];
-          devices.forEach(deviceName => {
+          // derive device names from the current deviceList (canonical bases -> device name)
+          const deviceNames = (deviceList || []).map(d => {
+            try { const parts = String(d.key || '').split('/').filter(Boolean); return parts.length ? parts[parts.length-1] : d.key; } catch (e) { return d.key; }
+          }).filter(Boolean);
+          deviceNames.forEach(deviceName => {
             try {
               // Prefer explicit runtime mode/customer slug when available
               const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
@@ -1706,9 +1670,9 @@ function parseJwtPayload(tok) {
               safeSend(ws, { type: 'publish', topic: outTopic, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
             } catch (e) {}
 
-            // Query additional power states for multi-switch devices
-            const multiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
-            if (multiSwitchDevices.includes(deviceName)) {
+            // Query additional power states for multi-switch devices (derive common candidates dynamically)
+            const multiSwitchCandidates = (deviceNames || []).filter(n => /MASH|HLT|BOIL/i.test(String(n)));
+            if (multiSwitchCandidates.includes(deviceName)) {
               for (let i = 1; i <= 3; i++) {
                 try {
                   const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
@@ -1725,12 +1689,12 @@ function parseJwtPayload(tok) {
         setTimeout(queryAllPowerStates, 500);
         setTimeout(queryAllPowerStates, 2000);
         setTimeout(queryAllPowerStates, 5000);
-        // targeted retry loop: every 4s for first 30s only for bases missing either sensor or target
+          // targeted retry loop: every 4s for first 30s only for bases missing either sensor or target
         let retryCount = 0;
         const retryTimer = setInterval(() => {
           retryCount += 1;
           if (retryCount > 7) { clearInterval(retryTimer); return; } // ~28s window
-          const bases = defaultDevices.map(d=>d.key);
+          const bases = (deviceList || []).map(d => d.key);
           bases.forEach(base => {
             const haveSensor = gSensors[base] !== undefined && gSensors[base] !== null;
             const haveTarget = gTargets[base] !== undefined && gTargets[base] !== null;
@@ -1839,17 +1803,13 @@ function parseJwtPayload(tok) {
                   wsRef.current.send(JSON.stringify({ type: 'publish', topic: pt.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `pwq-${deviceName}-${Date.now()}` }));
                 } catch (e) {}
 
-              // Query additional power states (POWER1, POWER2, POWER3) for multi-switch devices
-              const commonMultiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
-              if (commonMultiSwitchDevices.some(d => deviceName.toUpperCase().includes(d))) {
-                for (let i = 1; i <= 3; i++) {
-                  try {
-                    try {
-                      const t = buildCmdTopic(customerSlug, deviceName, `Power${i}`);
-                      wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `pwq-${deviceName}-p${i}-${Date.now()}` }));
-                    } catch (e) {}
-                  } catch (e) {}
-                }
+              // Probe Power1..Power3 for every device to discover multi-switch devices
+              // rather than relying on a maintained list of known multi-switch names.
+              for (let i = 1; i <= 3; i++) {
+                try {
+                  const t = buildCmdTopic(customerSlug, deviceName, `Power${i}`);
+                  wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `pwq-${deviceName}-p${i}-${Date.now()}` }));
+                } catch (e) {}
               }
             };
             
@@ -1860,13 +1820,6 @@ function parseJwtPayload(tok) {
               queryPowerStates(customerSlugFromTopic, dev);
             }
             
-            // Also check for direct device topics without customer prefix
-            const directSensorMatch = topic.match(/^tele\/([^/]+)\/SENSOR$/i);
-            if (directSensorMatch && mode) {
-              const [, dev] = directSensorMatch;
-              // Do not mark legacy no-site devices; query power states using mode
-              queryPowerStates(mode, dev);
-            }
 
             // Persist discovered canonical base back to server topics DB if it's a defaulted/legacy mapping
             try {
@@ -2139,7 +2092,7 @@ function parseJwtPayload(tok) {
             setTargetValue(n);
             setGTargets(prev => {
               const next = { ...prev };
-              defaultDevices.forEach(d => { next[d.key] = n; });
+              (deviceList || []).forEach(d => { try { next[d.key] = n; } catch (e) {} });
               return next;
             });
             // mark connected when DUMMYtest target arrives
@@ -2372,16 +2325,8 @@ function parseJwtPayload(tok) {
     connectWebSocket();
     // Hydrate last-known values from localStorage for immediate UX (web only)
     // NOTE: Removed localStorage hydration — rely on authoritative DB snapshot and live MQTT only
-    (async () => {
-      try {
-  const path = '/thresholds';
-  let res;
-  try { res = await doApiFetch(path); } catch (e) { res = null; }
-        if (res.status === 401) { try { window.dispatchEvent(new CustomEvent('brewski-unauthorized')); } catch (e) {} return; }
-        const js = await res.json();
-        if (js && js.overrides) setThresholds(js.overrides);
-      } catch(e) {}
-    })();
+    // Thresholds endpoint removed/deprecated; keep thresholds empty unless other sources populate them
+    (async () => { try { setThresholds({}); } catch (e) {} })();
     // NEW: Snapshot hydrate from /api/latest so gauges and POWER states render immediately after reload (before live MQTT)
     (async () => {
       try {
@@ -2644,26 +2589,7 @@ function parseJwtPayload(tok) {
             } catch (e) {}
           }
 
-          // Legacy: topic itself ends with POWER/POWER1 etc (per-key rows)
-          if (/^POWER\d*$/i.test(powerLastSeg)) {
-            if (site && device) {
-              try {
-                const powerKey = powerLastSeg.toUpperCase();
-                let isOn = false;
-                if (typeof lv === 'string') {
-                  isOn = lv === 'ON' || lv === '1' || lv === 'true';
-                } else if (typeof lv === 'number') {
-                  isOn = lv === 1;
-                } else if (typeof lv === 'boolean') {
-                  isOn = lv;
-                }
-                const baseCandidate = `${site}/${device}`;
-                persistFound(baseCandidate, { [powerKey]: isOn }, row.last_ts);
-              } catch (e) {}
-            }
-            return;
-          }
-
+         
           // Normal sensor hydration
           const num = Number(lv);
           if (Number.isNaN(num)) return;
@@ -2834,27 +2760,41 @@ function parseJwtPayload(tok) {
   useEffect(() => {
     if (!mode || !wsRef.current || wsRef.current.readyState !== 1) return;
     
-    // Query power states for all known devices
+    // Query power states for all known devices. Derive device names from the
+    // runtime-discovered `deviceList` instead of relying on a hard-coded array.
+    // For multi-switch devices we probe Power1..Power3 so discovery detects
+    // any additional named switches without embedding legacy device name lists.
     const queryPowerStatesForCustomer = () => {
-      const devices = ['FERM2', 'FERM4', 'FERM5', 'MASH', 'HLT', 'BOIL'];
-      
-      devices.forEach(deviceName => {
+      const deviceNames = (deviceList && deviceList.length) ? deviceList.map(d => {
+        try {
+          const k = String(d && d.key ? d.key : d).split('/').filter(Boolean);
+          return k.length >= 2 ? k[1] : (k[0] || String(d && d.key ? d.key : d));
+        } catch (e) {
+          return String(d && d.key ? d.key : d);
+        }
+      }) : [];
+
+      // If we don't have any discovered devices yet, do nothing (avoid
+      // probing arbitrary defaults in modern runs). This keeps behaviour
+      // predictable in new deployments and during dev where discovery may
+      // happen asynchronously.
+      if (!deviceNames.length) return;
+
+      deviceNames.forEach(deviceName => {
         try {
           const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
           const primaryTopic = buildCmdTopic(site, deviceName, 'Power');
           wsRef.current.send(JSON.stringify({ type: 'publish', topic: primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` }));
         } catch (e) {}
 
-        // Query additional power states for multi-switch devices
-        const multiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
-        if (multiSwitchDevices.includes(deviceName)) {
-          for (let i = 1; i <= 3; i++) {
-            try {
-              const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
-                const t = buildCmdTopic(site, deviceName, `Power${i}`);
-                wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` }));
-            } catch(e) {}
-          }
+        // Probe Power1..Power3 for every device to detect multi-switch devices
+        // without needing a maintained list of known multi-switch names.
+        for (let i = 1; i <= 3; i++) {
+          try {
+            const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
+            const t = buildCmdTopic(site, deviceName, `Power${i}`);
+            wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` }));
+          } catch(e) {}
         }
       });
     };
@@ -2942,35 +2882,13 @@ function parseJwtPayload(tok) {
     // If we still don't have a deviceName, abort
     if (!deviceName) return;
 
-    // BREW-specific legacy: if the original deviceKey explicitly started with 'BREW/'
-    // (exact match for the site segment) publish the raw value to `DEVICETarget`
-    // (no slash). This preserves a long-standing broker/device expectation.
+    // Only publish to the new targ/<SITE>/<DEVICE>Target topic
     let pubTopic = null;
-    const originalStartsWithBrew = /^\s*BREW\//i.test(String(deviceKey || ''));
-    if (originalStartsWithBrew) {
-      // Devicetarget format: e.g. FERM5Target (device name uppercased)
-      try {
-        pubTopic = `${String(deviceName || '').toUpperCase()}Target`;
-      } catch (e) {
-        pubTopic = `${deviceName}Target`;
-      }
-    } else {
-      // Build a command topic for a Tasmota-style Target command (we'll use 'Status' and 'Target' patterns where appropriate)
-      // Use buildCmdTopic to allow stripping BREW for legacy devices when appropriate, then append '/Target' to form the target topic.
-      const baseCmd = buildCmdTopic(site, deviceName, 'Target');
-      // baseCmd will be like 'cmnd/<site>/<device>/Target' or 'cmnd/<device>/Target' for legacy
-      // But for Target we publish to the raw `${site}/${device}/Target` (not cmnd prefix). Build accordingly.
-      try {
-        // If baseCmd begins with 'cmnd/', strip the 'cmnd' prefix and use the remainder as the topic path
-        if (typeof baseCmd === 'string' && baseCmd.toLowerCase().startsWith('cmnd/')) {
-          pubTopic = baseCmd.split('/').slice(1).join('/');
-        } else {
-          // Fallback to deviceKey/Target
-          pubTopic = `${deviceKey}/Target`;
-        }
-      } catch (e) {
-        pubTopic = `${deviceKey}/Target`;
-      }
+    try {
+      const sitePart = site || (mode ? mode : (customerSlug ? String(customerSlug).toUpperCase() : ''));
+      pubTopic = `targ/${sitePart}/${deviceName}Target`;
+    } catch (e) {
+      pubTopic = `${deviceName}Target`;
     }
 
     // Compute a canonical base key for optimistic UI update. Prefer the provided deviceKey
@@ -2981,55 +2899,24 @@ function parseJwtPayload(tok) {
     } catch (e) { canonicalForUpdate = (site ? `${site}/${deviceName}` : deviceName); }
 
     try {
-      if (originalStartsWithBrew) {
-        // BREW legacy: preserve exact casing (device uppercased already)
-          try { brewskiLog('[publishTarget] send', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
-          brewskiLog('publish', pubTopic, val, id);
-        // Also attempt additional legacy-compatible variants in case the bridge
-        // expects a slash-separated topic or a cmnd/ prefix for BREW devices.
-        try {
-          const withSlash = `${deviceName}/Target`;
-          const withCmnd = `cmnd/${deviceName}/Target`;
-          try { brewskiLog('[publishTarget] send fallback (slash)', { topic: withSlash, payload: val, id }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: withSlash, payload: val, id: id + '-s' }));
-          try { brewskiLog('[publishTarget] send fallback (cmnd)', { topic: withCmnd, payload: val, id }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: withCmnd, payload: val, id: id + '-c' }));
-        } catch (e) { brewskiLog('publishTargetForDevice: BREW extra sends failed', e && e.message); }
-      } else {
-        // normalize prefix to lowercase for broker expectations (site/device case preserved)
-        try {
-          const parts = pubTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const outTopic = parts.join('/');
-          try { brewskiLog('[publishTarget] send', { topic: outTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload: val, id }));
-          brewskiLog('publish', outTopic, val, id);
-        } catch (e) {
-          try { brewskiLog('[publishTarget] send fallback', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
-          brewskiLog('publish', pubTopic, val, id);
-        }
-      }
-
+      // normalize prefix to lowercase for broker expectations (site/device case preserved)
+      const parts = pubTopic.split('/');
+      if (parts && parts.length) parts[0] = parts[0].toLowerCase();
+      const outTopic = parts.join('/');
+      try { brewskiLog('[publishTarget] send', { topic: outTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
+      wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload: val, id }));
+      brewskiLog('publish', outTopic, val, id);
       // Optimistic UI update: set local known target immediately so sliders don't wait for round-trip
-      try {
-        if (canonicalForUpdate) setGTargets(prev => ({ ...(prev || {}), [canonicalForUpdate]: val }));
-      } catch (e) {}
+      if (canonicalForUpdate) setGTargets(prev => ({ ...(prev || {}), [canonicalForUpdate]: val }));
     } catch (e) {}
 
     setTimeout(() => {
       try {
         if (wsRef.current) {
           const getId = id + '-get';
-          let getTopic = pubTopic;
-          // For BREW legacy, ensure GET covers additional topic variants we published above
-          if (originalStartsWithBrew) {
-            // schedule GETs for the legacy raw topic, slash variant, and cmnd variant
-            try { const t1 = pubTopic; const t2 = `${deviceName}/Target`; const t3 = `cmnd/${deviceName}/Target`; brewskiLog('publishTargetForDevice: scheduling multiple GETs for BREW', { t1, t2, t3, getId }); wsRef.current.send(JSON.stringify({ type: 'get', topic: t1, id: getId + '-a' })); wsRef.current.send(JSON.stringify({ type: 'get', topic: t2, id: getId + '-b' })); wsRef.current.send(JSON.stringify({ type: 'get', topic: t3, id: getId + '-c' })); } catch (e) {}
-            return;
-          }
-          if (!originalStartsWithBrew) {
-            const parts = pubTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); getTopic = parts.join('/');
-          }
+          const parts = pubTopic.split('/');
+          if (parts && parts.length) parts[0] = parts[0].toLowerCase();
+          const getTopic = parts.join('/');
           brewskiLog('publishTargetForDevice: scheduling GET for', getTopic, getId);
           wsRef.current.send(JSON.stringify({ type: 'get', topic: getTopic, id: getId }));
         }
@@ -3037,16 +2924,7 @@ function parseJwtPayload(tok) {
     }, 500);
     // After scheduling GETs/probes, explicitly call requestCurrentForBase so incoming
     // variant replies are canonicalized and applied to gTargets quickly.
-    try {
-      if (originalStartsWithBrew) {
-        // call for each variant we requested
-        try { requestCurrentForBase(`${deviceName}`); } catch (e) {}
-        try { requestCurrentForBase(`${deviceName}/Target`); } catch (e) {}
-        try { requestCurrentForBase(`${deviceName}`); } catch (e) {}
-      } else {
-        try { requestCurrentForBase(canonicalForUpdate); } catch (e) {}
-      }
-    } catch (e) {}
+    try { requestCurrentForBase(canonicalForUpdate); } catch (e) {}
   };
   // Build a cmnd topic. Returns `cmnd/<site>/<device>/<Cmd>` when site is provided,
   // otherwise `cmnd/<device>/<Cmd>` as a last-resort legacy fallback.
@@ -3317,6 +3195,8 @@ function parseJwtPayload(tok) {
           dumpToConsole={() => { console.log('DEBUG DUMP', { mode, customerSlug, knownSlugs: Array.from(knownSlugs || []), gMeta, gSensors, gTargets, gPower, deviceList, filteredDevices, pendingSensorMessages, pendingPowerMessages }); }}
         />
       )}
+        {/* Admin control: persist discovered bases & power keys (visible in DEBUG or when token present) */}
+        {/* Persist discovered button removed as requested */}
   {/* small spacer to keep content below any header/hamburger */}
   <View style={[styles.headerSpacer, { height: headerSpacerHeight }]} />
       {/* Placeholder future: group filter UI (to filter deviceList by second topic segment/group) */}

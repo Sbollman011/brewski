@@ -26,13 +26,40 @@ const doFetchFactory = (tokenProvider) => async (path, opts = {}) => {
   // return the SPA shell for admin paths when same-origin is used. Use the
   // absolute api host for API calls to ensure JSON responses.
   let finalUrl = path;
+
+  // Defensive helper: normalize an API_HOST value so callers can safely
+  // prepend a scheme or use the host verbatim when it already includes one.
+  const normalizeAndEnsureHost = (host) => {
+    if (!host) return '';
+    let h = String(host).trim();
+    // Fix common mistakes like 'http//host' or 'http:/host' -> 'http://host'
+    try {
+      h = h.replace(/^(https?):\/\//i, '$1://');
+      h = h.replace(/^(https?)\/\//i, '$1://'); // missing colon case
+      h = h.replace(/^(https?):\/(?!\/)/i, '$1://'); // single slash -> double
+    } catch (e) {}
+    // strip trailing slash
+    h = h.replace(/\/$/, '');
+    return h;
+  };
+
   if (typeof path === 'string' && (path.startsWith('/admin/api') || path.startsWith('/api/'))) {
     // Always target the API host explicitly rather than relying on same-origin.
-    finalUrl = `https://${API_HOST}${path}`;
+    const host = normalizeAndEnsureHost(API_HOST);
+    if (/^https?:\/\//i.test(host)) {
+      finalUrl = host.replace(/\/$/, '') + path;
+    } else {
+      finalUrl = `https://${host}${path}`;
+    }
   } else if (typeof path === 'string' && !/^https?:/i.test(path)) {
     // Non-admin relative path – leave as-is (same-origin) on web. On native, prefix the API host.
     if (typeof window === 'undefined') {
-      finalUrl = `https://${API_HOST}${path.startsWith('/') ? path : '/' + path}`;
+      const host = normalizeAndEnsureHost(API_HOST);
+      if (/^https?:\/\//i.test(host)) {
+        finalUrl = host.replace(/\/$/, '') + (path.startsWith('/') ? path : '/' + path);
+      } else {
+        finalUrl = `https://${host}${path.startsWith('/') ? path : '/' + path}`;
+      }
     }
   }
 

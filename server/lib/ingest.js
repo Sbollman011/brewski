@@ -72,6 +72,16 @@ function shouldInsertTelemetry(sensorId, value, ts) {
 function recordWrite(sensorId, value, ts) { lastWrite.set(sensorId, { value: Number(value), ts }); }
 
 function ingestNumeric({ customerId, key, value, raw, ts = Date.now(), type = null, unit = null, topicKey = null }) {
+  // Allow disabling telemetry writes entirely via env var for dev/testing
+  if (process.env.DISABLE_TELEMETRY === '1') {
+    // Still ensure sensor exists but do not insert telemetry rows or update latest
+    try {
+      const sensor = ensureSensor(customerId, key, { type, unit, topicKey });
+      return { ok: true, sensorId: sensor ? sensor.id : null, inserted: false, disabled: true };
+    } catch (e) {
+      return { ok: false, reason: 'disabled_error', sensorId: null, inserted: false };
+    }
+  }
   if (value === null || value === undefined || isNaN(Number(value))) {
     return { ok: false, reason: 'non_numeric', sensorId: null, inserted: false };
   }

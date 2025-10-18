@@ -46,6 +46,16 @@ const CONFIG = {
   MAX_RECENT: parseInt(process.env.MQTT_MAX_RECENT || '200', 10)
 };
 
+// Development override: when DEV_MQTT_OVERRIDE is set to '1' the server will
+// connect to the central secure broker at mqtt.brewingremote.com:8883. This
+// avoids local broker troubleshooting during dev and mirrors the client dev
+// websocket behavior. Set DEV_MQTT_OVERRIDE=1 in your environment to enable.
+if (process.env.DEV_MQTT_OVERRIDE === '1') {
+  CONFIG.HOST = 'mqtt.brewingremote.com';
+  CONFIG.PORT_OVERRIDE = '8883';
+  CONFIG.FORCE_TLS = true;
+}
+
 class NextMqttClient extends EventEmitter {
   constructor(opts = {}) {
     super();

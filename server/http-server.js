@@ -33,7 +33,8 @@ function startHttpServer(opts = {}) {
         setSecurityHeadersLocal();
         res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
         // Allow common headers used by the SPA (JSON body + Authorization header)
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+        // Include Accept and X-Requested-With to match setSecurityHeaders defaults
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Authorization,Accept,X-Requested-With');
         res.setHeader('Access-Control-Max-Age', '600');
         res.writeHead(204);
         res.end();
