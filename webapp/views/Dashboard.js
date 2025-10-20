@@ -75,6 +75,78 @@ const safeLocal = {
     try { _inMemoryLocal_dashboard.delete(k); } catch (e) {}
   }
 };
+// React Native AsyncStorage (best-effort require). We try modern community package
+// first and fall back to React Native's AsyncStorage if present. If neither is
+// available (web), AsyncStorage remains null and we use `safeLocal` instead.
+let AsyncStorage = null;
+try {
+  // community package exposes default
+  const mod = require('@react-native-async-storage/async-storage');
+  AsyncStorage = mod && (mod.default || mod);
+} catch (e) {
+  try {
+    // older RN versions had AsyncStorage on react-native
+    const rn = require('react-native');
+    AsyncStorage = rn && rn.AsyncStorage ? rn.AsyncStorage : null;
+  } catch (e) {
+    AsyncStorage = null;
+  }
+}
+
+const _STORAGE_KEYS = { customerSlug: 'brewski_customer_slug', customerId: 'brewski_customer_id' };
+
+async function readPersistedCustomerSlug() {
+  try {
+    if (!AsyncStorage) return null;
+    const v = await AsyncStorage.getItem(_STORAGE_KEYS.customerSlug);
+    return v || null;
+  } catch (e) { return null; }
+}
+
+async function persistCustomerSlugToStorage(slug) {
+  try {
+    if (!AsyncStorage) return;
+    if (!slug) await AsyncStorage.removeItem(_STORAGE_KEYS.customerSlug);
+    else await AsyncStorage.setItem(_STORAGE_KEYS.customerSlug, String(slug));
+  } catch (e) { /* ignore storage failures */ }
+}
+
+async function persistCustomerIdToStorage(id) {
+  try {
+    if (!AsyncStorage) return;
+    if (!id && id !== 0) await AsyncStorage.removeItem(_STORAGE_KEYS.customerId);
+    else await AsyncStorage.setItem(_STORAGE_KEYS.customerId, String(id));
+  } catch (e) { /* ignore storage failures */ }
+}
+
+async function readPersistedCustomerId() {
+  try {
+    if (!AsyncStorage) return null;
+    const v = await AsyncStorage.getItem(_STORAGE_KEYS.customerId);
+    if (!v) return null;
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+    return null;
+  } catch (e) { return null; }
+}
+
+const TOKEN_STORAGE_KEY = 'brewski_jwt';
+
+async function persistTokenToStorage(tok) {
+  try {
+    if (!AsyncStorage) return;
+    if (!tok) await AsyncStorage.removeItem(TOKEN_STORAGE_KEY);
+    else await AsyncStorage.setItem(TOKEN_STORAGE_KEY, String(tok));
+  } catch (e) { /* ignore */ }
+}
+
+async function readPersistedToken() {
+  try {
+    if (!AsyncStorage) return null;
+    const v = await AsyncStorage.getItem(TOKEN_STORAGE_KEY);
+    return v || null;
+  } catch (e) { return null; }
+}
 // In-flight promise cache for fetchPowerLabels to coalesce concurrent callers
 const _inflightFetchPowerLabels = new Map();
 // Short-lived cache for server-side power-label listings per-customer to avoid
@@ -287,9 +359,10 @@ function normalizeCanonicalBase(origKey, { knownSlugs, gMeta, dbSensorBases, cus
 
       // Prefer explicit mode/customerSlug if available
       if (!device || /^(STATE|BREW|RAIL)$/i.test(String(device))) return null;
-      if (mode && mode.toUpperCase() !== 'BREW') return `${mode}/${device}`;
+      // Do not default to BREW for unscoped legacy topics. Require explicit mode/customerSlug.
+      if (mode) return `${mode}/${device}`;
       if (customerSlug) return `${customerSlug}/${device}`;
-      return `BREW/${device}`;
+      return null;
     }
 
     // If nothing else matched, return original
@@ -577,8 +650,6 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     })();
     return () => { mounted = false; };
   }, [token]);
-  // store numeric customer id if provided by /api/latest so we can POST admin updates
-  const [customerId, setCustomerId] = useState(null);
   // Debug info for /admin/api/me hydration attempts (visible when DEBUG=true)
   const [meDebug, setMeDebug] = useState(null);
   // responsive layout measurements
@@ -611,68 +682,60 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // Known company slugs discovered from the server (preferred) or inferred locally.
   const [knownSlugs, setKnownSlugs] = useState(new Set());
 
-  // Fetch known company slugs from the server so canonicalization scales as new companies are added.
-  async function fetchCompanySlugs(token) {
-
-// Lightweight JWT payload parser (no verification) to surface customer slug early
-function parseJwtPayload(tok) {
-  try {
-    if (!tok || typeof tok !== 'string') return null;
-    const parts = tok.split('.');
-    if (!parts[1]) return null;
-    // base64url -> base64
-    let b = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-    // pad
-    while (b.length % 4) b += '=';
-    const json = atob(b);
-    return JSON.parse(json);
-  } catch (e) {
-    return null;
-  }
-}
-    try {
-      let res;
-      const pathPublic = '/api/companies';
-      const pathAdmin = '/admin/api/companies';
-      // Prefer window.apiFetch when available
-      if (typeof window !== 'undefined' && window.apiFetch) {
-        try { res = await window.apiFetch(pathPublic); } catch (e) { /* try admin */ }
-      }
-      // Prefer the component helper which will route admin/public paths to the
-      // canonical API host (avoids hitting the web SPA host and getting HTML).
-      if (!res) {
-        try {
-          const urlPath = token ? `${pathAdmin}?token=${encodeURIComponent(token)}` : pathPublic;
-          res = await doApiFetch(urlPath, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
-        } catch (e) {
-          // fall back to direct absolute URL if doApiFetch is unavailable for some reason
-          const urlPath = token ? `${pathAdmin}?token=${encodeURIComponent(token)}` : pathPublic;
-          const API_HOST = 'api.brewingremote.com';
-          const useApiHost = String(urlPath || '').startsWith('/admin/api') || String(urlPath || '').startsWith('/api/');
-          const base = `https://${useApiHost ? API_HOST : resolveHost()}`;
-          const url = `${base}${urlPath}`;
-          res = await fetch(url, token ? { headers: { Authorization: `Bearer ${token}` } } : undefined);
-        }
-      }
-      if (!res || !res.ok) return new Set();
-      const js = await res.json();
-      if (!js || !Array.isArray(js.companies)) return new Set();
-      const s = new Set(js.companies.map(c => String(c.slug || c).toUpperCase()));
-      return s;
-    } catch (e) {
-      return new Set();
-    }
-  }
-
+  // React Native: try to hydrate a previously-persisted customer slug very early
+  // so snapshot filtering doesn't hide gauges while network requests finish.
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const s = await fetchCompanySlugs(token);
-      if (!mounted) return;
-      setKnownSlugs(s);
+      try {
+        // Only on RN environments; on web rely on safeLocal/localStorage
+        if (!isReactNative) return;
+        let persisted = await readPersistedCustomerSlug();
+        if (!mounted) return;
+        // If we don't have a persisted slug, try reading a persisted token and parse it
+        if (!persisted) {
+          try {
+            const tok = await readPersistedToken();
+            if (tok) {
+              const payload = parseJwtPayloadEarly(tok);
+              const maybeSlug = (payload && ((payload.customer && payload.customer.slug) || payload.customer_slug || payload.site || payload.org)) || null;
+              const looksLikeSlug = (s) => { try { return typeof s === 'string' && /[A-Za-z]/.test(s) && String(s).length >= 2; } catch (e) { return false; } };
+              if (maybeSlug && looksLikeSlug(maybeSlug)) persisted = maybeSlug;
+            }
+          } catch (e) {}
+        }
+        if (persisted && !customerSlug) {
+          try { setCustomerSlug(persisted); } catch (e) {}
+          try { setMode(String(persisted).toUpperCase()); } catch (e) {}
+        }
+
+        // Also attempt to hydrate a persisted numeric customerId
+        try {
+          const pid = await readPersistedCustomerId();
+          if (pid && !customerId) {
+            try { setCustomerId(pid); } catch (e) {}
+          }
+        } catch (e) {}
+
+        if (!persisted && !AsyncStorage) {
+          // On a full native build without AsyncStorage available, log a helpful message
+          if (DEBUG) brewskiLog('Dashboard: AsyncStorage not available — RN cold-start may lack persisted customer context');
+        }
+      } catch (e) {}
     })();
     return () => { mounted = false; };
-  }, [token]);
+  }, []);
+
+  // Persist customerSlug changes to AsyncStorage (RN) so next cold start has context
+  useEffect(() => {
+    try {
+      if (!isReactNative) return;
+      // best-effort async persist; don't await to avoid blocking UI
+      persistCustomerSlugToStorage(customerSlug).catch(() => {});
+    } catch (e) {}
+  }, [customerSlug]);
+
+
 
   // Lightweight JWT payload parser (no verification) to surface customer slug early
   // and avoid transiently showing BREW devices while /api/latest hydrates.
@@ -691,6 +754,30 @@ function parseJwtPayload(tok) {
       }
       return JSON.parse(json);
     } catch (e) { return null; }
+  };
+
+  // Normalize canonical keys for consistent state indexing. We uppercase the
+  // site/slug segment so lookups across snapshots, live MQTT and local discovery
+  // don't suffer from case mismatches that can cause devices to disappear.
+  const normalizeCanonicalKey = (k) => {
+    try {
+      if (!k && k !== 0) return k;
+      const s = String(k || '').split('/').filter(Boolean);
+      if (!s.length) return String(k || '');
+      s[0] = String(s[0]).toUpperCase();
+      return s.join('/');
+    } catch (e) { return k; }
+  };
+
+  const normalizeObjectKeys = (obj) => {
+    try {
+      if (!obj || typeof obj !== 'object') return obj;
+      const out = {};
+      Object.entries(obj).forEach(([k, v]) => {
+        try { out[normalizeCanonicalKey(k)] = v; } catch (e) { out[k] = v; }
+      });
+      return out;
+    } catch (e) { return obj; }
   };
 
   // Use the JWT claim as a fast-path to set customerSlug/mode until /api/latest provides authoritative values.
@@ -722,6 +809,34 @@ function parseJwtPayload(tok) {
       }
     } catch (e) {}
   }, [token]);
+
+  // Persist customerId to AsyncStorage and safeLocal when it changes
+  useEffect(() => {
+    try {
+      // Async persist
+      persistCustomerIdToStorage(customerId).catch(() => {});
+    } catch (e) {}
+    try {
+      if (typeof safeLocal !== 'undefined' && safeLocal && typeof safeLocal.setItem === 'function') {
+        if (customerId === null || customerId === undefined) safeLocal.removeItem(_STORAGE_KEYS.customerId);
+        else safeLocal.setItem(_STORAGE_KEYS.customerId, String(customerId));
+      }
+    } catch (e) {}
+  }, [customerId]);
+
+  // Persist customerSlug to safeLocal when it changes so synchronous reads during
+  // first render have context (helps RN cold-start). AsyncStorage is used too
+  // for long-term persistence.
+  useEffect(() => {
+    try {
+      if (typeof safeLocal !== 'undefined' && safeLocal && typeof safeLocal.setItem === 'function') {
+        if (!customerSlug) safeLocal.removeItem(_STORAGE_KEYS.customerSlug);
+        else safeLocal.setItem(_STORAGE_KEYS.customerSlug, String(customerSlug));
+      }
+    } catch (e) {}
+    try { persistCustomerSlugToStorage(customerSlug).catch(() => {}); } catch (e) {}
+    if (DEBUG) brewskiLog('Dashboard: persisted customerSlug ->', customerSlug, 'mode->', mode, 'customerId->', customerId);
+  }, [customerSlug, mode, customerId]);
 
   // Also attempt to hydrate authoritative current user/customer info from the server
   // when a token is present. This mirrors AdminPortal behavior and helps mobile
@@ -853,9 +968,10 @@ function parseJwtPayload(tok) {
       const persistedBasesRef = useRef(new Set());
     // Track which placeholder power_label posts we've recently attempted so we don't repeat them
     const placeholderPostedRef = useRef(new Map()); // key -> timestamp ms
-    // Track devices that historically published without a site prefix (legacy "nosite" topics like tele/<device>/...)
-    // If a device is known to be legacy-nosite and we're sending commands under BREW, omit the site
-    const legacyNoSiteDevicesRef = useRef(new Set());
+  // Legacy-nosite tracking removed: we no longer default to BREW or strip
+  // site prefixes for historical topics. Keep a placeholder ref to avoid
+  // extensive refactor churn elsewhere in the file.
+  const legacyNoSiteDevicesRef = useRef(new Set());
     // Debounce timer to consolidate label refreshes after multiple posts
     const labelsRefreshTimerRef = useRef(null);
 
@@ -1112,16 +1228,29 @@ function parseJwtPayload(tok) {
   const ALERT_DEBOUNCE_MS = 30_000; // avoid spamming same device alert more than every 30s
   // dynamic threshold overrides per base (min/max) loaded from server
   const [thresholds, setThresholds] = useState({}); // { base: { min, max } }
+  // store numeric customer id if provided by /api/latest so we can POST admin updates
+  const [customerId, setCustomerId] = useState(() => {
+    try {
+      const v = safeLocal.getItem(_STORAGE_KEYS.customerId);
+      const n = v ? Number(v) : null;
+      return Number.isFinite(n) ? n : null;
+    } catch (e) { return null; }
+  });
   // UI filter: customer slug (dynamic based on user's customer)
-  // Default customerSlug to BREW so we have a conservative fallback for lookups
-  // (power detection will still work via device-name fallback). Leave `mode`
-  // unset until /api/latest provides the authoritative customer slug so the
-  // filter logic doesn't get pre-forced to a value that may be incorrect.
-  const [mode, setMode] = useState(null); // will be set from customer info
-  // Do not assume BREW by default — leave customerSlug null until /api/latest
-  // provides the authenticated user's customer. This prevents the dashboard
-  // from showing BREW-specific devices for non-BREW users.
-  const [customerSlug, setCustomerSlug] = useState(null);
+  // Seed customerSlug and mode synchronously from safeLocal so initial render
+  // has effectiveMode available (helps RN cold-starts where AsyncStorage is async).
+  const [mode, setMode] = useState(() => {
+    try {
+      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
+      return s ? String(s).toUpperCase() : null;
+    } catch (e) { return null; }
+  });
+  const [customerSlug, setCustomerSlug] = useState(() => {
+    try {
+      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
+      return s || null;
+    } catch (e) { return null; }
+  });
   // Store raw power messages that need customer context
   const [pendingPowerMessages, setPendingPowerMessages] = useState([]);
   // Queue sensor/target messages that arrive before we know 'mode' so we can canonicalize them
@@ -1376,9 +1505,12 @@ function parseJwtPayload(tok) {
               if (!matchesDb) return false;
             }
 
-            // If we have authoritative DB entries but no customer context yet, don't show anything.
-            // This prevents prematurely showing BREW devices to customers who belong to another org.
-            if (dbSensorBases && dbSensorBases.size > 0 && !effectiveMode) return false;
+            // If we have authoritative DB entries but no customer context yet, prefer
+            // to show only unscoped/BREW entries rather than hiding everything.
+            // Hiding all devices here caused native clients to render an empty list
+            // when the snapshot arrived before `mode`/`customerSlug` was established.
+            // Keep the later per-device site checks so customer-prefixed bases remain
+            // hidden until `mode` is available.
 
             // Prefer site reported in gMeta for this canonical base (handles topics that arrived
             // without explicit org prefix and were later associated via discovery).
@@ -1408,10 +1540,23 @@ function parseJwtPayload(tok) {
       s = s.replace(/\/(STATE|RESULT)$/i, '');
       // Try normalized core first
       const norm = normalizeCanonicalBase(s, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
-      if (norm) return norm;
+      if (norm) {
+        try {
+          const parts = String(norm).split('/').filter(Boolean);
+          if (parts.length >= 1) parts[0] = parts[0].toUpperCase();
+          return parts.join('/');
+        } catch (e) { return norm; }
+      }
       // Fallback: try original topic
       const norm2 = normalizeCanonicalBase(topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
-      return norm2 || null;
+      if (norm2) {
+        try {
+          const parts = String(norm2).split('/').filter(Boolean);
+          if (parts.length >= 1) parts[0] = parts[0].toUpperCase();
+          return parts.join('/');
+        } catch (e) { return norm2; }
+      }
+      return null;
     } catch (e) { return null; }
   };
 
@@ -1663,7 +1808,6 @@ function parseJwtPayload(tok) {
     const base = USE_PUBLIC_WS ? `wss://${host}${PUBLIC_WS_PATH}` : `ws://${host}:8080`;
     // include token as query param (primary). We'll add a fallback retry with a single subprotocol only if needed.
     const url = `${base}?token=${encodeURIComponent(token)}`;
-  brewskiLog('[WS attempt] primary url=', url, 'token.len=', token && token.length);
     try {
       const ws = new WebSocket(url);
       wsRef.current = ws;
@@ -1681,7 +1825,6 @@ function parseJwtPayload(tok) {
         reconnectMeta.current.attempts = 0;
         // clear any connection error state on open
         try { setConnectionError(false); } catch (e) {}
-  brewskiLog('WS open -> requesting initial gets for default devices');
         // request current target and sensor for the default devices once connected
         const sendInitialGets = () => {
           defaultDevices.forEach(d => {
@@ -1812,23 +1955,31 @@ function parseJwtPayload(tok) {
             const applySensor = (topic, val) => {
             const meta = parseTopic(topic);
             if (!meta) return;
-            // If site missing, prefer discovery inference; otherwise default to BREW
+            // If site missing, prefer discovery inference; otherwise do not default to BREW
             if (!meta.site) {
               const inferred = findSiteForDevice(meta.device);
-              meta.site = inferred || 'BREW';
+              if (inferred) meta.site = inferred;
+              else {
+                // leave meta.site null to indicate unscoped/legacy topic
+                meta.site = null;
+              }
             }
             // build canonical base using current mode/customerSlug
             let canonical = canonicalBaseFromMeta(meta) || (meta.metric ? `${meta.device}/${meta.metric}` : `${meta.device}`);
             if (!canonical) return;
             try { canonical = normalizeCanonicalBase(canonical, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }); } catch (e) {}
-            setGSensors(prev => ({ ...prev, [canonical]: val }));
+            // ensure canonical key uses normalized site-case
+            const canonicalNorm = (() => {
+              try { const p = String(canonical).split('/').filter(Boolean); if (p.length) p[0] = p[0].toUpperCase(); return p.join('/'); } catch (e) { return canonical; }
+            })();
+            setGSensors(prev => ({ ...prev, [canonicalNorm]: val }));
             // register enriched meta under canonical base
-            const enrichedMeta = { site: (meta.site || (mode && mode !== 'BREW' ? mode : customerSlug || 'BREW')), device: meta.device, metric: meta.metric || null, terminal: 'Sensor' };
-            registerMeta(canonical, enrichedMeta);
+            const enrichedMeta = { site: (meta.site || (mode ? mode : (customerSlug || null))), device: meta.device, metric: meta.metric || null, terminal: 'Sensor' };
+            registerMeta(canonicalNorm, enrichedMeta);
             // Auto-request target for canonical base if missing
-            if (!(canonical in gTargets) && wsRef.current && wsRef.current.readyState === 1) {
-              const reqId = canonical + '-auto-target';
-              try { wsRef.current.send(JSON.stringify({ type: 'get', topic: `${canonical}/Target`, id: reqId })); targetRequestCounts.current[canonical] = (targetRequestCounts.current[canonical] || 0) + 1; } catch (e) {}
+            if (!(canonicalNorm in gTargets) && wsRef.current && wsRef.current.readyState === 1) {
+              const reqId = canonicalNorm + '-auto-target';
+              try { wsRef.current.send(JSON.stringify({ type: 'get', topic: `${canonicalNorm}/Target`, id: reqId })); targetRequestCounts.current[canonicalNorm] = (targetRequestCounts.current[canonicalNorm] || 0) + 1; } catch (e) {}
             }
             // Auto-query power states for newly discovered devices
             const queryPowerStates = (customerSlug, deviceName) => {
@@ -1864,12 +2015,13 @@ function parseJwtPayload(tok) {
               queryPowerStates(customerSlugFromTopic, dev);
             }
             
-            // Also check for direct device topics without customer prefix
+            // Also check for direct device topics without customer prefix. We do
+            // not mark devices as legacy-nosite anymore. If we have a runtime
+            // mode (customer slug) we'll attempt to query power states, otherwise
+            // skip probing.
             const directSensorMatch = topic.match(/^tele\/([^/]+)\/SENSOR$/i);
             if (directSensorMatch && mode) {
               const [, dev] = directSensorMatch;
-              // Mark device as legacy-nosite (published without site prefix historically)
-              try { legacyNoSiteDevicesRef.current.add(String(dev).toUpperCase()); } catch (e) {}
               queryPowerStates(mode, dev);
             }
 
@@ -1881,24 +2033,26 @@ function parseJwtPayload(tok) {
               if (!alreadyPersisted) {
                 // Construct a rawTopic guess that matches legacy patterns (tele/<device>/Sensor) when original topic lacked site
                 const rawTopicGuess = topic;
-                persistBaseToDB(canonical, rawTopicGuess, enrichedMeta).catch(e => {});
+                persistBaseToDB(canonicalNorm, rawTopicGuess, enrichedMeta).catch(e => {});
               }
             } catch (e) {}
           };
           const applyTarget = (topic, val) => {
             const meta = parseTopic(topic);
             if (!meta) return;
-            // If site missing, prefer discovery inference; otherwise default to BREW
+            // If site missing, prefer discovery inference; otherwise do not default to BREW
             if (!meta.site) {
               const inferred = findSiteForDevice(meta.device);
-              meta.site = inferred || 'BREW';
+              if (inferred) meta.site = inferred;
+              else meta.site = null;
             }
             let canonical = canonicalBaseFromMeta(meta) || (meta.metric ? `${meta.device}/${meta.metric}` : `${meta.device}`);
             if (!canonical) return;
             try { canonical = normalizeCanonicalBase(canonical, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }); } catch (e) {}
-            setGTargets(prev => ({ ...prev, [canonical]: val }));
-            const enrichedMeta = { site: (meta.site || (mode && mode !== 'BREW' ? mode : customerSlug || 'BREW')), device: meta.device, metric: meta.metric || null, terminal: 'Target' };
-            registerMeta(canonical, enrichedMeta);
+            const canonicalNormT = (() => { try { const p = String(canonical).split('/').filter(Boolean); if (p.length) p[0] = p[0].toUpperCase(); return p.join('/'); } catch (e) { return canonical; } })();
+            setGTargets(prev => ({ ...prev, [canonicalNormT]: val }));
+            const enrichedMetaT = { site: (meta.site || (mode ? mode : (customerSlug || null))), device: meta.device, metric: meta.metric || null, terminal: 'Target' };
+            registerMeta(canonicalNormT, enrichedMetaT);
           };
           // Enhanced POWER state extractor for multiple topic patterns
           const applyPower = (topic, payloadObj) => {
@@ -1945,9 +2099,10 @@ function parseJwtPayload(tok) {
               if (deviceName) {
                 // Try to infer site from existing meta first, else prefer explicit mode, then BREW
                 const inferred = findSiteForDevice(deviceName);
-                const siteForLegacy = inferred || mode || 'BREW';
-                // Mark as legacy-nosite if the topic lacked an explicit site token
-                try { legacyNoSiteDevicesRef.current.add(String(deviceName).toUpperCase()); } catch (e) {}
+                const siteForLegacy = inferred || mode || null; // do NOT default to BREW
+                // Do not treat topics without an explicit site as BREW: require
+                // an inferred site (via discovery) or runtime mode/customerSlug.
+                if (!siteForLegacy) return;
                 baseKey = `${siteForLegacy}/${deviceName}`;
               }
             }
@@ -1956,9 +2111,9 @@ function parseJwtPayload(tok) {
               deviceName = parts[1];
               if (deviceName) {
                 const inferred = findSiteForDevice(deviceName);
-                const siteForStat = inferred || mode || 'BREW';
-                // Mark as legacy-nosite when stat/<device>/... (no site token present)
-                try { legacyNoSiteDevicesRef.current.add(String(deviceName).toUpperCase()); } catch (e) {}
+                const siteForStat = inferred || mode || null; // do not default to BREW
+                // If site cannot be inferred, ignore stat/<device> legacy messages
+                if (!siteForStat) return;
                 baseKey = `${siteForStat}/${deviceName}`;
               }
             }
@@ -2045,10 +2200,8 @@ function parseJwtPayload(tok) {
 
               // Determine site preference
               const siteForStat = site || findSiteForDevice(device) || mode || (customerSlug ? String(customerSlug).toUpperCase() : null) || 'BREW';
-              // If the stat topic lacked a site token (stat/<device>/...), mark this device as legacy-nosite
-              if (!site && device) {
-                try { legacyNoSiteDevicesRef.current.add(String(device).toUpperCase()); } catch (e) {}
-              }
+              // Do not mark devices as legacy-nosite; require explicit site or inference
+              // from discovery/runtime mode. If none available, skip handling.
               const normBase = normalizeCanonicalBase(`${siteForStat}/${device}`, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || `${siteForStat}/${device}`;
 
               // Interpret payload
@@ -2123,12 +2276,12 @@ function parseJwtPayload(tok) {
           // also accept 'current' responses from the bridge for sensor gets
           if (obj.type === 'current' && typeof obj.topic === 'string' && /\/sensor$/i.test(obj.topic)) {
             const n = obj.payload === null ? null : Number(obj.payload);
-            if (!Number.isNaN(n) && n !== null) { applySensor(obj.topic, n); markConnected(); brewskiLog('Current response (Sensor)', obj.topic, n); }
+            if (!Number.isNaN(n) && n !== null) { applySensor(obj.topic, n); markConnected();}
           }
           if (obj.type === 'current' && typeof obj.topic === 'string' && /\/target$/i.test(obj.topic)) {
             if (obj.payload !== null && obj.payload !== undefined && obj.payload !== '') {
               const n = Number(obj.payload);
-              if (!Number.isNaN(n)) { applyTarget(obj.topic, n); markConnected(); brewskiLog('Current response (Target)', obj.topic, n); }
+              if (!Number.isNaN(n)) { applyTarget(obj.topic, n); markConnected();  }
             }
           }
           // also accept 'current' responses from the bridge for sensor gets
@@ -2164,11 +2317,17 @@ function parseJwtPayload(tok) {
               Object.entries(g.topics).forEach(([topic, val]) => {
                   const parsed = parseTopic(topic);
                   if (!parsed) return;
-                  // If site missing in grouped inventory, default to BREW (and mark legacy-nosite)
-                  if (!parsed.site) {
-                    try { legacyNoSiteDevicesRef.current.add(String(parsed.device).toUpperCase()); } catch (e) {}
-                    parsed.site = 'BREW';
-                  }
+                      // If site missing in grouped inventory, prefer discovery inference but do NOT default to BREW.
+                      if (!parsed.site) {
+                        try {
+                          const inferred = findSiteForDevice(parsed.device);
+                          if (inferred) parsed.site = inferred;
+                          else {
+                            // leave parsed.site null; we'll skip adding unscoped bases until we have mode/customer context
+                            try { legacyNoSiteDevicesRef.current.add(String(parsed.device).toUpperCase()); } catch (e) {}
+                          }
+                        } catch (e) {}
+                      }
                   // Canonicalize baseKey using parsed.site
                   const cand = canonicalBaseFromMeta(parsed);
                   let baseKey = null;
@@ -2268,8 +2427,10 @@ function parseJwtPayload(tok) {
             Object.entries(inv).forEach(([topic, val]) => {
               const parsed = parseTopic(topic);
               if (!parsed) return;
-                // If site missing, default to BREW so DB-backed snapshot entries are canonicalized
-                if (!parsed.site) parsed.site = 'BREW';
+                // If site missing, do NOT default to BREW. Leave parsed.site null so
+                // entries without explicit site are ignored until we have a mode/customer context.
+                // This prevents creating BREW-prefixed entries from inventories that omit site.
+                // if (!parsed.site) parsed.site = 'BREW';
                 const baseKey = canonicalBaseFromMeta(parsed) || (parsed.metric ? `${parsed.device}/${parsed.metric}` : `${parsed.device}`);
               const n = Number(val);
               if (/\/sensor$/i.test(topic) && !Number.isNaN(n)) sensorAdds[baseKey] = n;
@@ -2372,6 +2533,8 @@ function parseJwtPayload(tok) {
             if (DEBUG) console.log('Dashboard: persisted token to localStorage.brewski_jwt');
           }
         }
+        // Also persist token to AsyncStorage for RN so cold starts can hydrate
+        try { persistTokenToStorage(token).catch(() => {}); } catch (e) {}
       } catch (e) {
         if (DEBUG) console.warn('Dashboard: failed to persist token to storage', e && e.message);
       }
@@ -2388,16 +2551,6 @@ function parseJwtPayload(tok) {
     connectWebSocket();
     // Hydrate last-known values from localStorage for immediate UX (web only)
     // NOTE: Removed localStorage hydration — rely on authoritative DB snapshot and live MQTT only
-    (async () => {
-      try {
-  const path = '/thresholds';
-  let res;
-  try { res = await doApiFetch(path); } catch (e) { res = null; }
-        if (res.status === 401) { try { window.dispatchEvent(new CustomEvent('brewski-unauthorized')); } catch (e) {} return; }
-        const js = await res.json();
-        if (js && js.overrides) setThresholds(js.overrides);
-      } catch(e) {}
-    })();
     // NEW: Snapshot hydrate from /api/latest so gauges and POWER states render immediately after reload (before live MQTT)
     (async () => {
       try {
@@ -2466,7 +2619,11 @@ function parseJwtPayload(tok) {
           if (parts.length === 3) { device = parts[1]; }
           else if (parts.length >= 4) { site = parts[1]; device = parts[2]; }
           if (!device) return;
-          const siteForStat = site || findSiteForDevice(device) || mode || (customerSlug ? String(customerSlug).toUpperCase() : null) || 'BREW';
+          // Do NOT default to 'BREW' for missing site — require explicit site, discovery
+          // inference (findSiteForDevice) or runtime mode/customerSlug. If none are
+          // available, skip applying this stat message so we don't synthesize BREW entries.
+          const siteForStat = site || findSiteForDevice(device) || mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
+          if (!siteForStat) return;
           const normBase = normalizeCanonicalBase(`${siteForStat}/${device}`, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || `${siteForStat}/${device}`;
 
           // mark provided key so snapshot doesn't overwrite
@@ -2507,10 +2664,11 @@ function parseJwtPayload(tok) {
             site = core[0]; device = core[1]; metric = core[2];
           }
 
-          // Default missing site to BREW so snapshot canonicalization matches runtime
+          // If site is missing in the inventory snapshot, do NOT synthesize a
+          // 'BREW' prefix. Leave site null so we treat this as a device-only entry.
           if (!site) {
-            try { if (device) legacyNoSiteDevicesRef.current.add(String(device).toUpperCase()); } catch (e) {}
-            site = 'BREW';
+            // historically we tracked legacy no-site devices here; we no longer
+            // populate that set and we do not assign a default site.
           }
 
           // Reconstruct canonical baseKey matching applySensor logic
@@ -2585,7 +2743,7 @@ function parseJwtPayload(tok) {
           } catch (e) { parsedLastRaw = null; }
 
           // If last_raw contained POWER keys (e.g., { POWER1: 'OFF', POWER2: 'ON' }), prefer these.
-          if (parsedLastRaw && typeof parsedLastRaw === 'object') {
+              if (parsedLastRaw && typeof parsedLastRaw === 'object') {
             try {
               const found = {};
               Object.entries(parsedLastRaw).forEach(([k, v]) => {
@@ -2598,7 +2756,9 @@ function parseJwtPayload(tok) {
                 } catch (e) {}
               });
               if (Object.keys(found).length) {
-                const baseCandidate = (site && device) ? `${site}/${device}` : (core && core.length ? (core.length >= 2 ? `${core[0]}/${core[1]}` : `BREW/${core[0]}`) : rawTopic);
+                // If no site is present, prefer device-only base (e.g. `Device`) rather
+                // than synthesizing `BREW/Device`.
+                const baseCandidate = (site && device) ? `${site}/${device}` : (core && core.length ? (core.length >= 2 ? `${core[0]}/${core[1]}` : `${core[0]}`) : rawTopic);
                 persistFound(baseCandidate, found, row.last_ts);
                 return;
               }
@@ -2609,7 +2769,7 @@ function parseJwtPayload(tok) {
                 if (/^POWER\d*$/i.test(pk)) {
                   const st = parsedLastRaw.state;
                   const isOn = (typeof st === 'string') ? (st.toUpperCase() === 'ON' || st === '1' || st.toUpperCase() === 'TRUE') : !!st;
-                  const baseCandidate = (site && device) ? `${site}/${device}` : (parts && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : (device ? `BREW/${device}` : rawTopic));
+                  const baseCandidate = (site && device) ? `${site}/${device}` : (parts && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : (device ? `${device}` : rawTopic));
                   persistFound(baseCandidate, { [pk]: isOn }, row.last_ts);
                   return;
                 }
@@ -2633,7 +2793,7 @@ function parseJwtPayload(tok) {
                   } catch (e) {}
                 });
                 if (Object.keys(found).length) {
-                  const baseCandidate = (site && device) ? `${site}/${device}` : (core && core.length ? (core.length >= 2 ? `${core[0]}/${core[1]}` : `BREW/${core[0]}`) : rawTopic);
+                  const baseCandidate = (site && device) ? `${site}/${device}` : (core && core.length ? (core.length >= 2 ? `${core[0]}/${core[1]}` : `${core[0]}`) : rawTopic);
                   persistFound(baseCandidate, found, row.last_ts);
                   return;
                 }
@@ -2657,7 +2817,7 @@ function parseJwtPayload(tok) {
                 }
               } catch (e) {}
               try { if (!isOn && (row.last_value === 1 || row.last_value === '1' || row.last_value === true)) isOn = true; } catch (e) {}
-              const baseCandidate = (site && device) ? `${site}/${device}` : (parts && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : (device ? `BREW/${device}` : rawTopic));
+              const baseCandidate = (site && device) ? `${site}/${device}` : (parts && parts.length >= 2 ? `${parts[0]}/${parts[1]}` : (device ? `${device}` : rawTopic));
               persistFound(baseCandidate, { [pk]: isOn }, row.last_ts);
               return;
             } catch (e) {}
@@ -2931,10 +3091,8 @@ function parseJwtPayload(tok) {
       return;
     }
     if (!wsRef.current || wsRef.current.readyState !== 1) {
-      // Try to reconnect and schedule a retry so UI actions result in a publish
       try { brewskiLog('publishTargetForDevice: ws not open, attempting reconnect and scheduling retry', { readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
       try { connectWebSocket(); } catch (e) {}
-      // schedule a single retry after a short delay; allow caller to move on
       setTimeout(() => {
         try { publishTargetForDevice(deviceKey, n); } catch (e) {}
       }, 500);
@@ -2943,8 +3101,7 @@ function parseJwtPayload(tok) {
     const id = Date.now() + '-' + Math.random().toString(36).slice(2,8);
 
     // deviceKey is expected to be canonical SITE/DEVICE or DEVICE. Derive
-    // site/device pieces and build a topic using buildCmdTopic so we honor
-    // legacy devices that historically published without a site prefix.
+    // site/device pieces and build a topic using the new targ/<MODE>/<DEVICE>Target format.
     let site = null; let deviceName = null;
     try {
       const parts = String(deviceKey || '').split('/').filter(Boolean);
@@ -2958,114 +3115,40 @@ function parseJwtPayload(tok) {
       else if (customerSlug) site = String(customerSlug).toUpperCase();
     }
 
-    // If we still don't have a deviceName, abort
     if (!deviceName) return;
 
-    // BREW-specific legacy: if the original deviceKey explicitly started with 'BREW/'
-    // (exact match for the site segment) publish the raw value to `DEVICETarget`
-    // (no slash). This preserves a long-standing broker/device expectation.
+    // Build the new topic: targ/<MODE>/<DEVICE>Target
     let pubTopic = null;
-    const originalStartsWithBrew = /^\s*BREW\//i.test(String(deviceKey || ''));
-    if (originalStartsWithBrew) {
-      // Devicetarget format: e.g. FERM5Target (device name uppercased)
-      try {
-        pubTopic = `${String(deviceName || '').toUpperCase()}Target`;
-      } catch (e) {
-        pubTopic = `${deviceName}Target`;
-      }
+    if (site) {
+      pubTopic = `targ/${site}/${deviceName}Target`;
     } else {
-      // Build a command topic for a Tasmota-style Target command (we'll use 'Status' and 'Target' patterns where appropriate)
-      // Use buildCmdTopic to allow stripping BREW for legacy devices when appropriate, then append '/Target' to form the target topic.
-      const baseCmd = buildCmdTopic(site, deviceName, 'Target');
-      // baseCmd will be like 'cmnd/<site>/<device>/Target' or 'cmnd/<device>/Target' for legacy
-      // But for Target we publish to the raw `${site}/${device}/Target` (not cmnd prefix). Build accordingly.
-      try {
-        // If baseCmd begins with 'cmnd/', strip the 'cmnd' prefix and use the remainder as the topic path
-        if (typeof baseCmd === 'string' && baseCmd.toLowerCase().startsWith('cmnd/')) {
-          pubTopic = baseCmd.split('/').slice(1).join('/');
-        } else {
-          // Fallback to deviceKey/Target
-          pubTopic = `${deviceKey}/Target`;
-        }
-      } catch (e) {
-        pubTopic = `${deviceKey}/Target`;
-      }
+      pubTopic = `targ/${deviceName}Target`;
     }
 
-    // Compute a canonical base key for optimistic UI update. Prefer the provided deviceKey
-    // normalized via existing helper so we match how other parts of the app index targets.
+    // Optimistic UI update: set local known target immediately so sliders don't wait for round-trip
     let canonicalForUpdate = null;
     try {
       canonicalForUpdate = normalizeCanonicalBase(deviceKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || (site ? `${site}/${deviceName}` : deviceName);
     } catch (e) { canonicalForUpdate = (site ? `${site}/${deviceName}` : deviceName); }
 
     try {
-      if (originalStartsWithBrew) {
-        // BREW legacy: preserve exact casing (device uppercased already)
-          try { brewskiLog('[publishTarget] send', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
-          brewskiLog('publish', pubTopic, val, id);
-        // Also attempt additional legacy-compatible variants in case the bridge
-        // expects a slash-separated topic or a cmnd/ prefix for BREW devices.
-        try {
-          const withSlash = `${deviceName}/Target`;
-          const withCmnd = `cmnd/${deviceName}/Target`;
-          try { brewskiLog('[publishTarget] send fallback (slash)', { topic: withSlash, payload: val, id }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: withSlash, payload: val, id: id + '-s' }));
-          try { brewskiLog('[publishTarget] send fallback (cmnd)', { topic: withCmnd, payload: val, id }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: withCmnd, payload: val, id: id + '-c' }));
-        } catch (e) { brewskiLog('publishTargetForDevice: BREW extra sends failed', e && e.message); }
-      } else {
-        // normalize prefix to lowercase for broker expectations (site/device case preserved)
-        try {
-          const parts = pubTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const outTopic = parts.join('/');
-          try { brewskiLog('[publishTarget] send', { topic: outTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload: val, id }));
-          brewskiLog('publish', outTopic, val, id);
-        } catch (e) {
-          try { brewskiLog('[publishTarget] send fallback', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
-          brewskiLog('publish', pubTopic, val, id);
-        }
-      }
-
-      // Optimistic UI update: set local known target immediately so sliders don't wait for round-trip
-      try {
-        if (canonicalForUpdate) setGTargets(prev => ({ ...(prev || {}), [canonicalForUpdate]: val }));
-      } catch (e) {}
+      try { brewskiLog('[publishTarget] send', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
+      wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
+      brewskiLog('publish', pubTopic, val, id);
+      if (canonicalForUpdate) setGTargets(prev => ({ ...(prev || {}), [canonicalForUpdate]: val }));
     } catch (e) {}
 
     setTimeout(() => {
       try {
         if (wsRef.current) {
           const getId = id + '-get';
-          let getTopic = pubTopic;
-          // For BREW legacy, ensure GET covers additional topic variants we published above
-          if (originalStartsWithBrew) {
-            // schedule GETs for the legacy raw topic, slash variant, and cmnd variant
-            try { const t1 = pubTopic; const t2 = `${deviceName}/Target`; const t3 = `cmnd/${deviceName}/Target`; brewskiLog('publishTargetForDevice: scheduling multiple GETs for BREW', { t1, t2, t3, getId }); wsRef.current.send(JSON.stringify({ type: 'get', topic: t1, id: getId + '-a' })); wsRef.current.send(JSON.stringify({ type: 'get', topic: t2, id: getId + '-b' })); wsRef.current.send(JSON.stringify({ type: 'get', topic: t3, id: getId + '-c' })); } catch (e) {}
-            return;
-          }
-          if (!originalStartsWithBrew) {
-            const parts = pubTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); getTopic = parts.join('/');
-          }
-          brewskiLog('publishTargetForDevice: scheduling GET for', getTopic, getId);
-          wsRef.current.send(JSON.stringify({ type: 'get', topic: getTopic, id: getId }));
+          brewskiLog('publishTargetForDevice: scheduling GET for', pubTopic, getId);
+          wsRef.current.send(JSON.stringify({ type: 'get', topic: pubTopic, id: getId }));
         }
       } catch (e) { brewskiLog('publishTargetForDevice: GET send failed', e && e.message); }
     }, 500);
-    // After scheduling GETs/probes, explicitly call requestCurrentForBase so incoming
-    // variant replies are canonicalized and applied to gTargets quickly.
-    try {
-      if (originalStartsWithBrew) {
-        // call for each variant we requested
-        try { requestCurrentForBase(`${deviceName}`); } catch (e) {}
-        try { requestCurrentForBase(`${deviceName}/Target`); } catch (e) {}
-        try { requestCurrentForBase(`${deviceName}`); } catch (e) {}
-      } else {
-        try { requestCurrentForBase(canonicalForUpdate); } catch (e) {}
-      }
-    } catch (e) {}
+
+    try { requestCurrentForBase(canonicalForUpdate); } catch (e) {}
   };
   // Build a cmnd topic, stripping the BREW site for devices we know historically published without a site.
   // Returns a string like `cmnd/<device>/<Cmd>` or `cmnd/<site>/<device>/<Cmd>`.
@@ -3079,22 +3162,9 @@ function parseJwtPayload(tok) {
       // Defensive: ensure we have a device and a command
       if (!d || !cmd) return `cmnd/${d}/${cmd}`;
 
-      // If this device is known to be legacy-nosite and the site is BREW (or missing), omit the site prefix
-      try {
-        if ((s === 'BREW' || !s) && legacyNoSiteDevicesRef.current && legacyNoSiteDevicesRef.current.has(String(d).toUpperCase())) {
+          // If we have a non-empty site, include it; otherwise return device-only topic
+          if (s && s.length) return `cmnd/${s}/${d}/${cmd}`;
           return `cmnd/${d}/${cmd}`;
-        }
-      } catch (e) {
-        // ignore and fall through
-      }
-
-      // If we have a non-empty site, include it
-      if (s && s.length) {
-        return `cmnd/${s}/${d}/${cmd}`;
-      }
-
-      // Fallback: device-only topic
-      return `cmnd/${d}/${cmd}`;
     } catch (e) {
       return `cmnd/${deviceName}/${cmdKey}`;
     }
@@ -3220,22 +3290,7 @@ function parseJwtPayload(tok) {
         ws.send(JSON.stringify({ type: 'get', topic: stateTopic, id: idSt }));
       } catch (e) {}
 
-      // If the base looks like a legacy BREW (no site or BREW site), also probe
-      // raw device-target variants (e.g., FERM3Target) and slash/cmnd fallbacks.
-      try {
-        const isBrewish = !site || String(site).toUpperCase() === 'BREW';
-        if (isBrewish && deviceName) {
-          // Raw DEVICETarget (legacy tasmota/bridge behavior)
-          try {
-            const rawTarget = `${String(deviceName).toUpperCase()}Target`;
-            ws.send(JSON.stringify({ type: 'get', topic: rawTarget, id: `reqcur-raw-target-${base}-${Date.now()}` }));
-          } catch (e) {}
-          // Slash variant: device/Target
-          try { ws.send(JSON.stringify({ type: 'get', topic: `${deviceName}/Target`, id: `reqcur-slash-target-${base}-${Date.now()}` })); } catch (e) {}
-          // cmnd prefixed variant
-          try { ws.send(JSON.stringify({ type: 'get', topic: `cmnd/${deviceName}/Target`, id: `reqcur-cmnd-target-${base}-${Date.now()}` })); } catch (e) {}
-        }
-      } catch (e) {}
+      // No legacy BREW raw/cmnd probes: only request normalized base topics.
 
       // Probe device with non-mutating Status 0 to encourage immediate STATE publish
       try { probeStateForDevice(site, deviceName); } catch (e) {}
