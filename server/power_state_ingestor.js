@@ -36,16 +36,21 @@ function canonicalizeTopic(raw) {
     const parts = s.split('/').filter(Boolean).map(p => String(p).toUpperCase());
     while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
     if (parts.length === 0) return raw;
-    let site = 'BREW';
+    // Do NOT default to BREW. Require explicit site in incoming topics.
+    // If a site segment is missing, return null to indicate an unscoped/invalid topic.
+    let site = null;
     let device = '';
     if (parts.length === 1) {
-      device = parts[0];
+      // single-segment topics (device only) are legacy and must be rejected here
+      return null;
     } else {
-      site = parts[0] || 'BREW';
+      // Do NOT default to BREW. Require explicit site in incoming topics.
+      site = parts[0];
       device = parts[1] || '';
     }
-    site = String(site).toUpperCase();
+    site = site ? String(site).toUpperCase() : null;
     device = String(device).toUpperCase();
+    if (!site) return null;
     return `${site}/${device}/STATE`;
   } catch (e) { return raw; }
 }
@@ -127,10 +132,7 @@ function startPowerStateIngestor() {
   try { if (!process.env.DEBUG_BRIDGE) process.env.DEBUG_BRIDGE = '1'; } catch (e) {}
   const customerMap = getCustomerSlugMap();
   let customerMapLocal = customerMap;
-  const catchAllId = customerMapLocal['BREW'];
-  if (!catchAllId) {
-    return;
-  }
+  // Do not use a catch-all 'BREW' customer. All messages MUST include an explicit site slug.
   mqttClient.registerMessageHandler(({ topic, payload }) => {
     // Handle both tele/.../STATE JSON messages and per-key stat/.../POWER or stat/.../POWER1 topics
     let raw = null;
@@ -188,18 +190,19 @@ function startPowerStateIngestor() {
     } catch (e) {
       return;
     }
-  const slug = extractSlugFromTopic(topic);
-    // ensure we match slug keys case-insensitively by using uppercase keys
-    let customerId = catchAllId;
-    try {
-      if (slug) {
-        // refresh the map if we miss (handles newly-created customers without restart)
-        if (!customerMapLocal[slug]) {
-          customerMapLocal = getCustomerSlugMap();
-        }
-        customerId = (slug && customerMapLocal[slug]) ? customerMapLocal[slug] : catchAllId;
-      }
-    } catch (e) { customerId = catchAllId; }
+    const slug = extractSlugFromTopic(topic);
+    // require explicit site slug; do not default to BREW
+    if (!slug) {
+      if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: rejecting message with no site slug', { topic });
+      return; // ignore legacy nosite topics
+    }
+    // refresh the map if we miss (handles newly-created customers without restart)
+    if (!customerMapLocal[slug]) customerMapLocal = getCustomerSlugMap();
+    const customerId = customerMapLocal[slug];
+    if (!customerId) {
+      if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: unknown site slug, ignoring', { slug, topic });
+      return;
+    }
     Object.keys(raw).forEach(k => {
         if (/^POWER(\d*)$/i.test(k)) {
           const val = raw[k] === 'ON' ? 1 : 0;
@@ -214,22 +217,8 @@ function startPowerStateIngestor() {
           // prefer the existing BREW/<device> so we don't create a separate SITE/<device>
           // row for legacy no-site devices. This keeps legacy devices namespaced under
           // BREW and avoids collisions across tenants.
-          try {
-            const parts = String(keyBase || '').split('/').filter(Boolean);
-            const device = parts.length ? parts[parts.length - 1] : null;
-            if (device && parts.length > 1) {
-              const brewKey = `BREW/${device}`;
-              // case-insensitive search for existing BREW/<device>
-              try {
-                const existing = db.prepare('SELECT id FROM sensors WHERE UPPER(key)=? LIMIT 1').get(String(brewKey).toUpperCase());
-                if (existing && existing.id) {
-                  canonical = `${brewKey}/STATE`;
-                  keyBase = brewKey;
-                  if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: remapping to existing BREW row', { incoming: topic, brewKey, canonical });
-                }
-              } catch (e) { /* ignore DB lookup errors */ }
-            }
-          } catch (e) { /* ignore normalization errors */ }
+          // Do not remap incoming SITE/DEVICE to existing BREW/<device> rows.
+          // Messages should be recorded for the explicit site provided in the topic.
           // Read last_value and last_ts for debugging to decide why we may skip upserts
           let lastRow = null;
           try {

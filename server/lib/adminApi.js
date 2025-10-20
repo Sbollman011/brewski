@@ -61,16 +61,19 @@ function canonicalizeTopic(raw) {
     // remove trailing STATE tokens if present
     while (parts.length && parts[parts.length - 1] === 'STATE') parts.pop();
     if (parts.length === 0) return raw;
-    let site = 'BREW';
+    // Do not default to BREW. Require explicit site. Single-segment topics are legacy and considered invalid here.
+    let site = null;
     let device = '';
     if (parts.length === 1) {
-      device = parts[0];
+      // No explicit site provided; treat as unscoped/invalid for canonicalization
+      return null;
     } else {
-      site = parts[0] || 'BREW';
+      site = parts[0] || null;
       device = parts[1] || '';
     }
-    site = String(site).toUpperCase();
+    site = site ? String(site).toUpperCase() : null;
     device = String(device).toUpperCase();
+    if (!site) return null;
     return `${site}/${device}/STATE`;
   } catch (e) { return raw; }
 }

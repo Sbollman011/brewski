@@ -205,9 +205,9 @@ class NextMqttClient extends EventEmitter {
                       if (customer && customer.id) {
                         customerId = customer.id;
                       } else {
-                        // If no customer found for slug, try to find/create BREW customer as catch-all
-                        const brewCustomer = findCustomerBySlug('BREW');
-                        if (brewCustomer && brewCustomer.id) customerId = brewCustomer.id;
+                        // If no customer found for slug, do NOT fall back to a global BREW customer.
+                        // Leave the configured DEFAULT_CUSTOMER_ID or previously-determined value.
+                        if (process.env.DEBUG_BRIDGE === '1') console.debug('mqtt-client: no customer for slug', potentialSlug);
                       }
                     } catch (e) { /* auth module unavailable, use fallback */ }
                   }
