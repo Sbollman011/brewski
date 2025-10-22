@@ -29,6 +29,11 @@ const CONFIG = {
   GROUP_SEGMENT_INDEX: parseInt(process.env.MQTT_GROUP_SEGMENT_INDEX || '1', 10),
   PROTOCOL_RAW: (process.env.MQTT_PROTOCOL || '').toLowerCase(),
   FORCE_TLS: process.env.MQTT_FORCE_TLS === '1',
+  // Persist latest Target/Sensor values to disk. Default: disabled (safer).
+  ENABLE_PERSIST_LATEST: process.env.ENABLE_PERSIST_LATEST === '1',
+  // When set, do NOT fall back to the legacy 'BREW' customer when a topic slug
+  // cannot be resolved. Instead ingestion will be skipped for those messages.
+  REQUIRE_SITE_SLUGS: process.env.REQUIRE_SITE_SLUGS === '1',
   // Prefer an explicit MQTT host via env. Fall back to SERVER_FQDN or 127.0.0.1 for legacy.
   HOST: process.env.MQTT_HOST || process.env.MQTT_BROKER_HOST || process.env.SERVER_FQDN || '127.0.0.1',
   PORT_OVERRIDE: process.env.MQTT_PORT || process.env.MQTT_BROKER_PORT,
@@ -146,7 +151,9 @@ class NextMqttClient extends EventEmitter {
         this.latestValue.set(topic, payload);
         this.latestRetain.set(topic, retained);
         if (this.recentMessages.length > this.MAX_RECENT) this.recentMessages.splice(this.MAX_RECENT);
-        if (/\/(Target|Sensor)$/i.test(topic)) this.persistLatest();
+        if (/\/(Target|Sensor)$/i.test(topic)) {
+          if (CONFIG.ENABLE_PERSIST_LATEST && !/DUMMY/i.test(topic)) this.persistLatest();
+        }
         // Group indexing
         const group = this._extractGroup(topic);
         if (group) {
@@ -212,7 +219,12 @@ class NextMqttClient extends EventEmitter {
                     } catch (e) { /* auth module unavailable, use fallback */ }
                   }
                 }
-                ingestNumeric({ customerId, key: baseKey, topicKey: baseKey, value: numeric, raw: rawForStore });
+                // If REQUIRE_SITE_SLUGS is enabled and we couldn't resolve a customerId, skip ingestion.
+                if (CONFIG.REQUIRE_SITE_SLUGS && !customerId) {
+                  // intentionally skip ingesting messages without explicit site slug
+                } else {
+                  ingestNumeric({ customerId, key: baseKey, topicKey: baseKey, value: numeric, raw: rawForStore });
+                }
               }
             }
           }
@@ -243,11 +255,15 @@ class NextMqttClient extends EventEmitter {
   publish(topic, payload, opts = {}, cb) {
     if (!this.client) return cb && cb(new Error('not-connected'));
     const retain = !!opts.retain;
+    const LOG_MQTT_PUBLISH = process.env.LOG_MQTT_PUBLISH === '1';
+    if (LOG_MQTT_PUBLISH) {
+      try { console.log('[mqtt-client] publish', { topic, payload: String(payload), retain }); } catch (e) {}
+    }
     this.client.publish(topic, String(payload), { qos: 0, retain }, err => {
       if (!err && /\/(Target)$/.test(topic)) {
         this.latestValue.set(topic, String(payload));
         this.latestRetain.set(topic, retain);
-        this.persistLatest();
+        if (CONFIG.ENABLE_PERSIST_LATEST && !/DUMMY/i.test(topic)) this.persistLatest();
       }
       if (cb) cb(err);
     });
@@ -325,20 +341,24 @@ class NextMqttClient extends EventEmitter {
 
   persistLatest() {
     try {
+      if (!CONFIG.ENABLE_PERSIST_LATEST) return;
       const out = {};
       for (const [k,v] of this.latestValue.entries()) {
+        // Never persist known dummy topics that can cause noisy replay on broker restart
+        if (/DUMMY/i.test(k)) continue;
         if (/\/(Target|Sensor)$/i.test(k)) out[k] = v;
       }
-      fs.writeFileSync(this.PERSIST_FILE, JSON.stringify(out));
+      try { fs.writeFileSync(this.PERSIST_FILE, JSON.stringify(out)); } catch (e) { /* ignore */ }
     } catch (e) {}
   }
 
   loadPersisted() {
     try {
+      if (!CONFIG.ENABLE_PERSIST_LATEST) return;
       if (fs.existsSync(this.PERSIST_FILE)) {
         const raw = fs.readFileSync(this.PERSIST_FILE, 'utf8');
         const obj = JSON.parse(raw);
-        if (obj && typeof obj === 'object') Object.entries(obj).forEach(([k,v]) => { if (typeof v === 'string') this.latestValue.set(k, v); });
+        if (obj && typeof obj === 'object') Object.entries(obj).forEach(([k,v]) => { if (typeof v === 'string' && !/DUMMY/i.test(k)) this.latestValue.set(k, v); });
         this.dlog('[next] loaded persisted keys', this.latestValue.size);
       }
     } catch (e) { this.dlog('[next] persist load error', e && e.message); }

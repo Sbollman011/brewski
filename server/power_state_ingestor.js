@@ -226,16 +226,37 @@ function startPowerStateIngestor() {
           } catch (e) { lastRow = null; }
           const last = lastRow ? lastRow.last_value : undefined;
           const lastTs = lastRow ? lastRow.last_ts : null;
-          // Always ensure a power_label placeholder exists so the Admin UI
-          // will render an editable input for this POWER key even when the
-          // reported numeric value hasn't changed.
-          try { ensurePowerLabelPlaceholder(customerId, canonical, k); } catch (e) {}
+          // For stat-originated messages (fromStat === true) we must NOT create
+          // new DB rows or power_label placeholders. stat/... messages are
+          // probes and may arrive from devices without tenant/site context; the
+          // authoritative creation of sensors/placeholders should be driven by
+          // tele/<SITE>/<DEVICE>/STATE messages. Therefore:
+          //  - Only create/ensure power_label placeholders when the message
+          //    did NOT originate from a `stat/...` topic.
+          //  - When the message *did* originate from stat, only upsert if a
+          //    sensor row already exists for this customer+keyBase; do not
+          //    call ingestion that would create a new sensor.
+          try {
+            if (!fromStat) {
+              try { ensurePowerLabelPlaceholder(customerId, canonical, k); } catch (e) {}
+            }
+          } catch (e) {}
+
           if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: will upsert?', { customerId, canonical, keyBase, powerKey: k, newVal: val, last, lastTs, fromStat });
-          // Always upsert when we don't have a last value, the value changed,
-          // or the incoming message was a stat/... topic — stat topics are non-mutating
-          // probes and we want to refresh last_ts/last_raw even if the numeric
-          // value is identical so clients see the fresh timestamp.
-          if (last === undefined || last !== val || fromStat) {
+
+          // Determine whether we should perform an upsert. For stat-originated
+          // messages, only upsert when a corresponding sensor row already
+          // exists for the (customerId, keyBase) pair. This prevents stat from
+          // creating new sensors or labels.
+          let shouldUpsert = true;
+          if (fromStat) {
+            try {
+              const existing = db.prepare('SELECT id FROM sensors WHERE customer_id = ? AND key = ?').get(customerId, keyBase);
+              if (!existing || !existing.id) shouldUpsert = false;
+            } catch (e) { shouldUpsert = false; }
+          }
+
+          if (shouldUpsert && (last === undefined || last !== val || fromStat)) {
             try {
               upsertPowerState(customerId, canonical, k, val, JSON.stringify(raw));
               if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: upserted', { customerId, canonical, powerKey: k, newVal: val });
@@ -243,7 +264,7 @@ function startPowerStateIngestor() {
               console.error('power_state_ingestor: upsert error', e && e.message ? e.message : e);
             }
           } else {
-            if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: skipped upsert (no change)', { customerId, canonical, powerKey: k, newVal: val, last });
+            if (process.env.DEBUG_BRIDGE === '1') console.debug('power_state_ingestor: skipped upsert (no change or stat-no-sensor)', { customerId, canonical, powerKey: k, newVal: val, last, shouldUpsert });
           }
         }
     });

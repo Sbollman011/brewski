@@ -130,7 +130,7 @@ function startWsBridge(opts = {}) {
 
   wss.on('connection', (ws, req) => {
     const user = (req && req.user) ? req.user : { id: 'unknown', username: 'unknown' };
-    const LOG_WS = process.env.LOG_WS_MESSAGES === '1';
+  const LOG_WS = process.env.LOG_WS_MESSAGES === '1';
     try { ws.send(JSON.stringify({ type: 'status', data: { server: 'brewski', user }, ts: Date.now() })); } catch (e) {}
 
     const configured = Array.isArray(topics) ? topics.slice() : [];
@@ -158,9 +158,16 @@ function startWsBridge(opts = {}) {
         const obj = JSON.parse(raw);
         if (!obj || !obj.type) return;
         if (obj.type === 'publish') {
-          const topic = obj.topic || 'DUMMYtest/Sensor';
+          // Require an explicit topic for publish requests; do not default to a DUMMY topic.
+          const topic = obj.topic;
           const payload = (typeof obj.payload === 'string' || typeof obj.payload === 'number') ? String(obj.payload) : JSON.stringify(obj.payload || '');
-          const retain = /\/(Target)$/.test(topic);
+          // Only set retain for Target topics when the client explicitly requested it.
+          // This prevents the bridge from implicitly repopulating retained Target messages
+          // after a broker restart when clients/servers reconnect.
+          const retain = (obj.retain === true) && /\/(Target)$/.test(topic);
+          if (LOG_WS) {
+            try { console.log('[ws-bridge] WS publish request', { user: (req && req.user && req.user.username) || 'unknown', topic, payload, requestedRetain: !!obj.retain, effectiveRetain: !!retain }); } catch (e) {}
+          }
           const pub = typeof publishFn === 'function' ? publishFn : (mqttClient && mqttClient.publish ? mqttClient.publish.bind(mqttClient) : null);
           if (!pub) {
             try { ws.send(JSON.stringify({ type: 'publish-result', success: false, error: 'no_publish_fn', id: obj.id, ts: Date.now() })); } catch (e) {}
