@@ -481,7 +481,28 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // Grouped by canonical base: { 'SITE/DEVICE': { POWER: 'Label', POWER1: 'Label2' } }
   const [powerLabelsByCanonical, setPowerLabelsByCanonical] = useState({});
   // store numeric customer id if provided by /api/latest so we can POST admin updates
-  // const [customerId, setCustomerId] = useState(null); // <-- REMOVE this duplicate
+  const [customerId, setCustomerId] = useState(() => {
+    try {
+      const v = safeLocal.getItem(_STORAGE_KEYS.customerId);
+      const n = v ? Number(v) : null;
+      return Number.isFinite(n) ? n : null;
+    } catch (e) { return null; }
+  });
+  // UI filter: customer slug (dynamic based on user's customer)
+  // Seed customerSlug and mode synchronously from safeLocal so initial render
+  // has effectiveMode available (helps RN cold-starts where AsyncStorage is async).
+  const [mode, setMode] = useState(() => {
+    try {
+      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
+      return s ? String(s).toUpperCase() : null;
+    } catch (e) { return null; }
+  });
+  const [customerSlug, setCustomerSlug] = useState(() => {
+    try {
+      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
+      return s || null;
+    } catch (e) { return null; }
+  });
   // Fetch power labels on mount (and when token changes)
   useEffect(() => {
     let mounted = true;
@@ -1410,29 +1431,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   const ALERT_DEBOUNCE_MS = 30_000; // avoid spamming same device alert more than every 30s
   // dynamic threshold overrides per base (min/max) loaded from server
   const [thresholds, setThresholds] = useState({}); // { base: { min, max } }
-  // store numeric customer id if provided by /api/latest so we can POST admin updates
-  const [customerId, setCustomerId] = useState(() => {
-    try {
-      const v = safeLocal.getItem(_STORAGE_KEYS.customerId);
-      const n = v ? Number(v) : null;
-      return Number.isFinite(n) ? n : null;
-    } catch (e) { return null; }
-  });
-  // UI filter: customer slug (dynamic based on user's customer)
-  // Seed customerSlug and mode synchronously from safeLocal so initial render
-  // has effectiveMode available (helps RN cold-starts where AsyncStorage is async).
-  const [mode, setMode] = useState(() => {
-    try {
-      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
-      return s ? String(s).toUpperCase() : null;
-    } catch (e) { return null; }
-  });
-  const [customerSlug, setCustomerSlug] = useState(() => {
-    try {
-      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
-      return s || null;
-    } catch (e) { return null; }
-  });
+  
   // Store raw power messages that need customer context
   const [pendingPowerMessages, setPendingPowerMessages] = useState([]);
   // Queue sensor/target messages that arrive before we know 'mode' so we can canonicalize them
