@@ -156,8 +156,9 @@ const _powerLabelsFetchCache = new Map(); // key -> { ts, existingKeys: Set }
 
 // Helper to fetch power labels from the API. Accepts an optional JWT token
 // and will try multiple fallbacks to handle different hosting/proxy setups.
-async function fetchPowerLabels(token) {
-  const cacheKey = token || '__anon__';
+async function fetchPowerLabels(token, customerId) {
+  // Cache key includes customerId when provided so per-customer results are cached separately
+  const cacheKey = customerId ? `id:${customerId}` : (token ? `tok:${token}` : '__anon__');
   if (_inflightFetchPowerLabels.has(cacheKey)) return await _inflightFetchPowerLabels.get(cacheKey);
   const doFetch = async () => {
     try {
@@ -174,8 +175,13 @@ async function fetchPowerLabels(token) {
 
       // Direct fetch to canonical API host (works in React Native and other hosts)
       const API_HOST = DEFAULT_API_HOST || 'api.brewingremote.com';
-      const adminUrl = `https://${API_HOST}/admin/api/power-labels`;
-      const publicUrl = `https://${API_HOST}/api/power-labels`;
+      let adminUrl = `https://${API_HOST}/admin/api/power-labels`;
+      let publicUrl = `https://${API_HOST}/api/power-labels`;
+      // If a numeric customerId was provided, prefer the per-customer query to reduce noise
+      if (customerId) {
+        adminUrl = `${adminUrl}?customer_id=${encodeURIComponent(customerId)}`;
+        publicUrl = `${publicUrl}?customer_id=${encodeURIComponent(customerId)}`;
+      }
 
       // Try admin endpoint with Authorization header first
       try {
@@ -191,7 +197,8 @@ async function fetchPowerLabels(token) {
       // Try admin endpoint with token query param (some setups accept token via query)
       if (token) {
         try {
-          const q = `${adminUrl}?token=${encodeURIComponent(token)}`;
+          // If we already appended customer_id above, include token as an additional param
+          const q = adminUrl.includes('?') ? `${adminUrl}&token=${encodeURIComponent(token)}` : `${adminUrl}?token=${encodeURIComponent(token)}`;
           const resQ = await fetch(q, { headers: { Accept: 'application/json' } });
           if (resQ && resQ.ok) {
             const jsq = await resQ.json().catch(() => null);
@@ -214,7 +221,7 @@ async function fetchPowerLabels(token) {
       // As a last attempt, try public endpoint with token query param
       if (token) {
         try {
-          const q2 = `${publicUrl}?token=${encodeURIComponent(token)}`;
+          const q2 = publicUrl.includes('?') ? `${publicUrl}&token=${encodeURIComponent(token)}` : `${publicUrl}?token=${encodeURIComponent(token)}`;
           const rq = await fetch(q2, { headers: { Accept: 'application/json' } });
           if (rq && rq.ok) {
             const jsq2 = await rq.json().catch(() => null);
@@ -473,11 +480,34 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   const [powerLabels, setPowerLabels] = useState({});
   // Grouped by canonical base: { 'SITE/DEVICE': { POWER: 'Label', POWER1: 'Label2' } }
   const [powerLabelsByCanonical, setPowerLabelsByCanonical] = useState({});
+  // store numeric customer id if provided by /api/latest so we can POST admin updates
+  const [customerId, setCustomerId] = useState(() => {
+    try {
+      const v = safeLocal.getItem(_STORAGE_KEYS.customerId);
+      const n = v ? Number(v) : null;
+      return Number.isFinite(n) ? n : null;
+    } catch (e) { return null; }
+  });
+  // UI filter: customer slug (dynamic based on user's customer)
+  // Seed customerSlug and mode synchronously from safeLocal so initial render
+  // has effectiveMode available (helps RN cold-starts where AsyncStorage is async).
+  const [mode, setMode] = useState(() => {
+    try {
+      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
+      return s ? String(s).toUpperCase() : null;
+    } catch (e) { return null; }
+  });
+  const [customerSlug, setCustomerSlug] = useState(() => {
+    try {
+      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
+      return s || null;
+    } catch (e) { return null; }
+  });
   // Fetch power labels on mount (and when token changes)
   useEffect(() => {
     let mounted = true;
     (async () => {
-      const labelsArr = await fetchPowerLabels(token);
+      const labelsArr = await fetchPowerLabels(token, customerId);
       // Convert array to map if needed
       let labelMap = {};
       if (Array.isArray(labelsArr)) {
@@ -486,7 +516,9 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             if (l && l.topic && l.power_key) {
               const rawTopic = String(l.topic).trim();
               const pk = String(l.power_key).toUpperCase();
-              const labelVal = l.label || '';
+              const labelVal = String(l.label || '').trim();
+              // skip empty labels (we don't want blank placeholders to enable buttons)
+              if (!labelVal) return;
 
               // Helper to add multiple variants into the map
               const add = (t, k) => {
@@ -510,20 +542,19 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 }
               } catch (e) {}
 
-              // Add tele variants for both site-prefixed and device-only forms
+              // Add tele variants for site-prefixed forms only. Avoid adding
+              // device-only tele/<device>/STATE variants which can match across
+              // unrelated prefixes and cause labels to bleed into other sites.
               try {
                 const parts = rawTopic.split('/').filter(Boolean);
                 let site = null; let device = null;
                 if (parts.length >= 3 && /^(tele|stat)$/i.test(parts[0])) { site = parts[1]; device = parts[2]; }
                 else if (parts.length >= 2) { site = parts[0]; device = parts[1]; }
-                else if (parts.length === 1) { device = parts[0]; }
-                if (device) {
-                  if (site) {
-                    add(`tele/${site}/${device}/STATE`, pk);
-                    add(`tele/${site}/${device}/STATE`.toUpperCase(), pk);
-                  }
-                  add(`tele/${device}/STATE`, pk);
-                  add(`tele/${device}/STATE`.toUpperCase(), pk);
+                // Only add tele variants when an explicit site is present. Do not add
+                // tele/<device>/STATE for device-only topics as that is too permissive.
+                if (device && site) {
+                  add(`tele/${site}/${device}/STATE`, pk);
+                  add(`tele/${site}/${device}/STATE`.toUpperCase(), pk);
                 }
               } catch (e) {}
 
@@ -532,9 +563,35 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 const maybeParts = rawTopic.split('/').filter(Boolean);
                 const candidateBase = maybeParts.length >= 2 ? `${maybeParts[0]}/${maybeParts[1]}` : `BREW/${maybeParts[0] || rawTopic}`;
                 const norm = normalizeCanonicalBase(candidateBase, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || candidateBase;
-                add(norm, pk);
-                add(`${norm}/STATE`, pk);
-                add(norm.toUpperCase(), pk);
+                // Defensive: avoid mapping ambiguous prefixes (e.g. RAIL/<DEVICE>/...) into
+                // a SITE/DEVICE canonical that would incorrectly apply labels across
+                // different orgs. Only add the normalized variant when the original
+                // first segment looks like a known slug/site (or is tele/stat) or when
+                // the normalized first segment matches a known slug or current customer.
+                try {
+                  const origFirst = (maybeParts[0] || '').toUpperCase();
+                  const normFirst = String(norm).split('/').filter(Boolean)[0] || '';
+                  const isTeleStat = /^(TELE|STAT)$/.test(origFirst);
+                  const origLooksLikeSlug = origFirst && knownSlugs && knownSlugs.has(origFirst);
+                  const normLooksLikeSlug = normFirst && knownSlugs && knownSlugs.has(normFirst);
+                  const matchesCurrentCustomer = (mode && mode === normFirst) || (customerSlug && String(customerSlug).toUpperCase() === normFirst);
+                  if (isTeleStat || origLooksLikeSlug || normLooksLikeSlug || matchesCurrentCustomer) {
+                    add(norm, pk);
+                    add(`${norm}/STATE`, pk);
+                    add(norm.toUpperCase(), pk);
+                  } else {
+                    // Fallback: add the raw candidateBase variants but avoid the
+                    // normalized (cross-customer) mapping which caused labels to
+                    // bleed across unrelated devices.
+                    add(candidateBase, pk);
+                    add(`${candidateBase}/STATE`, pk);
+                    add(candidateBase.toUpperCase(), pk);
+                  }
+                } catch (e) {
+                  add(norm, pk);
+                  add(`${norm}/STATE`, pk);
+                  add(norm.toUpperCase(), pk);
+                }
               } catch (e) {}
             }
           } catch (e) { /* ignore */ }
@@ -563,7 +620,9 @@ export default function Dashboard({ token, onCustomerLoaded }) {
               if (!can) return;
               if (!canonicalMap[can]) canonicalMap[can] = {};
               const upk = String(l.power_key).toUpperCase();
-              canonicalMap[can][upk] = l.label || '';
+              const labelVal = String(l.label || '').trim();
+              if (!labelVal) return; // ignore empty labels
+              canonicalMap[can][upk] = labelVal;
             } catch (e) { }
           });
         } else if (labelsArr && typeof labelsArr === 'object') {
@@ -584,9 +643,21 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         setPowerLabels(prev => {
           try {
             const next = Object.assign({}, prev || {});
-            Object.keys(labelMap || {}).forEach(k => { try { next[k] = labelMap[k]; } catch (e) {} });
-            // ensure uppercase variants are set
-            Object.keys(labelMap || {}).forEach(k => { try { next[k.toUpperCase()] = labelMap[k]; } catch (e) {} });
+            Object.keys(labelMap || {}).forEach(k => {
+              try {
+                const v = String(labelMap[k] || '').trim();
+                if (!v) return;
+                next[k] = v;
+              } catch (e) {}
+            });
+            // ensure uppercase variants are set for non-empty labels
+            Object.keys(labelMap || {}).forEach(k => {
+              try {
+                const v = String(labelMap[k] || '').trim();
+                if (!v) return;
+                next[k.toUpperCase()] = v;
+              } catch (e) {}
+            });
             return next;
           } catch (e) { return labelMap; }
         });
@@ -623,23 +694,39 @@ export default function Dashboard({ token, onCustomerLoaded }) {
               return s;
             });
 
-            // Initialize gPower entries (presence of keys enables power buttons)
+            // Initialize gPower entries (presence of keys enables power buttons).
+            // Use the canonicalized base for each stored label so we only create
+            // power entries for exact SITE/DEVICE canonical matches. This avoids
+            // labels stored under prefixes like RAIL/<DEVICE> from bleeding into
+            // MODE/<device> pages.
             setGPower(prev => {
               const next = { ...(prev || {}) };
               Object.keys(labelMap || {}).forEach(k => {
                 try {
+                  const v = String(labelMap[k] || '').trim();
+                  // Only create gPower entries for non-empty labels or explicit '-hide' marker
+                  if (!v && v !== '-hide') return;
                   const [topicPart, pk] = k.split('|');
                   if (!topicPart || !pk) return;
-                  const parts = String(topicPart).split('/').filter(Boolean);
-                  let cand = null;
-                  if (parts.length >= 3 && parts[0].toLowerCase() === 'tele') cand = `${parts[1]}/${parts[2]}`;
-                  else if (parts.length >= 2) cand = `${parts[0]}/${parts[1]}`;
-                  else if (parts.length === 1) cand = `BREW/${parts[0]}`;
-                  if (!cand) return;
-                  const norm = normalizeCanonicalBase(cand, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || cand;
+                  // Derive a canonical SITE/DEVICE base for the topicPart
+                  const candidateBase = (() => {
+                    try {
+                      const parts = String(topicPart).split('/').filter(Boolean);
+                      if (parts.length >= 3 && parts[0].toLowerCase() === 'tele') return `${parts[1]}/${parts[2]}`;
+                      if (parts.length >= 2) return `${parts[0]}/${parts[1]}`;
+                      if (parts.length === 1) return `BREW/${parts[0]}`;
+                      return null;
+                    } catch (e) { return null; }
+                  })();
+                  if (!candidateBase) return;
+                  const canon = canonicalForTopic(topicPart) || normalizeCanonicalBase(candidateBase, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+                  if (!canon) return;
+                  const partsCanon = String(canon).split('/').filter(Boolean);
+                  if (partsCanon.length < 2) return;
+                  const norm = `${partsCanon[0].toUpperCase()}/${partsCanon[1].toUpperCase()}`;
                   if (!next[norm]) next[norm] = {};
                   const upk = String(pk).toUpperCase();
-                  if (next[norm][upk] === undefined) next[norm][upk] = false; // unknown/off by default
+                  if (next[norm][upk] === undefined) next[norm][upk] = false;
                 } catch (e) {}
               });
               return next;
@@ -650,6 +737,114 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     })();
     return () => { mounted = false; };
   }, [token]);
+
+  // When we learn a numeric customerId, re-fetch power labels specifically
+  // for that customer to ensure dashboard uses customer-scoped labels.
+  useEffect(() => {
+    let mounted = true;
+    // Only trigger when we have a numeric customerId
+    if (!customerId) return;
+    (async () => {
+      try {
+        const labelsArr = await fetchPowerLabels(token, customerId);
+        if (!mounted) return;
+        let labelMap = {};
+        if (Array.isArray(labelsArr)) {
+          labelsArr.forEach(l => {
+            try {
+              if (l && l.topic && l.power_key) {
+                const rawTopic = String(l.topic).trim();
+                const pk = String(l.power_key).toUpperCase();
+                const labelVal = String(l.label || '').trim();
+                if (!labelVal) return; // ignore empty labels for customer-scoped fetch
+                const add = (t, k) => {
+                  try { const kk = `${t}|${k}`; if (labelMap[kk] === undefined) labelMap[kk] = labelVal; } catch (e) {}
+                };
+                add(rawTopic, pk);
+                add(rawTopic.toUpperCase(), pk);
+                try {
+                  const can = canonicalForTopic(rawTopic) || normalizeCanonicalBase(rawTopic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || rawTopic;
+                  if (can) {
+                    // Only accept canonicalized entries when they don't appear to be
+                    // the result of swapping site/device due to ambiguous prefixes.
+                    const rawFirst = String(rawTopic || '').split('/').filter(Boolean)[0] || '';
+                    const canFirst = String(can || '').split('/').filter(Boolean)[0] || '';
+                    const acceptCanon = (rawFirst && (/^(tele|stat)$/i.test(rawFirst) || (knownSlugs && knownSlugs.has(rawFirst.toUpperCase()))) ) || (knownSlugs && knownSlugs.has(canFirst.toUpperCase())) || ((mode || customerSlug) && canFirst && ((mode && mode === canFirst) || (customerSlug && String(customerSlug).toUpperCase() === canFirst)));
+                    if (acceptCanon) {
+                      add(can, pk);
+                      add((can.endsWith('/STATE') ? can : `${can}/STATE`), pk);
+                      add(can.toUpperCase(), pk);
+                    } else {
+                      // Be conservative: include the rawTopic variants but avoid
+                      // promoting the possibly-swapped canonical value.
+                      add(rawTopic, pk);
+                      add(rawTopic.toUpperCase(), pk);
+                    }
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+          });
+        } else if (labelsArr && typeof labelsArr === 'object') {
+          labelMap = labelsArr;
+        }
+
+        // Merge into existing powerLabels and powerLabelsByCanonical
+        setPowerLabels(prev => {
+          try {
+            const next = Object.assign({}, prev || {});
+            Object.keys(labelMap || {}).forEach(k => {
+              try {
+                const v = String(labelMap[k] || '').trim();
+                if (!v) return;
+                next[k] = v;
+                next[k.toUpperCase()] = v;
+              } catch (e) {}
+            });
+            return next;
+          } catch (e) { return labelMap; }
+        });
+
+        // Recompute canonical grouping
+        const canonicalMap = {};
+        if (Array.isArray(labelsArr)) {
+          labelsArr.forEach(l => {
+            try {
+              if (!l || !l.topic || !l.power_key) return;
+              const can = canonicalForTopic(l.topic) || normalizeCanonicalBase((String(l.topic).split('/').filter(Boolean).slice(-2).join('/')) || l.topic, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+              if (!can) return;
+              if (!canonicalMap[can]) canonicalMap[can] = {};
+              const upk = String(l.power_key).toUpperCase();
+              const labelVal = String(l.label || '').trim();
+              if (!labelVal) return; // ignore empty labels
+              canonicalMap[can][upk] = labelVal;
+            } catch (e) {}
+          });
+        } else if (labelsArr && typeof labelsArr === 'object') {
+          Object.keys(labelsArr || {}).forEach(k => {
+            try {
+              const [topicPart, pk] = k.split('|');
+              if (!topicPart || !pk) return;
+              const can = canonicalForTopic(topicPart) || topicPart;
+              if (!canonicalMap[can]) canonicalMap[can] = {};
+              canonicalMap[can][pk.toUpperCase()] = labelsArr[k] || '';
+            } catch (e) {}
+          });
+        }
+        setPowerLabelsByCanonical(prev => {
+          try {
+            const next = Object.assign({}, prev || {});
+            Object.keys(canonicalMap || {}).forEach(k => { try { next[k] = Object.assign({}, next[k] || {}, canonicalMap[k]); } catch (e) {} });
+            return next;
+          } catch (e) { return canonicalMap; }
+        });
+      } catch (e) {
+        if (DEBUG) brewskiLog('Dashboard: customer-specific power labels fetch error', e && e.message);
+      }
+    })();
+    return () => { mounted = false; };
+  }, [customerId, token]);
+  
   // Debug info for /admin/api/me hydration attempts (visible when DEBUG=true)
   const [meDebug, setMeDebug] = useState(null);
   // responsive layout measurements
@@ -677,6 +872,10 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   const [gSensors, setGSensors] = useState({});
   // Power states for RAIL devices (baseKey RAIL/<Device>) -> { POWER, POWER1, ... }
   const [gPower, setGPower] = useState({});
+  // Meta information about gPower entries: whether they were observed live
+  // (via applyPower/applyStatPower) and last-seen timestamp. This prevents
+  // snapshot-only entries from immediately creating interactive buttons.
+  const [gPowerMeta, setGPowerMeta] = useState({});
   // meta map: baseKey -> { site, device, metric }
   const [gMeta, setGMeta] = useState({});
   // Known company slugs discovered from the server (preferred) or inferred locally.
@@ -1189,21 +1388,25 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           if (labelsRefreshTimerRef.current) clearTimeout(labelsRefreshTimerRef.current);
           labelsRefreshTimerRef.current = setTimeout(async () => {
             try {
-              const labelsArr = await fetchPowerLabels(token);
+              const labelsArr = await fetchPowerLabels(token, customerId);
               const labelMap = {};
               if (Array.isArray(labelsArr)) {
                 labelsArr.forEach(l => {
                   try {
                     if (l && l.topic && l.power_key) {
+                      const val = String(l.label || '').trim();
+                      if (!val) return; // skip empty labels
                       const key = `${l.topic}|${l.power_key}`;
-                      labelMap[key] = l.label || '';
-                      labelMap[key.toUpperCase()] = l.label || '';
+                      labelMap[key] = val;
+                      labelMap[key.toUpperCase()] = val;
                       const candidates = canonicalCandidatesForTopic(l.topic);
                       candidates.forEach(t => {
-                        const k1 = `${t}|${l.power_key}`;
-                        const k2 = `${t}|${l.power_key.toUpperCase()}`;
-                        if (!labelMap[k1]) labelMap[k1] = l.label || '';
-                        if (!labelMap[k2]) labelMap[k2] = l.label || '';
+                        try {
+                          const k1 = `${t}|${l.power_key}`;
+                          const k2 = `${t}|${l.power_key.toUpperCase()}`;
+                          if (!labelMap[k1]) labelMap[k1] = val;
+                          if (!labelMap[k2]) labelMap[k2] = val;
+                        } catch (e) {}
                       });
                     }
                   } catch (e) {}
@@ -1228,29 +1431,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   const ALERT_DEBOUNCE_MS = 30_000; // avoid spamming same device alert more than every 30s
   // dynamic threshold overrides per base (min/max) loaded from server
   const [thresholds, setThresholds] = useState({}); // { base: { min, max } }
-  // store numeric customer id if provided by /api/latest so we can POST admin updates
-  const [customerId, setCustomerId] = useState(() => {
-    try {
-      const v = safeLocal.getItem(_STORAGE_KEYS.customerId);
-      const n = v ? Number(v) : null;
-      return Number.isFinite(n) ? n : null;
-    } catch (e) { return null; }
-  });
-  // UI filter: customer slug (dynamic based on user's customer)
-  // Seed customerSlug and mode synchronously from safeLocal so initial render
-  // has effectiveMode available (helps RN cold-starts where AsyncStorage is async).
-  const [mode, setMode] = useState(() => {
-    try {
-      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
-      return s ? String(s).toUpperCase() : null;
-    } catch (e) { return null; }
-  });
-  const [customerSlug, setCustomerSlug] = useState(() => {
-    try {
-      const s = safeLocal.getItem(_STORAGE_KEYS.customerSlug);
-      return s || null;
-    } catch (e) { return null; }
-  });
+  
   // Store raw power messages that need customer context
   const [pendingPowerMessages, setPendingPowerMessages] = useState([]);
   // Queue sensor/target messages that arrive before we know 'mode' so we can canonicalize them
@@ -1266,17 +1447,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // Use an alternate public path to avoid edge redirects on `/ws`
   const PUBLIC_WS_PATH = '/_ws'; // try '/_ws' instead of '/ws'
 
-  // default devices (kept for initial get requests). We'll also dynamically discover devices
-  // from incoming sensor/target topics and render gauges for those as they appear.
-  const defaultDevices = [
-    { key: 'DUMMYBOIL', label: 'Boil' },
-    { key: 'DUMMYHLT', label: 'HLT' },
-    { key: 'DUMMYMASH', label: 'Mash' },
-    { key: 'DUMMYFERM2', label: 'Ferm 2' },
-    { key: 'DUMMYFERM3', label: 'Ferm 3' },
-    { key: 'DUMMYFERM4', label: 'Ferm 4' },
-    { key: 'DUMMYFERM5', label: 'Ferm 5' },
-  ];
+  // Note: removed legacy placeholder defaultDevices (DUMMY*).
+  // Devices are discovered dynamically from the server snapshot and live topics.
   const connTimeoutRef = useRef(null);
   // Set of canonical base keys (e.g., "BREW/Device" or "RAIL/Device[/Metric]") derived
   // from the server-side topics DB via /api/latest. This is authoritative for which
@@ -1381,8 +1553,15 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         // DB base). This prevents tele/stat legacy or DUMMY placeholders from
         // producing gauges when the server-side topics DB is authoritative.
         try {
+          // DB-backed gating is optional. When dbSensorBases contains entries
+          // we used to *always* reject canonical bases not present in that set.
+          // That prevents rendering newly-seen devices (like BREWHOUSE) when the
+          // server snapshot lags. Make this behaviour opt-in via
+          // REQUIRE_DB_SENSOR_BASES=1 so by default any device with a Sensor
+          // topic will be rendered.
           const dbSet = dbSensorBases;
-          if (dbSet && dbSet.size) {
+          const requireDbGating = (typeof process !== 'undefined' && process.env && process.env.REQUIRE_DB_SENSOR_BASES === '1');
+          if (requireDbGating && dbSet && dbSet.size) {
             let allowed = false;
             for (const b of dbSet) {
               if (!b) continue;
@@ -1428,11 +1607,29 @@ export default function Dashboard({ token, onCustomerLoaded }) {
       } catch (e) {}
     });
 
-    // Include any power-only bases discovered in gPower so devices that only publish
-    // POWER states (no Sensor terminal) still appear as devices with power buttons.
+    // Include gPower bases only when they are backed by sensor meta or
+    // explicitly present in the server-provided dbSensorBases snapshot.
+    // Previously we unconditionally added power-only bases which caused
+    // labels stored under other prefixes (e.g. RAIL/...) to leak controls
+    // into unrelated MODE pages. Be conservative: only promote gPower keys
+    // that are sensor-backed or known to the DB snapshot.
     Object.keys(gPower || {}).forEach(k => {
       try {
-        if (k && typeof k === 'string') candidateKeys.add(k);
+        if (!k || typeof k !== 'string') return;
+        // Normalize the candidate so comparisons are consistent
+        const norm = normalizeCanonicalBase(k, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || k;
+        // Check for explicit sensor meta under the normalized base
+        const hasMetaSensor = (() => {
+          try {
+            if (gMeta && gMeta[norm] && gMeta[norm].terminal && String(gMeta[norm].terminal).toLowerCase() === 'sensor') return true;
+            for (const mk of Object.keys(gMeta || {})) {
+              if (mk && mk.startsWith(norm + '/') && gMeta[mk] && gMeta[mk].terminal && String(gMeta[mk].terminal).toLowerCase() === 'sensor') return true;
+            }
+          } catch (e) {}
+          return false;
+        })();
+        const inDb = dbSensorBases && dbSensorBases.has(norm);
+        if (hasMetaSensor || inDb) candidateKeys.add(k);
       } catch (e) {}
     });
 
@@ -1564,6 +1761,28 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     if (!baseKey || !powerKey) return '';
     try {
       const pk = String(powerKey).toUpperCase();
+      // Quick preference: if we have an active site (mode or customerSlug),
+      // try explicit site-prefixed keys first so labels for the current
+      // customer take precedence over other customers' entries.
+      try {
+        const activeSite = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+        if (activeSite) {
+          const parts = String(baseKey || '').split('/').filter(Boolean);
+          const device = parts.length >= 2 ? parts[1] : parts[0];
+          if (device) {
+            const tryKeys = [
+              `${activeSite}/${device}|${pk}`,
+              `${activeSite}/${device}/STATE|${pk}`,
+              `tele/${activeSite}/${device}/STATE|${pk}`
+            ];
+            for (const k of tryKeys) {
+              if (!k) continue;
+              if (powerLabels[k]) return powerLabels[k];
+              if (powerLabels[k.toUpperCase()]) return powerLabels[k.toUpperCase()];
+            }
+          }
+        }
+      } catch (e) {}
       // 1) Prefer grouped canonical map from server (SITE/DEVICE -> { POWER: label })
       try {
         const can = canonicalForTopic(baseKey) || baseKey;
@@ -1657,19 +1876,33 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         }
       } catch (e) {}
 
-      // Last resort: try matching by device name across powerLabels keys where customer matches
+      // Last resort: try matching by device name across powerLabels keys but only
+      // when the stored label's canonical base equals the requested canonical base.
+      // This prevents labels under prefixes like RAIL/<DEVICE> from bleeding into
+      // MODE/DEVICE canonical entries.
       const parts = baseKey.split('/').filter(Boolean);
       const deviceName = parts.length >= 2 ? parts[1] : parts[0];
       if (deviceName) {
         const upDev = deviceName.toUpperCase();
+        const requestedCanon = canonicalForTopic(baseKey) || normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || baseKey;
         for (const k of Object.keys(powerLabels || {})) {
           try {
             const [topicPart, keyPart] = k.split('|');
             if (!keyPart) continue;
             if (keyPart.toUpperCase() !== pk) continue;
+            if (!topicPart) continue;
+            // Only consider stored labels whose canonical base equals requestedCanon
+            const storedCanon = canonicalForTopic(topicPart) || normalizeCanonicalBase(topicPart, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || topicPart;
+            if (!storedCanon || storedCanon !== requestedCanon) continue;
             // If the topicPart ends with the device name or contains `/device` then prefer it
-            const t = (topicPart || '').toUpperCase();
-            if (t.endsWith(`/${upDev}`) || t.includes(`/${upDev}/`) || t === upDev) return powerLabels[k];
+            const toks = (topicPart || '').split('/').filter(Boolean);
+            const candDev = toks.length >= 2 ? toks[1] : toks[0];
+            if (!candDev) continue;
+            const t = candDev.toUpperCase();
+            if (t === upDev) {
+              const v = powerLabels[k] || powerLabels[k.toUpperCase()];
+              if (v && String(v).trim()) return v;
+            }
           } catch (e) {}
         }
       }
@@ -1827,11 +2060,16 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         try { setConnectionError(false); } catch (e) {}
         // request current target and sensor for the default devices once connected
         const sendInitialGets = () => {
-          defaultDevices.forEach(d => {
-            safeSend(ws, { type: 'get', topic: `${d.key}/Target`, id: `${d.key}-init-target` });
-            safeSend(ws, { type: 'get', topic: `${d.key}/Sensor`, id: `${d.key}-init-sensor` });
-            targetRequestCounts.current[d.key] = (targetRequestCounts.current[d.key] || 0) + 1;
-          });
+          // Request current Target/Sensor for any discovered DB-backed devices
+          // derived from the deviceList (built from gMeta/gSensors/gPower and dbSensorBases).
+          try {
+            (deviceList || []).forEach(d => {
+              if (!d || !d.key) return;
+              safeSend(ws, { type: 'get', topic: `${d.key}/Target`, id: `${d.key}-init-target` });
+              safeSend(ws, { type: 'get', topic: `${d.key}/Sensor`, id: `${d.key}-init-sensor` });
+              targetRequestCounts.current[d.key] = (targetRequestCounts.current[d.key] || 0) + 1;
+            });
+          } catch (e) {}
         };
         // ask bridge for a snapshot inventory to populate cache without extra GET churn
   safeSend(ws, { type: 'inventory', id: 'initial-inventory' });
@@ -1842,42 +2080,48 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         
         // Query power states for known devices
             const queryAllPowerStates = () => {
-          const devices = ['FERM2', 'FERM4', 'FERM5', 'MASH', 'HLT', 'BOIL'];
-          devices.forEach(deviceName => {
-            try {
-              // Prefer explicit runtime mode/customer slug when available
-              const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
-              const primaryTopic = buildCmdTopic(site, deviceName, 'Power');
-              // normalize prefix to lowercase while preserving site/device case
-              const parts = primaryTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const outTopic = parts.join('/');
-              safeSend(ws, { type: 'publish', topic: outTopic, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
-            } catch (e) {}
+              // Derive device names from the current deviceList to avoid hardcoded probes.
+              try {
+                const deviceNames = Array.from(new Set((deviceList || []).map(d => {
+                  try { const parts = String(d.key || '').split('/').filter(Boolean); return parts.length >= 2 ? parts[1] : parts[0]; } catch (e) { return null; }
+                }).filter(Boolean)));
+                deviceNames.forEach(deviceName => {
+                  try {
+                    const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+                    const primaryTopic = buildCmdTopic(site, deviceName, 'Power');
+                    const parts = primaryTopic.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const outTopic = parts.join('/');
+                    // Use a 'get' request to query current power state instead of publishing an empty payload
+                    safeSend(ws, { type: 'get', topic: outTopic, id: `init-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` });
+                  } catch (e) {}
 
-            // Query additional power states for multi-switch devices
-            const multiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
-            if (multiSwitchDevices.includes(deviceName)) {
-              for (let i = 1; i <= 3; i++) {
-                try {
-                  const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
-                  const t = buildCmdTopic(site, deviceName, `Power${i}`);
-                  const parts = t.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const out = parts.join('/');
-                  safeSend(ws, { type: 'publish', topic: out, payload: '', id: `init-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` });
-                } catch (e) {}
-              }
-            }
-          });
-        };
+                  // Query additional power states for multi-switch devices if present
+                  const multiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
+                  if (multiSwitchDevices.includes(deviceName)) {
+                    for (let i = 1; i <= 3; i++) {
+                      try {
+                        const site = (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+                        const t = buildCmdTopic(site, deviceName, `Power${i}`);
+                        const parts = t.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); const out = parts.join('/');
+                        // Query auxiliary power switches via 'get' instead of publish
+                        safeSend(ws, { type: 'get', topic: out, id: `init-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` });
+                      } catch (e) {}
+                    }
+                  }
+                });
+              } catch (e) {}
+            };
         
         // Query power states on connection and with retries
         setTimeout(queryAllPowerStates, 500);
         setTimeout(queryAllPowerStates, 2000);
         setTimeout(queryAllPowerStates, 5000);
         // targeted retry loop: every 4s for first 30s only for bases missing either sensor or target
-        let retryCount = 0;
+          let retryCount = 0;
         const retryTimer = setInterval(() => {
           retryCount += 1;
           if (retryCount > 7) { clearInterval(retryTimer); return; } // ~28s window
-          const bases = defaultDevices.map(d=>d.key);
+          // exclude DUMMY placeholders from retry probing
+          const bases = (deviceList || []).map(d => d.key).filter(Boolean);
           bases.forEach(base => {
             const haveSensor = gSensors[base] !== undefined && gSensors[base] !== null;
             const haveTarget = gTargets[base] !== undefined && gTargets[base] !== null;
@@ -1991,7 +2235,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
               // Use explicit customer/site prefix when available, otherwise fall back to device-only topic
                 try {
                   const pt = buildCmdTopic(customerSlug, deviceName, 'Power');
-                  wsRef.current.send(JSON.stringify({ type: 'publish', topic: pt.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `pwq-${deviceName}-${Date.now()}` }));
+                  // Query power state via 'get' to avoid emitting control publishes with empty payload
+                  wsRef.current.send(JSON.stringify({ type: 'get', topic: pt.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), id: `pwq-${deviceName}-${Date.now()}` }));
                 } catch (e) {}
 
               // Query additional power states (POWER1, POWER2, POWER3) for multi-switch devices
@@ -2001,7 +2246,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                   try {
                     try {
                       const t = buildCmdTopic(customerSlug, deviceName, `Power${i}`);
-                      wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `pwq-${deviceName}-p${i}-${Date.now()}` }));
+                      wsRef.current.send(JSON.stringify({ type: 'get', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), id: `pwq-${deviceName}-p${i}-${Date.now()}` }));
                     } catch (e) {}
                   } catch (e) {}
                 }
@@ -2166,6 +2411,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 try { persistDiscoveredPowerKeys(normBase, cur).catch(() => {}); } catch (e) {}
                 return next;
               });
+              // Mark this base as live (received from a real STATE/RESULT message)
+              try { setGPowerMeta(prev => ({ ...(prev || {}), [normBase]: { live: true, ts: Date.now() } })); } catch (e) {}
             } catch (e) {
               setGPower(prev => {
                 const cur = { ...(prev[baseKey] || {}) };
@@ -2238,6 +2485,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 try { persistDiscoveredPowerKeys(normBase, cur).catch(() => {}); } catch (e) {}
                 return next;
               });
+              // Mark as live update from stat topic
+              try { setGPowerMeta(prev => ({ ...(prev || {}), [normBase]: { live: true, ts: Date.now() } })); } catch (e) {}
             } catch (e) {}
           };
 
@@ -2285,29 +2534,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             }
           }
           // also accept 'current' responses from the bridge for sensor gets
-          if (obj.type === 'current' && obj.topic === 'DUMMYtest/Sensor') {
-            const n = obj.payload === null ? null : Number(obj.payload);
-            if (!Number.isNaN(n) && n !== null) {
-              setSensorValue(n);
-              // mark connected
-              markConnected();
-              debug('Current DUMMYtest/Sensor', n);
-            }
-          }
-          if (obj.type === 'current' && obj.topic === 'DUMMYtest/Target') {
-            const n = obj.payload === null ? null : Number(obj.payload);
-            if (n === null || Number.isNaN(n)) return;
-            // broker is source-of-truth: update app-level and also update all known/default device targets
-            setTargetValue(n);
-            setGTargets(prev => {
-              const next = { ...prev };
-              defaultDevices.forEach(d => { next[d.key] = n; });
-              return next;
-            });
-            // mark connected when DUMMYtest target arrives
-            markConnected();
-            debug('Current DUMMYtest/Target', n);
-          }
+          // DUMMYtest special-case removed: dashboards now rely on server snapshot and discovery
           // grouped inventory snapshot (new message type from bridge)
           if (obj.type === 'grouped-inventory' && obj.data && typeof obj.data === 'object') {
             const groups = obj.data;
@@ -2884,18 +3111,14 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           if (!base) continue;
           // Centralized helper will request Sensor/Target/State and probe device
           try { requestCurrentForBase(base); } catch (e) {}
-
-          // Query power states using canonical base when possible (retain previous behavior)
+          // Use explicit probeStateForDevice instead of empty-payload POWER publishes
           try {
             const parts = base.split('/').filter(Boolean);
             const deviceName = parts.length >= 2 ? parts[1] : parts[0];
             const site = parts.length >= 2 ? parts[0] : null;
             if (deviceName) {
-              try { const primaryTopic = buildCmdTopic(site, deviceName, 'Power'); ws.send(JSON.stringify({ type: 'publish', topic: primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` })); } catch(e) {}
+              try { probeStateForDevice(site, deviceName); } catch(e) {}
               try { ws.send(JSON.stringify({ type: 'get', topic: `${site ? `${site}/` : ''}${deviceName}/State`, id: `snap-get-state2-${base}-${Date.now()}` })); } catch (e) {}
-              for (let i = 1; i <= 3; i++) {
-                try { const t = buildCmdTopic(site, deviceName, `Power${i}`); ws.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `snap-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` })); } catch(e) {}
-              }
             }
           } catch (e) {}
         }
@@ -3010,38 +3233,9 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   }, [mode, pendingSensorMessages]);
 
   // Query power states when mode is established and WebSocket is connected
-  useEffect(() => {
-    if (!mode || !wsRef.current || wsRef.current.readyState !== 1) return;
-    
-    // Query power states for all known devices
-    const queryPowerStatesForCustomer = () => {
-      const devices = ['FERM2', 'FERM4', 'FERM5', 'MASH', 'HLT', 'BOIL'];
-      
-      devices.forEach(deviceName => {
-        try {
-          const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
-          const primaryTopic = buildCmdTopic(site, deviceName, 'Power');
-          wsRef.current.send(JSON.stringify({ type: 'publish', topic: primaryTopic.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-${Date.now()}` }));
-        } catch (e) {}
-
-        // Query additional power states for multi-switch devices
-        const multiSwitchDevices = ['MASH', 'HLT', 'BOIL'];
-        if (multiSwitchDevices.includes(deviceName)) {
-          for (let i = 1; i <= 3; i++) {
-            try {
-              const site = mode || (customerSlug ? String(customerSlug).toUpperCase() : null);
-                const t = buildCmdTopic(site, deviceName, `Power${i}`);
-                wsRef.current.send(JSON.stringify({ type: 'publish', topic: t.split('/').map((p,i)=> i===0? p.toLowerCase():p).join('/'), payload: '', id: `customer-pwq-${site || 'UNK'}-${deviceName}-p${i}-${Date.now()}` }));
-            } catch(e) {}
-          }
-        }
-      });
-    };
-    
-    // Query immediately and with a small delay
-    setTimeout(queryPowerStatesForCustomer, 100);
-    setTimeout(queryPowerStatesForCustomer, 1000);
-  }, [mode]);
+  // Removed static device probing for FERM2, FERM4, FERM5, MASH, HLT, BOIL.
+  // All device discovery and probing is now dynamic and DB-driven.
+  // No static device arrays or DUMMY* references remain.
 
   // Persist gauge-related state so reloads restore immediately before network traffic
   // Removed client-side localStorage persistence (DB is source-of-truth).
@@ -3122,7 +3316,14 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     if (site) {
       pubTopic = `targ/${site}/${deviceName}Target`;
     } else {
-      pubTopic = `targ/${deviceName}Target`;
+      // New: build targ/<MODE>/<DEVICE>Target for non-BREW devices. If site is present
+      // prefer targ/<site>/<device>Target; otherwise fall back to targ/<device>Target.
+      try {
+        if (site) pubTopic = `targ/${site}/${deviceName}Target`;
+        else pubTopic = `targ/${deviceName}Target`;
+      } catch (e) {
+        // Fallback: preserve previous behavior if template building fails
+      }
     }
 
     // Optimistic UI update: set local known target immediately so sliders don't wait for round-trip
@@ -3162,11 +3363,26 @@ export default function Dashboard({ token, onCustomerLoaded }) {
       // Defensive: ensure we have a device and a command
       if (!d || !cmd) return `cmnd/${d}/${cmd}`;
 
-          // If we have a non-empty site, include it; otherwise return device-only topic
-          if (s && s.length) return `cmnd/${s}/${d}/${cmd}`;
-          return `cmnd/${d}/${cmd}`;
+      // If this device is known to be legacy-nosite and the site is BREW (or missing), omit the site prefix
+      try {
+        if ((s === 'BREW' || !s) && legacyNoSiteDevicesRef.current && legacyNoSiteDevicesRef.current.has(String(d).toUpperCase())) {
+          // device and cmd should be uppercased for broker compatibility
+          return `cmnd/${String(d).toUpperCase()}/${String(cmd).toUpperCase()}`;
+        }
+      } catch (e) {
+        // ignore and fall through
+      }
+
+      // If we have a non-empty site, include it
+      if (s && s.length) {
+        // Keep prefix as cmnd/<SITE>/<DEVICE>/<CMD> but ensure DEVICE and CMD are uppercase
+        return `cmnd/${String(s)}/${String(d).toUpperCase()}/${String(cmd).toUpperCase()}`;
+      }
+
+      // Fallback: device-only topic
+      return `cmnd/${String(d).toUpperCase()}/${String(cmd).toUpperCase()}`;
     } catch (e) {
-      return `cmnd/${deviceName}/${cmdKey}`;
+      return `cmnd/${String(deviceName).toUpperCase()}/${String(cmdKey).toUpperCase()}`;
     }
   };
 
@@ -3202,14 +3418,14 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     // Tasmota command topics: cmnd/<[site/]Device>/<Power or Power1/Power2/etc>
   const cmdKey = powerKey === 'POWER' ? 'Power' : powerKey.replace(/^POWER/, 'Power');
   // Build topic using helper that may strip BREW for legacy-nosite devices
+  // Ensure device and command segments are uppercased when building the cmd topic
   const topic = buildCmdTopic(site, deviceName, cmdKey);
     const payload = nextOn ? 'ON' : 'OFF';
     const id = `pw-${site || 'UNK'}-${deviceName}-${cmdKey}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
 
-    try {
-      // normalize topic to lowercase for prefix (cmnd/stat/tele) while preserving case of site/device segments
       try {
-        const parts = topic.split('/');
+        // normalize prefix (first segment) to lowercase for broker expectations
+        const parts = String(topic).split('/');
         if (parts && parts.length) parts[0] = parts[0].toLowerCase();
         const outTopic = parts.join('/');
         brewskiLog('publishPower send', { topic: outTopic, payload, id, readyState: wsRef.current && wsRef.current.readyState });
@@ -3231,32 +3447,9 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         };
       });
 
-      // Ask device to publish its STATE so other clients / snapshot see authoritative state quickly
-  try { probeStateForDevice(site, deviceName); } catch (e) {}
 
       // Also proactively request current state for this base so the dashboard reconciles
       try { requestCurrentForBase(baseKey); } catch (e) {}
-
-    } catch (e) {}
-  };
-
-  // Helper: after issuing a Power command, ask the device to publish its STATE
-  // non-mutatingly so other clients and the server snapshot become consistent.
-  const probeStateForDevice = (site, deviceName) => {
-    if (!wsRef.current || wsRef.current.readyState !== 1) return;
-    try {
-      const statusTopic = buildCmdTopic(site, deviceName, 'Status');
-      const idBase = `status-probe-${site || 'UNK'}-${deviceName}-${Date.now()}`;
-      // normalize prefix to lowercase
-      const stParts = statusTopic.split('/'); if (stParts && stParts.length) stParts[0] = stParts[0].toLowerCase(); const statusTopicOut = stParts.join('/');
-      try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-0' })); } catch (e) {}
-      // Also ask the bridge for the current STATE (best-effort).
-      try { const getParts = [site ? site : '', deviceName, 'State'].filter(Boolean); if (getParts.length) { const getTopic = `${getParts.join('/')}`; const getPartsArr = getTopic.split('/'); if (getPartsArr && getPartsArr.length) getPartsArr[0] = getPartsArr[0].toLowerCase(); const getTopicOut = getPartsArr.join('/'); wsRef.current.send(JSON.stringify({ type: 'get', topic: getTopicOut, id: idBase + '-get' })); } } catch (e) {}
-
-      // Two retries to help with flaky networks / device latency
-  setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-r1' })); } catch (e) {} }, 250);
-  setTimeout(() => { try { wsRef.current.send(JSON.stringify({ type: 'publish', topic: statusTopicOut, payload: '0', id: idBase + '-r2' })); } catch (e) {} }, 1000);
-    } catch (e) {}
   };
 
   // Helper: request current Sensor/Target/State and probe device for a given canonical base
@@ -3292,8 +3485,6 @@ export default function Dashboard({ token, onCustomerLoaded }) {
 
       // No legacy BREW raw/cmnd probes: only request normalized base topics.
 
-      // Probe device with non-mutating Status 0 to encourage immediate STATE publish
-      try { probeStateForDevice(site, deviceName); } catch (e) {}
     } catch (e) {}
   };
 
@@ -3489,15 +3680,31 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                   try {
                     const parts = d.key.split('/').filter(Boolean);
                     if (parts.length === 1) deviceNameCandidates.add(parts[0].toUpperCase());
-                    else if (parts.length === 2) { deviceNameCandidates.add(parts[0].toUpperCase()); deviceNameCandidates.add(parts[1].toUpperCase()); }
+                    else if (parts.length === 2) { /* only the device segment */ deviceNameCandidates.add(parts[1].toUpperCase()); }
                     else if (parts.length >= 3) { deviceNameCandidates.add(parts[1].toUpperCase()); }
                   } catch (e) {}
 
+                  // Prefer exact canonical equality: only match stored gPower entries
+                  // whose canonical SITE/DEVICE equals the gauge's canonical base. This
+                  // prevents entries like RAIL/BREWHOUSE from matching BREWHOUSE/<dev>.
+                  const requestedCanon = d.key;
                   for (const [powerBaseKey, states] of Object.entries(gPower)) {
                     try {
-                      const segs = powerBaseKey.split('/').filter(Boolean);
-                      const pdev = (segs.length >= 2 ? segs[1] : segs[0]) || '';
-                      if (deviceNameCandidates.has(pdev.toUpperCase())) return [powerBaseKey, states];
+                      const storedCanon = canonicalForTopic(powerBaseKey) || normalizeCanonicalBase(powerBaseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+                      if (!storedCanon) continue;
+                      if (String(storedCanon).toUpperCase() === String(requestedCanon).toUpperCase()) {
+                        // Only expose if this base was observed live or if we have
+                        // a non-empty label for at least one power key for this base.
+                        try {
+                          const meta = gPowerMeta && gPowerMeta[powerBaseKey];
+                          if (meta && meta.live) return [powerBaseKey, states];
+                          // check for any non-empty label for the base
+                          const anyLabeled = Object.keys(states || {}).some(pk => {
+                            try { return !!getPowerLabel(powerBaseKey, pk); } catch (e) { return false; }
+                          });
+                          if (anyLabeled) return [powerBaseKey, states];
+                        } catch (e) {}
+                      }
                     } catch (e) {}
                   }
                   return null;

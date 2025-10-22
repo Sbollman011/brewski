@@ -42,7 +42,7 @@ function main() {
     delegatedHttp: http,
     publishFn: (topic, payload, opts, cb) => mqttClient.publish(topic, payload, opts, cb),
     mqttClient,
-    caches,
+   // caches,
   });
 
   // Periodic persistence of latest metrics
