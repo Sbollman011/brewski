@@ -1458,6 +1458,14 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // from the server-side topics DB via /api/latest. This is authoritative for which
   // gauges should be created. Populated during snapshot hydrate and kept for runtime.
   const [dbSensorBases, setDbSensorBases] = useState(new Set());
+  // Offline / no-state tracking (timestamps ms since epoch)
+  const [lastTeleMap, setLastTeleMap] = useState({}); // canonicalBase -> ts
+  const [lastStatMap, setLastStatMap] = useState({}); // canonicalBase -> ts
+  // thresholds and storage key
+  const OFFLINE_MS = 90 * 1000; // 90s without telemetry => offline
+  const NOSTATE_MS = 90 * 1000; // 90s without stat => no-state
+  const LAST_SEEN_STORAGE_KEY = 'brewski_last_seen_v1';
+  const persistTimerRef = useRef(null);
 
     // Auto-sync: when gPower changes, ensure discovered bases and power keys exist in server DB.
     // This runs best-effort in background and avoids repeated work via a ref cache.
@@ -2378,6 +2386,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             // register enriched meta under canonical base
             const enrichedMeta = { site: (meta.site || (mode ? mode : (customerSlug || null))), device: meta.device, metric: meta.metric || null, terminal: 'Sensor' };
             registerMeta(canonicalNorm, enrichedMeta);
+            // update last-telemetry timestamp for this canonical base
+            try { setLastTeleMap(prev => ({ ...(prev || {}), [canonicalNorm]: Date.now() })); } catch (e) {}
             // Auto-request target for canonical base if missing
             if (!(canonicalNorm in gTargets) && wsRef.current && wsRef.current.readyState === 1) {
               const reqId = canonicalNorm + '-auto-target';
@@ -2577,6 +2587,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
               });
               // Mark this base as live (received from a real STATE/RESULT message)
               try { setGPowerMeta(prev => ({ ...(prev || {}), [normBase]: { live: true, ts: Date.now() } })); } catch (e) {}
+              // update last-stat timestamp for this canonical base
+              try { setLastStatMap(prev => ({ ...(prev || {}), [normBase]: Date.now() })); } catch (e) {}
             } catch (e) {
               setGPower(prev => {
                 const cur = { ...(prev[baseKey] || {}) };
@@ -2661,6 +2673,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
               });
               // Mark as live update from stat topic
               try { setGPowerMeta(prev => ({ ...(prev || {}), [normBase]: { live: true, ts: Date.now() } })); } catch (e) {}
+              // record last stat timestamp for this base so UI can show 'no stat' when stale
+              try { setLastStatMap(prev => ({ ...(prev || {}), [normBase]: Date.now() })); } catch (e) {}
             } catch (e) {}
           };
 
@@ -2748,6 +2762,13 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             if (Object.keys(sensorAdds).length) setGSensors(prev => ({ ...prev, ...sensorAdds }));
             if (Object.keys(targetAdds).length) setGTargets(prev => ({ ...prev, ...targetAdds }));
             if (Object.keys(metaAdds).length) setGMeta(prev => ({ ...prev, ...metaAdds }));
+            // mark last-tele timestamps for snapshot-applied sensors
+            try {
+              const now = Date.now();
+              const teleAdds = {};
+              Object.keys(sensorAdds || {}).forEach(k => { try { teleAdds[k] = now; } catch (e) {} });
+              if (Object.keys(teleAdds).length) setLastTeleMap(prev => ({ ...(prev||{}), ...teleAdds }));
+            } catch (e) {}
             if (DEBUG) {
               try {
                 console.debug('[inventory/grouped-inventory] gTargets keys:', Object.keys(gTargets));
@@ -2886,6 +2907,41 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     }
   };
 
+  // Helpers to persist last-seen maps across refreshes (use AsyncStorage when available)
+  const readPersistedLastSeen = async () => {
+    try {
+      if (AsyncStorage) {
+        const v = await AsyncStorage.getItem(LAST_SEEN_STORAGE_KEY);
+        if (!v) return null;
+        return JSON.parse(v);
+      }
+    } catch (e) {}
+    try {
+      const v = safeLocal.getItem && safeLocal.getItem(LAST_SEEN_STORAGE_KEY);
+      if (v) return JSON.parse(v);
+    } catch (e) {}
+    return null;
+  };
+
+  const persistLastSeen = async (obj) => {
+    try {
+      const s = JSON.stringify(obj || {});
+      if (AsyncStorage) await AsyncStorage.setItem(LAST_SEEN_STORAGE_KEY, s);
+      try { safeLocal.setItem && safeLocal.setItem(LAST_SEEN_STORAGE_KEY, s); } catch (e) {}
+    } catch (e) {}
+  };
+
+  // schedule periodic persistence of last-seen maps (debounced)
+  useEffect(() => {
+    try {
+      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = setTimeout(() => {
+        try { persistLastSeen({ tele: lastTeleMap, stat: lastStatMap }).catch(() => {}); } catch (e) {}
+      }, 800);
+    } catch (e) {}
+    return () => { try { if (persistTimerRef.current) clearTimeout(persistTimerRef.current); } catch (e) {} };
+  }, [lastTeleMap, lastStatMap]);
+
   // Fallback: if first connection attempt after mount/token doesn't reach OPEN state within 1.2s, try again once with a single Bearer subprotocol carrying token.
   useEffect(() => {
     if (!token) return;
@@ -2974,6 +3030,14 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     // NOTE: Removed localStorage hydration — rely on authoritative DB snapshot and live MQTT only
     // NEW: Snapshot hydrate from /api/latest so gauges and POWER states render immediately after reload (before live MQTT)
     (async () => {
+      // hydrate persisted last-seen maps so offline badges persist across refresh
+      try {
+        const persisted = await readPersistedLastSeen();
+        if (persisted) {
+          try { if (persisted.tele) setLastTeleMap(prev => ({ ...prev, ...persisted.tele })); } catch (e) {}
+          try { if (persisted.stat) setLastStatMap(prev => ({ ...prev, ...persisted.stat })); } catch (e) {}
+        }
+      } catch (e) {}
       try {
         const latestPath = '/api/latest';
         let res;
@@ -4126,6 +4190,13 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 if (DEBUG) {
                   try { console.debug('Dashboard: render gauge', { canonical: d.key, representative: d.representative, idx: i }); } catch (e) {}
                 }
+                // Determine offline / no-state status for UI
+                const nowTs = Date.now();
+                const lastTele = (lastTeleMap && (lastTeleMap[d.key] || lastTeleMap[d.representative])) || null;
+                const lastStat = (lastStatMap && (lastStatMap[d.key] || lastStatMap[d.representative])) || null;
+                const isOffline = !(lastTele) || ((nowTs - (lastTele || 0)) > OFFLINE_MS);
+                const isNoState = !(lastStat) || ((nowTs - (lastStat || 0)) > NOSTATE_MS);
+
                 return (
                   <View key={wrapperKey} style={{ width: columnWidth, padding: gap/2, alignItems:'center' }}>
                     <View style={styles.gaugeCardWrapper}>
@@ -4145,6 +4216,13 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                           min={gp.min}
                           max={gp.max}
                         />
+                        {/* Offline / No-State badges */}
+                        {(isOffline || isNoState) && (
+                          <View style={{ marginTop: 6, alignItems: 'center' }}>
+                            {isOffline && <Text style={{ color: '#b71c1c', fontSize: 11, fontWeight: '700' }}>Offline (no tele)</Text>}
+                            {!isOffline && isNoState && <Text style={{ color: '#ff9800', fontSize: 11, fontWeight: '700' }}>No state received in the last 90 seconds</Text>}
+                          </View>
+                        )}
 
                         {/* Integrated power switches directly below gauge */}
                         {powerSwitches && (
@@ -4217,8 +4295,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                                 return (
                                   <Pressable
                                     key={powerKey}
-                                    onPress={() => { if (!indicatorRenderer) publishPower(powerSwitches[0], powerKey, !isOn); }}
-                                    disabled={!!indicatorRenderer}
+                                    onPress={() => { if (!indicatorRenderer && !isOffline) publishPower(powerSwitches[0], powerKey, !isOn); }}
+                                    disabled={!!indicatorRenderer || isOffline}
                                     accessibilityRole={indicatorRenderer ? 'text' : 'button'}
                                     style={{ 
                                       paddingVertical: 6, 
@@ -4237,7 +4315,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                                       shadowRadius: isOn ? 3 : 2,
                                       transform: [{ scale: isOn ? 1.02 : 1 }]
                                     }}
-                                  >
+                                    >
                                     {indicatorRenderer ? (
                                       <View style={{ alignItems: 'center' }}>
                                         {/* show the textual label above the indicator when a prefix label exists */}
