@@ -1450,6 +1450,10 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // Note: removed legacy placeholder defaultDevices (DUMMY*).
   // Devices are discovered dynamically from the server snapshot and live topics.
   const connTimeoutRef = useRef(null);
+  // keep spinner visible for a short buffer after hydrate to reduce visible
+  // flashes when RN/web startup races resolve (ms)
+  const SPINNER_BUFFER_MS = 2500;
+  const spinnerBufferRef = useRef(false);
   // Set of canonical base keys (e.g., "BREW/Device" or "RAIL/Device[/Metric]") derived
   // from the server-side topics DB via /api/latest. This is authoritative for which
   // gauges should be created. Populated during snapshot hydrate and kept for runtime.
@@ -1502,7 +1506,68 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         if (!origKey) return;
         const canonical = canonicalBaseFromKey(origKey);
         if (!canonical) return;
-        if (seen.has(canonical)) return;
+        // Scoring heuristic: choose the best representative when multiple original
+        // keys map to the same canonical base. This prevents lower-quality
+        // snapshot/legacy reps from overwriting ones that have interactive
+        // power buttons, live metadata, or DB-backed sensor entries.
+        const repScore = (rep) => {
+          try {
+            if (!rep) return 0;
+            let score = 0;
+            // Prefer entries that have explicit Sensor meta
+            try {
+              const metaExact = gMeta && gMeta[rep];
+              if (metaExact && metaExact.terminal && String(metaExact.terminal).toLowerCase() === 'sensor') score += 40;
+            } catch (e) {}
+            // Prefer entries that are sensor-backed under any gMeta key starting with canonical
+            try {
+              for (const k of Object.keys(gMeta || {})) {
+                if (!k) continue;
+                if (k === rep || k.startsWith(canonical + '/')) {
+                  const m = gMeta[k];
+                  if (m && m.terminal && String(m.terminal).toLowerCase() === 'sensor') { score += 20; break; }
+                }
+              }
+            } catch (e) {}
+            // Prefer entries with live power metadata
+            try {
+              const repCanon = canonicalBaseFromKey(rep) || canonical;
+              if (gPowerMeta && gPowerMeta[repCanon] && gPowerMeta[repCanon].live) score += 50;
+              if (gPowerMeta && gPowerMeta[rep] && gPowerMeta[rep].live) score += 50;
+            } catch (e) {}
+            // Prefer entries with any non-empty power label
+            try {
+              const states = gPower && (gPower[canonical] || gPower[rep] || gPower[canonical.toUpperCase()]);
+              if (states) {
+                for (const pk of Object.keys(states || {})) {
+                  try {
+                    const lab = getPowerLabel(canonical, pk) || getPowerLabel(rep, pk);
+                    if (lab && String(lab).trim()) { score += 30; break; }
+                  } catch (e) {}
+                }
+              }
+            } catch (e) {}
+            // Prefer DB-backed canonical bases
+            try { if (dbSensorBases && dbSensorBases.has(canonical)) score += 10; } catch (e) {}
+            // small preference for longer (metric-bearing) representatives
+            try { const segs = String(rep).split('/').filter(Boolean).length; score += Math.min(segs, 3); } catch (e) {}
+            return score;
+          } catch (e) { return 0; }
+        };
+
+        if (seen.has(canonical)) {
+          try {
+            const existing = seen.get(canonical);
+            const curRep = existing.representative;
+            const curScore = repScore(curRep || canonical);
+            const newScore = repScore(origKey);
+            if (newScore > curScore) {
+              // preserve existing label when possible, but replace representative
+              seen.set(canonical, { label: existing.label || null, representative: origKey });
+            }
+            return;
+          } catch (e) { return; }
+        }
 
         // Choose label from meta when available, prefer device name only (user preference)
         const metaForOrig = gMeta[origKey] || gMeta[canonical];
@@ -1655,6 +1720,17 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         return A < B ? -1 : 1;
       } catch (e) { return 0; }
     });
+    // Diagnostic: detect duplicate canonical keys (can happen when canonicalization collapses different devices)
+    try {
+      if (DEBUG) {
+        const keys = arr.map(x => x.key);
+        const dup = keys.filter((k, idx) => keys.indexOf(k) !== idx);
+        if (dup && dup.length) {
+          console.warn('Dashboard: duplicate canonical keys detected in deviceList', { duplicates: Array.from(new Set(dup)), sample: arr.slice(0,10) });
+        }
+      }
+    } catch (e) {}
+
     return arr;
   }, [gSensors, gTargets, gMeta, gPower, mode, customerSlug, dbSensorBases]);
 
@@ -1916,6 +1992,44 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         if (DEBUG) console.warn('Dashboard: getPowerLabel - powerLabels map empty');
       }
     } catch (e) {}
+    // Read-time fallback: try a small set of alternate canonicalizations to handle
+    // RN startup races where mode/customerSlug may not yet be set or where keys
+    // were written under slightly different variants. This is conservative and
+    // only used when label lookup fails above.
+    try {
+      const alternates = [];
+      // 1) Uppercased canonical form
+      try { const can = canonicalForTopic(baseKey) || normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }); if (can) alternates.push(can.toUpperCase()); } catch (e) {}
+      // 2) BREW-prefixed device fallback (if baseKey didn't include BREW)
+      try {
+        const parts = String(baseKey || '').split('/').filter(Boolean);
+        if (parts.length >= 2) {
+          const dev = parts[1];
+          alternates.push(`BREW/${dev}`);
+          alternates.push(`BREW/${dev}/STATE`);
+        } else if (parts.length === 1) {
+          alternates.push(`BREW/${parts[0]}`);
+          alternates.push(`tele/${parts[0]}/STATE`);
+        }
+      } catch (e) {}
+      // 3) Try swapping knownSlugs candidates (if we have any) to find a match
+      try {
+        const parts = String(baseKey || '').split('/').filter(Boolean);
+        const dev = parts.length >= 2 ? parts[1] : parts[0];
+        if (dev && knownSlugs && knownSlugs.size) {
+          for (const s of Array.from(knownSlugs)) {
+            try { alternates.push(`${s}/${dev}`); alternates.push(`${s}/${dev}/STATE`); } catch (e) {}
+          }
+        }
+      } catch (e) {}
+
+      for (const a of alternates) {
+        if (!a) continue;
+        const k = `${a}|${String(powerKey).toUpperCase()}`;
+        if (powerLabels[k]) return powerLabels[k];
+        if (powerLabels[k.toUpperCase()]) return powerLabels[k.toUpperCase()];
+      }
+    } catch (e) {}
     return '';
   };
 
@@ -1941,6 +2055,16 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   // diagnostics for missing Target currents
   const targetRequestCounts = useRef({}); // base -> count of get requests sent
   const targetReceiveCounts = useRef({}); // base -> count of current/ message target receipts
+  // Recent publish intents/results for in-view debugging
+  const [pubLog, setPubLog] = useState([]);
+  const addPubLog = (entry) => {
+    try {
+      setPubLog(prev => {
+        const next = [{ ...entry, ts: Date.now() }, ...prev];
+        return next.slice(0, 60);
+      });
+    } catch (e) {}
+  };
 
   const resolveHost = () => {
     if (USE_PUBLIC_WS) return PUBLIC_WS_HOST;
@@ -2054,6 +2178,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
       };
 
       ws.onopen = () => {
+        console.log('WS OPEN: connection established');
         // reset attempts
         reconnectMeta.current.attempts = 0;
         // clear any connection error state on open
@@ -2065,7 +2190,18 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           try {
             (deviceList || []).forEach(d => {
               if (!d || !d.key) return;
-              safeSend(ws, { type: 'get', topic: `${d.key}/Target`, id: `${d.key}-init-target` });
+              // Request the targ/...Target retained topic so we receive retained values
+              try {
+                const parts = String(d.key).split('/').filter(Boolean);
+                const site = parts.length >= 2 ? parts[0] : (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+                const deviceName = parts.length >= 2 ? parts[1] : parts[0];
+                if (deviceName) {
+                  const targTopic = site ? `targ/${site}/${deviceName}Target` : `targ/${deviceName}Target`;
+                  safeSend(ws, { type: 'get', topic: targTopic, id: `${d.key}-init-target` });
+                }
+              } catch (e) {
+                safeSend(ws, { type: 'get', topic: `${d.key}/Target`, id: `${d.key}-init-target` });
+              }
               safeSend(ws, { type: 'get', topic: `${d.key}/Sensor`, id: `${d.key}-init-sensor` });
               targetRequestCounts.current[d.key] = (targetRequestCounts.current[d.key] || 0) + 1;
             });
@@ -2131,6 +2267,16 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             }
             if (!haveTarget) {
               const id = base + '-retry-target-' + retryCount;
+              // Request the targ retained topic as well as the canonical base/Target
+              try {
+                const parts = String(base).split('/').filter(Boolean);
+                const site = parts.length >= 2 ? parts[0] : (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+                const deviceName = parts.length >= 2 ? parts[1] : parts[0];
+                if (deviceName) {
+                  const targTopic = site ? `targ/${site}/${deviceName}Target` : `targ/${deviceName}Target`;
+                  safeSend(ws, { type: 'get', topic: targTopic, id: id + '-targ' });
+                }
+              } catch (e) {}
               safeSend(ws, { type: 'get', topic: `${base}/Target`, id }); targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
             }
           });
@@ -2138,8 +2284,10 @@ export default function Dashboard({ token, onCustomerLoaded }) {
         // store timer on ref for cleanup
         ws._retryTimer = retryTimer;
       };
-  ws.onmessage = (ev) => {
+      ws.onmessage = (ev) => {
         try {
+          // Raw WS frame debug to catch early messages during initial connect/hydrate
+          try { if (DEBUG) { console.debug && console.debug('WS RAW FRAME recv', ev && ev.data && typeof ev.data === 'string' ? ev.data.slice(0, 200) : ev.data); } } catch (e) {}
           const obj = JSON.parse(ev.data);
           // helper to mark the connection healthy (clear the 6s timeout and overlay)
           const markConnected = () => {
@@ -2153,16 +2301,26 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             const parts = topic.split('/').filter(Boolean);
             if (parts.length < 2) return null; // must have at least a terminal and one element
             const last = parts[parts.length - 1];
-            if (!/^(Sensor|Target)$/i.test(last)) return null;
-            const terminal = last;
+            // Accept both explicit terminal segments ('Sensor'/'Target') and
+            // merged suffix forms like 'BOILTarget' produced by targ/... topics.
+            const m = String(last).match(/^(.*?)(Sensor|Target)$/i);
+            if (!m) return null;
+            const lastCore = (m[1] || '').trim();
+            const terminal = m[2];
 
-            // Remove optional leading 'tele' or 'stat' prefix so remaining parts are the core path
+            // Remove optional leading 'tele', 'stat' or 'targ' prefix so remaining parts are the core path
+            // targ/<SITE>/<DEVICE>Target is used by retained target topics and should be
+            // treated like tele/stat: strip the leading 'targ' segment before computing core
             let startIdx = 0;
-            if (parts[0] && (parts[0].toLowerCase() === 'tele' || parts[0].toLowerCase() === 'stat')) startIdx = 1;
-            const core = parts.slice(startIdx, parts.length - 1); // drop terminal
+            if (parts[0] && (['tele', 'stat', 'targ'].includes(String(parts[0]).toLowerCase()))) startIdx = 1;
+            // Build core pieces: everything except the last segment, plus any
+            // non-empty prefix from the merged last segment (e.g., 'BOIL' from 'BOILTarget')
+            const coreBase = parts.slice(startIdx, parts.length - 1); // drop last full segment
+            const core = coreBase.slice();
+            if (lastCore) core.push(lastCore);
             let site = null, device = null, metric = null;
             if (core.length === 1) {
-              // <device>/Sensor  (legacy)
+              // <device>/Sensor  (legacy) or merged last -> device only
               device = core[0];
             } else if (core.length === 2) {
               // <site>/<device>/Sensor
@@ -2285,6 +2443,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           const applyTarget = (topic, val) => {
             const meta = parseTopic(topic);
             if (!meta) return;
+            try { if (DEBUG) { console.debug && console.debug('Dashboard: applyTarget called', { topic, val, parsed: meta, mode, customerSlug }); } } catch (e) {}
             // If site missing, prefer discovery inference; otherwise do not default to BREW
             if (!meta.site) {
               const inferred = findSiteForDevice(meta.device);
@@ -2377,13 +2536,18 @@ export default function Dashboard({ token, onCustomerLoaded }) {
 
             // Update power states: if the topic contained an explicit site (normBaseExplicit),
             // treat that as authoritative and write under that key. Otherwise normalize.
-            try {
-              let normBase;
-              if (typeof normBaseExplicit !== 'undefined' && normBaseExplicit) {
-                normBase = normBaseExplicit;
-              } else {
-                normBase = normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
-              }
+              try {
+              // Normalize the base key into a stable canonical form used as gPower map keys.
+              // Prefer canonicalForTopic (strips tele/stat/STATE/RESULT) then fallback to normalizeCanonicalBase.
+              let rawNorm = (typeof normBaseExplicit !== 'undefined' && normBaseExplicit) ? normBaseExplicit : normalizeCanonicalBase(baseKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode });
+              let normBase = null;
+              try {
+                normBase = canonicalForTopic(rawNorm) || normalizeCanonicalBase(rawNorm, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || rawNorm;
+                // Ensure site segment is uppercased for stable comparisons
+                const parts = String(normBase || '').split('/').filter(Boolean);
+                if (parts.length) parts[0] = parts[0].toUpperCase();
+                normBase = parts.join('/');
+              } catch (e) { normBase = rawNorm; }
               // Update meta information under normalized key
               setGMeta(prev => {
                 const existing = prev[normBase] || prev[baseKey];
@@ -2449,7 +2613,17 @@ export default function Dashboard({ token, onCustomerLoaded }) {
               const siteForStat = site || findSiteForDevice(device) || mode || (customerSlug ? String(customerSlug).toUpperCase() : null) || 'BREW';
               // Do not mark devices as legacy-nosite; require explicit site or inference
               // from discovery/runtime mode. If none available, skip handling.
-              const normBase = normalizeCanonicalBase(`${siteForStat}/${device}`, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || `${siteForStat}/${device}`;
+              // Normalize incoming stat-derived base into canonical SITE/DEVICE form
+              let normBase = null;
+              try {
+                const raw = `${siteForStat}/${device}`;
+                normBase = canonicalForTopic(raw) || normalizeCanonicalBase(raw, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || raw;
+                const partsNorm = String(normBase).split('/').filter(Boolean);
+                if (partsNorm.length) partsNorm[0] = partsNorm[0].toUpperCase();
+                normBase = partsNorm.join('/');
+              } catch (e) {
+                normBase = `${siteForStat}/${device}`;
+              }
 
               // Interpret payload
               let isOn = false;
@@ -2519,15 +2693,21 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             if (parsedJson) applyPower(topic, parsedJson);
             if (!Number.isNaN(n)) {
               if (lowerTopic.endsWith('/sensor')) { applySensor(topic, n); markConnected(); }
-              else if (lowerTopic.endsWith('/target')) { applyTarget(topic, n); markConnected(); }
+              else if (String(lowerTopic || '').endsWith('target')) { applyTarget(topic, n); markConnected(); }
             }
+          }
+          // capture publish-result messages from bridge
+          if (obj.type === 'publish-result' && obj.id) {
+            try {
+              addPubLog({ type: 'result', id: obj.id, success: !!obj.success, topic: obj.topic || null, payload: obj.payload || null, retained: !!obj.retained });
+            } catch (e) {}
           }
           // also accept 'current' responses from the bridge for sensor gets
           if (obj.type === 'current' && typeof obj.topic === 'string' && /\/sensor$/i.test(obj.topic)) {
             const n = obj.payload === null ? null : Number(obj.payload);
             if (!Number.isNaN(n) && n !== null) { applySensor(obj.topic, n); markConnected();}
           }
-          if (obj.type === 'current' && typeof obj.topic === 'string' && /\/target$/i.test(obj.topic)) {
+          if (obj.type === 'current' && typeof obj.topic === 'string' && String(obj.topic || '').toLowerCase().endsWith('target')) {
             if (obj.payload !== null && obj.payload !== undefined && obj.payload !== '') {
               const n = Number(obj.payload);
               if (!Number.isNaN(n)) { applyTarget(obj.topic, n); markConnected();  }
@@ -2561,13 +2741,20 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                   if (cand) baseKey = cand;
                 const num = Number(val);
                 if (/\/sensor$/i.test(topic) && !Number.isNaN(num)) sensorAdds[baseKey] = num;
-                if (/\/target$/i.test(topic) && !Number.isNaN(num)) targetAdds[baseKey] = num;
+                if (String(topic || '').toLowerCase().endsWith('target') && !Number.isNaN(num)) targetAdds[baseKey] = num;
                 if (!metaAdds[baseKey]) metaAdds[baseKey] = parsed;
               });
             });
-            if (Object.keys(sensorAdds).length) setGSensors(prev => ({ ...sensorAdds, ...prev }));
-            if (Object.keys(targetAdds).length) setGTargets(prev => ({ ...targetAdds, ...prev }));
+            if (Object.keys(sensorAdds).length) setGSensors(prev => ({ ...prev, ...sensorAdds }));
+            if (Object.keys(targetAdds).length) setGTargets(prev => ({ ...prev, ...targetAdds }));
             if (Object.keys(metaAdds).length) setGMeta(prev => ({ ...prev, ...metaAdds }));
+            if (DEBUG) {
+              try {
+                console.debug('[inventory/grouped-inventory] gTargets keys:', Object.keys(gTargets));
+                console.debug('[inventory/grouped-inventory] gSensors keys:', Object.keys(gSensors));
+                console.debug('[inventory/grouped-inventory] gMeta keys:', Object.keys(gMeta));
+              } catch (e) {}
+            }
             markConnected();
           }
           // real-time every message broadcast
@@ -2644,7 +2831,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
             if (parsedJson) applyPower(obj.topic, parsedJson);
             if (!Number.isNaN(n)) {
               if (lowerTopic.endsWith('/sensor')) { applySensor(obj.topic, n); markConnected(); }
-              else if (lowerTopic.endsWith('/target')) { applyTarget(obj.topic, n); markConnected(); }
+              else if (String(lowerTopic || '').endsWith('target')) { applyTarget(obj.topic, n); markConnected(); }
             }
           }
           // inventory snapshot
@@ -2661,12 +2848,19 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 const baseKey = canonicalBaseFromMeta(parsed) || (parsed.metric ? `${parsed.device}/${parsed.metric}` : `${parsed.device}`);
               const n = Number(val);
               if (/\/sensor$/i.test(topic) && !Number.isNaN(n)) sensorAdds[baseKey] = n;
-              if (/\/target$/i.test(topic) && !Number.isNaN(n)) targetAdds[baseKey] = n;
+              if (String(topic || '').toLowerCase().endsWith('target') && !Number.isNaN(n)) targetAdds[baseKey] = n;
               if (!metaAdds[baseKey]) metaAdds[baseKey] = parsed;
             });
-            if (Object.keys(sensorAdds).length) setGSensors(prev => ({ ...sensorAdds, ...prev }));
-            if (Object.keys(targetAdds).length) setGTargets(prev => ({ ...targetAdds, ...prev }));
+            if (Object.keys(sensorAdds).length) setGSensors(prev => ({ ...prev, ...sensorAdds }));
+            if (Object.keys(targetAdds).length) setGTargets(prev => ({ ...prev, ...targetAdds }));
             if (Object.keys(metaAdds).length) setGMeta(prev => ({ ...prev, ...metaAdds }));
+            if (DEBUG) {
+              try {
+                console.debug('[inventory] gTargets keys:', Object.keys(gTargets));
+                console.debug('[inventory] gSensors keys:', Object.keys(gSensors));
+                console.debug('[inventory] gMeta keys:', Object.keys(gMeta));
+              } catch (e) {}
+            }
             debug('Applied inventory snapshot (parsed)', Object.keys(sensorAdds).length, 'sensors,', Object.keys(targetAdds).length, 'targets');
           }
         } catch (e) {
@@ -3085,7 +3279,18 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   }
   if (Object.keys(addsPower).length) {
     if (DEBUG) { try { console.debug('Dashboard: snapshot.addsPower (before apply)', addsPower); } catch (e) {} }
-    setGPower(prev => ({ ...prev, ...addsPower }));
+    // Normalize keys in addsPower to canonical SITE/DEVICE form so they match live messages
+    const normalizedAdds = {};
+    Object.entries(addsPower).forEach(([k, v]) => {
+      try {
+        let norm = canonicalForTopic(k) || normalizeCanonicalBase(k, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || k;
+        const parts = String(norm).split('/').filter(Boolean);
+        if (parts.length) parts[0] = parts[0].toUpperCase();
+        norm = parts.join('/');
+        normalizedAdds[norm] = v;
+      } catch (e) { normalizedAdds[k] = v; }
+    });
+    setGPower(prev => ({ ...prev, ...normalizedAdds }));
     if (DEBUG) {
       // schedule a microtask to log resulting gPower (best-effort; may log previous value if state hasn't updated yet)
       try { setTimeout(() => { try { console.debug('Dashboard: snapshot.applied gPower (post-apply)'); } catch (e) {} }, 250); } catch (e) {}
@@ -3095,10 +3300,15 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     const newDbSet = new Set(Array.from(seenDbBases));
     setDbSensorBases(newDbSet);
 
-    // Snapshot hydrate completed: clear loading overlay and cancel the connection timeout
+    // Snapshot hydrate completed: clear loading overlay after a small buffer so
+    // UI doesn't flash missing controls during immediate post-hydrate reconciliation.
     try {
-      setLoading(false);
+      // mark spinner buffer active and schedule clearing loading after buffer
+      spinnerBufferRef.current = true;
       if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+      setTimeout(() => {
+        try { spinnerBufferRef.current = false; setLoading(false); } catch (e) {}
+  }, 3500);
     } catch (e) {}
 
     // If the WebSocket is already open, proactively request current Sensor/Target
@@ -3332,12 +3542,67 @@ export default function Dashboard({ token, onCustomerLoaded }) {
       canonicalForUpdate = normalizeCanonicalBase(deviceKey, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }) || (site ? `${site}/${deviceName}` : deviceName);
     } catch (e) { canonicalForUpdate = (site ? `${site}/${deviceName}` : deviceName); }
 
-    try {
-      try { brewskiLog('[publishTarget] send', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
-      wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id }));
+      try {
+        try { brewskiLog('[publishTarget] send', { topic: pubTopic, payload: val, id, readyState: wsRef.current && wsRef.current.readyState }); } catch (e) {}
+        // Request bridge to publish as retained so new subscribers immediately get the latest target
+        wsRef.current.send(JSON.stringify({ type: 'publish', topic: pubTopic, payload: val, id, retain: true }));
       brewskiLog('publish', pubTopic, val, id);
       if (canonicalForUpdate) setGTargets(prev => ({ ...(prev || {}), [canonicalForUpdate]: val }));
     } catch (e) {}
+
+      // After we optimistically set target locally, immediately evaluate any
+      // indicator-labelled power keys for this canonical base and trigger cmnd
+      // publishes as appropriate so automation happens without waiting for stat.
+      try {
+        if (canonicalForUpdate) {
+          (function maybeTriggerIndicatorsForBase(base, targetValue) {
+            try {
+              // find any gPower entry whose canonical matches `base`
+              const matches = [];
+              for (const [pwBase, states] of Object.entries(gPower || {})) {
+                try {
+                  const storedCanon = (() => {
+                    try { return canonicalForTopic(pwBase) || normalizeCanonicalBase(pwBase, { knownSlugs, gMeta, dbSensorBases, customerSlug, mode }); } catch (e) { return pwBase; }
+                  })();
+                  if (!storedCanon) continue;
+                  if (String(storedCanon).toUpperCase() === String(base).toUpperCase()) {
+                    matches.push([pwBase, states]);
+                  }
+                } catch (e) {}
+              }
+              if (!matches.length) return;
+
+              // Evaluate each matched power entry
+              for (const [pwBase, states] of matches) {
+                try {
+                  for (const [powerKey, isOn] of Object.entries(states || {})) {
+                    try {
+                      const label = getPowerLabel(pwBase, powerKey) || '';
+                      const ind = parseIndicatorType(label);
+                      if (!ind) continue;
+
+                      // Determine current sensor value for this base
+                      const sensorVal = findPrefixedValue(gSensors, base);
+                      const sNum = (sensorVal === null || sensorVal === undefined) ? null : Number(sensorVal);
+                      const tNum = (targetValue === null || targetValue === undefined) ? null : Number(targetValue);
+                      if (sNum === null || tNum === null || Number.isNaN(sNum) || Number.isNaN(tNum)) continue;
+
+                      const desired = computeDesired(ind, sNum, tNum);
+                      if (desired === null) continue; // within hysteresis
+
+                      const curOn = !!isOn;
+                      if (desired !== curOn) {
+                        // call publishPower with source 'auto' so logs/pubLog match manual publishes
+                        publishPower(pwBase, powerKey, desired, { source: 'auto' });
+                      }
+                    } catch (e) {}
+                  }
+                } catch (e) {}
+              }
+            } catch (e) {}
+          })(canonicalForUpdate, val);
+        }
+      } catch (e) {}
 
     setTimeout(() => {
       try {
@@ -3386,8 +3651,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     }
   };
 
-  const publishPower = (baseKey, powerKey, nextOn) => {
-    if (!wsRef.current || wsRef.current.readyState !== 1) return;
+  const publishPower = (baseKey, powerKey, nextOn, opts = {}) => {
+    if (!wsRef.current || wsRef.current.readyState !== 1) return null;
 
     // baseKey is expected to be canonical (SITE/DEVICE). If it already
     // contains a site portion use it; otherwise attempt to derive site from
@@ -3422,17 +3687,22 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   const topic = buildCmdTopic(site, deviceName, cmdKey);
     const payload = nextOn ? 'ON' : 'OFF';
     const id = `pw-${site || 'UNK'}-${deviceName}-${cmdKey}-${Date.now()}-${Math.random().toString(36).slice(2,6)}`;
+    const source = (opts && opts.source) ? String(opts.source) : 'user';
 
       try {
-        // normalize prefix (first segment) to lowercase for broker expectations
-        const parts = String(topic).split('/');
-        if (parts && parts.length) parts[0] = parts[0].toLowerCase();
-        const outTopic = parts.join('/');
-        brewskiLog('publishPower send', { topic: outTopic, payload, id, readyState: wsRef.current && wsRef.current.readyState });
-        wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload, id }));
+          // normalize prefix (first segment) to lowercase for broker expectations
+          const parts = String(topic).split('/');
+          if (parts && parts.length) parts[0] = parts[0].toLowerCase();
+          const outTopic = parts.join('/');
+          try { brewskiLog && brewskiLog('publishPower.send_intent', { topic: outTopic, payload, id, source }); } catch (e) {}
+          if (DEBUG) console.debug('publishPower: sending publish frame', { topic: outTopic, payload, id, readyState: wsRef.current && wsRef.current.readyState, source });
+          try { addPubLog({ type: 'intent', id, topic: outTopic, payload, source }); } catch (e) {}
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic: outTopic, payload, id }));
       } catch (e) {
-        brewskiLog('publishPower send fallback', { topic, payload, id, err: e && e.message });
-        wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload, id }));
+  try { brewskiLog && brewskiLog('publishPower.send_error', { topic, payload, id, err: e && e.message, source }); } catch (ee) {}
+  try { addPubLog({ type: 'error', id, topic, payload, err: e && e.message, source }); } catch (ee) {}
+          if (DEBUG) console.warn('publishPower: send fallback', e && e.message);
+          wsRef.current.send(JSON.stringify({ type: 'publish', topic, payload, id }));
       }
 
       // Optimistically update local state for immediate UI feedback
@@ -3448,9 +3718,139 @@ export default function Dashboard({ token, onCustomerLoaded }) {
       });
 
 
-      // Also proactively request current state for this base so the dashboard reconciles
-      try { requestCurrentForBase(baseKey); } catch (e) {}
+    // Also proactively request current state for this base so the dashboard reconciles
+    try { requestCurrentForBase(baseKey); } catch (e) {}
+    return id;
   };
+
+  // --- Automation for heating/cooling indicator power labels ---
+  // Configurable constants
+  const AUTO_HYSTERESIS = 0.5; // degrees to prevent flapping
+  const AUTO_THROTTLE_MS = 30 * 1000; // don't auto-toggle the same key more than once per 30s
+  const MANUAL_OVERRIDE_MS = 2 * 60 * 1000; // respect manual toggles for 2 minutes
+
+  // Refs to track last automated toggle attempts (throttle)
+  const lastAutoAttemptRef = useRef({}); // key -> ts
+
+  // No manual toggle detection required: UI buttons for indicators are disabled.
+
+  // Helper: parse indicator type from label string
+  const parseIndicatorType = (label) => {
+    if (!label || typeof label !== 'string') return null;
+    const low = label.toLowerCase();
+    if (low.includes('heatingindicator')) return 'heating';
+    if (low.includes('coolingindicator')) return 'cooling';
+    return null;
+  };
+
+  // Helper: find prefixed value like in render code - exact match then prefixed variant
+  const findPrefixedValue = (mapObj, base) => {
+    if (!mapObj) return null;
+    if (mapObj[base] !== undefined) return mapObj[base];
+    const pref = Object.keys(mapObj).find(k => k.startsWith(base + '/'));
+    return pref ? mapObj[pref] : null;
+  };
+
+  // Detect manual user publishPower calls by wrapping around publishPower usage in UI.
+  // Existing UI calls publishPower directly; to mark manual toggles we intercept via a helper used by buttons.
+  // We will not change existing UI wiring here; instead mark toggles when publishPower runs by checking call stack.
+  // To be robust, also provide an explicit wrapper used by UI if desired.
+
+  // Helper to decide desired state given type, sensor, target
+  const computeDesired = (type, sensor, target) => {
+    if (typeof sensor !== 'number' || typeof target !== 'number') return null;
+    if (type === 'heating') {
+      if (sensor < (target - AUTO_HYSTERESIS)) return true;
+      if (sensor >= (target + AUTO_HYSTERESIS)) return false;
+      return null; // within hysteresis band -> no change
+    }
+    if (type === 'cooling') {
+      if (sensor > (target + AUTO_HYSTERESIS)) return true;
+      if (sensor <= (target - AUTO_HYSTERESIS)) return false;
+      return null;
+    }
+    return null;
+  };
+
+  // Wrap publishPower to annotate lastToggleRef when called from UI (user) vs automation (auto)
+  // We will call publishPower directly for automation and then mark lastToggleRef as auto.
+
+  // useEffect: run automation whenever sensors/targets/power/meta change
+  useEffect(() => {
+    try {
+      if (!wsRef.current || wsRef.current.readyState !== 1) return; // require ws connected
+      if (!gPower || !gTargets || !gSensors) return;
+      const now = Date.now();
+
+      Object.entries(gPower).forEach(([powerBaseKey, states]) => {
+        if (!states || typeof states !== 'object') return;
+        Object.entries(states).forEach(([powerKey, isOn]) => {
+          try {
+            const label = getPowerLabel(powerBaseKey, powerKey) || '';
+            const ind = parseIndicatorType(label);
+            if (!ind) return;
+
+            // Determine canonical base to lookup sensors/targets
+            const requestedCanon = powerBaseKey;
+            const sensorVal = findPrefixedValue(gSensors, requestedCanon);
+            const targetVal = findPrefixedValue(gTargets, requestedCanon);
+            const sNum = (sensorVal === null || sensorVal === undefined) ? null : Number(sensorVal);
+            const tNum = (targetVal === null || targetVal === undefined) ? null : Number(targetVal);
+            if (sNum === null || tNum === null || Number.isNaN(sNum) || Number.isNaN(tNum)) return;
+
+            const desired = computeDesired(ind, sNum, tNum);
+            if (desired === null) return; // within hysteresis band
+
+            const key = `${powerBaseKey}|${powerKey}`;
+
+            // Respect manual override: if last toggle was manual and recent, skip
+            const last = lastToggleRef.current[key];
+            if (last && last.source === 'user' && (now - last.ts) < MANUAL_OVERRIDE_MS) {
+              if (DEBUG) console.debug('autoIndicator: skipping due to manual override', key);
+              return;
+            }
+
+            // Throttle repeated automated attempts
+            const lastAuto = lastAutoAttemptRef.current[key] || 0;
+            if ((now - lastAuto) < AUTO_THROTTLE_MS) {
+              if (DEBUG) console.debug('autoIndicator: throttled', key);
+              return;
+            }
+
+            // If desired differs from current state, act
+            const curOn = !!isOn;
+            if (desired !== curOn) {
+              if (DEBUG) console.debug('autoIndicator: toggling', { key, desired, curOn, sensor: sNum, target: tNum, label });
+              try {
+                // record intent so change detector can identify this as auto
+                lastAutoAttemptRef.current[key] = now;
+                // compute cmnd topic for logging (derive site/device/cmdKey similar to publishPower)
+                try {
+                  const parts = String(powerBaseKey || '').split('/').filter(Boolean);
+                  const site = parts.length >= 2 ? parts[0] : null;
+                  const deviceName = parts.length >= 2 ? parts[1] : (parts[0] || null);
+                  const cmdKey = (powerKey === 'POWER') ? 'Power' : powerKey.replace(/^POWER/, 'Power');
+                  const cmdTopic = (function() {
+                    try {
+                      const built = site ? `cmnd/${String(site)}/${String(deviceName).toUpperCase()}/${String(cmdKey).toUpperCase()}` : `cmnd/${String(deviceName).toUpperCase()}/${String(cmdKey).toUpperCase()}`;
+                      const parts = built.split('/'); if (parts && parts.length) parts[0] = parts[0].toLowerCase(); return parts.join('/');
+                    } catch (e) { return null; }
+                  })();
+                  try { brewskiLog && brewskiLog('autoIndicator.publish_intent', { topic: cmdTopic, payload: desired, key }); } catch (e) {}
+                  if (DEBUG) console.debug('autoIndicator: publish_intent', { topic: cmdTopic, payload: desired, key });
+                } catch (e) {}
+
+                // send command (mark as automated source so logs/pubLog include it)
+                publishPower(powerBaseKey, powerKey, desired, { source: 'auto' });
+              } catch (e) {
+                if (DEBUG) console.warn('autoIndicator: publishPower failed', e && e.message);
+              }
+            }
+          } catch (e) {}
+        });
+      });
+    } catch (e) {}
+  }, [gSensors, gTargets, gPower, gMeta, mode]);
 
   // Helper: request current Sensor/Target/State and probe device for a given canonical base
   const requestCurrentForBase = (base) => {
@@ -3473,6 +3873,17 @@ export default function Dashboard({ token, onCustomerLoaded }) {
       try {
         const idT = `reqcur-target-${base}-${Date.now()}`;
         ws.send(JSON.stringify({ type: 'get', topic: `${base}/Target`, id: idT }));
+        // Also request the targ/<site>/<device>Target retained topic so retained targets are returned
+        try {
+          const parts = String(base).split('/').filter(Boolean);
+          const site = parts.length >= 2 ? parts[0] : (mode || (customerSlug ? String(customerSlug).toUpperCase() : null));
+          const deviceName = parts.length >= 2 ? parts[1] : parts[0];
+          if (deviceName) {
+            const targTopic = site ? `targ/${site}/${deviceName}Target` : `targ/${deviceName}Target`;
+            const idTarg = `reqcur-targ-${base}-${Date.now()}`;
+            ws.send(JSON.stringify({ type: 'get', topic: targTopic, id: idTarg }));
+          }
+        } catch (e) {}
         targetRequestCounts.current[base] = (targetRequestCounts.current[base] || 0) + 1;
       } catch (e) {}
 
@@ -3710,12 +4121,17 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                   return null;
                 })();
                 
+                const wrapperKey = `gwrap-${d.key}-${d.representative || i}-${i}`;
+                const gaugeKey = `g-${d.key}-${d.representative || i}-${i}`;
+                if (DEBUG) {
+                  try { console.debug('Dashboard: render gauge', { canonical: d.key, representative: d.representative, idx: i }); } catch (e) {}
+                }
                 return (
-                  <View key={`gwrap-${d.key}`} style={{ width: columnWidth, padding: gap/2, alignItems:'center' }}>
+                  <View key={wrapperKey} style={{ width: columnWidth, padding: gap/2, alignItems:'center' }}>
                     <View style={styles.gaugeCardWrapper}>
-                      <View style={[styles.gaugeCard, { minHeight: cardMin }]}>
+                      <View style={[styles.gaugeCard, { minHeight: cardMin }]}> 
                         <Gauge
-                          key={`g-${d.key}`}
+                          key={gaugeKey}
                           size={gaugeSize}
                           title={d.label}
                           sensorValue={sensorVal}
@@ -3880,6 +4296,18 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           </>
         )}
       </ScrollView>
+      {DEBUG && (
+        <View style={{ position: 'absolute', right: 8, bottom: 8, width: 360, maxHeight: 240, backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 8, padding: 8 }} pointerEvents="box-none">
+          <Text style={{ color: '#fff', fontWeight: '600', marginBottom: 6 }}>Publish Log</Text>
+          <ScrollView style={{ maxHeight: 200 }}>
+            {pubLog.map((e, idx) => (
+              <Text key={idx} style={{ color: e.type === 'error' ? '#ffbaba' : e.type === 'result' && !e.success ? '#ffd6a5' : '#dcedc8', fontSize: 11 }}>
+                {new Date(e.ts).toLocaleTimeString()} {e.type} {e.topic || ''} {e.payload !== undefined ? JSON.stringify(e.payload) : ''} {e.success === false ? 'FAILED' : ''}
+              </Text>
+            ))}
+          </ScrollView>
+        </View>
+      )}
       {(loading || connectionError) && (
         <View style={styles.fullscreenOverlay} pointerEvents="auto">
           <View style={styles.overlayInner}>
