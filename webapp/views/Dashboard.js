@@ -1466,6 +1466,16 @@ export default function Dashboard({ token, onCustomerLoaded }) {
   const NOSTATE_MS = 90 * 1000; // 90s without stat => no-state
   const LAST_SEEN_STORAGE_KEY = 'brewski_last_seen_v1';
   const persistTimerRef = useRef(null);
+  // Track connection timing so we can show 'Establishing connection...' on first load
+  // Initialize immediately if we already have a token so the UI can display
+  // the establishing state on first render instead of showing 'Offline'.
+  const connectStartedAtRef = useRef(token ? Date.now() : null);
+  // Mount timestamp: used as a fallback to show the establishing grace period
+  // when connectStartedAtRef has not yet been recorded (token may arrive async).
+  const mountStartedAtRef = useRef(Date.now());
+  const [firstMessageAt, setFirstMessageAt] = useState(null);
+  const firstMessageAtRef = useRef(null);
+  const ESTABLISHING_MS = 90 * 1000; // 90s grace before marking offline (allow bridge to respond)
 
     // Auto-sync: when gPower changes, ensure discovered bases and power keys exist in server DB.
     // This runs best-effort in background and avoids repeated work via a ref cache.
@@ -2174,8 +2184,10 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     // include token as query param (primary). We'll add a fallback retry with a single subprotocol only if needed.
     const url = `${base}?token=${encodeURIComponent(token)}`;
     try {
-      const ws = new WebSocket(url);
+  const ws = new WebSocket(url);
       wsRef.current = ws;
+  // record connect attempt start
+  try { connectStartedAtRef.current = Date.now(); setFirstMessageAt(null); firstMessageAtRef.current = null; } catch (e) {}
       // helper to avoid sending on sockets that are not OPEN
       const safeSend = (socket, payload) => {
         try {
@@ -2301,6 +2313,13 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           const markConnected = () => {
             try { setConnectionError(false); setLoading(false); } catch (e) {}
             if (connTimeoutRef.current) { clearTimeout(connTimeoutRef.current); connTimeoutRef.current = null; }
+            // record time of first successful message arrival
+            try {
+              if (!firstMessageAtRef.current) {
+                firstMessageAtRef.current = Date.now();
+                setFirstMessageAt(firstMessageAtRef.current);
+              }
+            } catch (e) {}
           };
 
           // Topic parsing helper (expects <site>/<device>/<metric>/<Sensor|Target>)
@@ -3025,6 +3044,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
     // Mode will be set from customer info in /api/latest response
     try { wsRef.current && wsRef.current.close(); } catch (e) {}
     if (reconnectMeta.current.timer) { clearTimeout(reconnectMeta.current.timer); reconnectMeta.current.timer = null; }
+    // record that we're attempting to connect now so UI can show 'Establishing connection...'
+    try { connectStartedAtRef.current = Date.now(); setFirstMessageAt(null); firstMessageAtRef.current = null; } catch (e) {}
     connectWebSocket();
     // Hydrate last-known values from localStorage for immediate UX (web only)
     // NOTE: Removed localStorage hydration — rely on authoritative DB snapshot and live MQTT only
@@ -3059,7 +3080,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           } catch (e) {}
         }
 
-        // Extract customer information for dynamic filtering
+  // Extract customer information for dynamic filtering
         if (js.customer && js.customer.slug) {
           setCustomerSlug(js.customer.slug);
           // Set mode to user's actual customer slug (BREW users get BREW, others get their slug)
@@ -3072,7 +3093,7 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           }
         }
 
-        const addsSensors = {}, addsMeta = {}, addsPower = {};
+  const addsSensors = {}, addsMeta = {}, addsPower = {};
   // track per-base/per-powerKey timestamps so we apply the most recent snapshot value
   const addsPowerTs = {};
   // collect authoritative DB-backed sensor bases from the snapshot
@@ -3397,6 +3418,107 @@ export default function Dashboard({ token, onCustomerLoaded }) {
           } catch (e) {}
         }
       }
+            // If the server provided timestamps in the snapshot (either mqtt_seen,
+            // or the sensors/latest_stats arrays) use them to seed the client's
+            // lastTeleMap/lastStatMap so the UI can trust authoritative last-seen
+            // evidence rather than showing Offline immediately.
+            try {
+              const teleSeed = {};
+              const statSeed = {};
+
+              // 1) mqtt_seen array (if present) — keep existing behavior
+              try {
+                if (Array.isArray(js.mqtt_seen) && js.mqtt_seen.length) {
+                  js.mqtt_seen.forEach(entry => {
+                    try {
+                      const t = entry && entry.topic ? String(entry.topic) : null;
+                      const ts = entry && entry.last_ts ? Number(entry.last_ts) : null;
+                      if (!t || !ts) return;
+                      let parts = t.split('/').filter(Boolean);
+                      if (!parts.length) return;
+                      if (/^(tele|stat|targ)$/i.test(parts[0])) parts = parts.slice(1);
+                      const last = parts[parts.length - 1];
+                      if (/^(sensor|target|state|result)$/i.test(last)) parts = parts.slice(0, parts.length - 1);
+                      if (!parts.length) return;
+                      const base = parts.length >= 2 ? `${parts[0]}/${parts[1]}` : `${parts[0]}`;
+                      if (/\/sensor$/i.test(t) || /sensor/i.test(last) || /tele\//i.test(t)) {
+                        teleSeed[base] = Math.max(teleSeed[base] || 0, ts);
+                      }
+                      if (/\/state$/i.test(t) || /result$/i.test(t) || /stat\//i.test(t) || /^POWER/i.test(last)) {
+                        statSeed[base] = Math.max(statSeed[base] || 0, ts);
+                      }
+                    } catch (e) {}
+                  });
+                }
+              } catch (e) {}
+
+              // 2) sensors array rows — each row carries last_ts and topic_key/key
+              try {
+                if (Array.isArray(js.sensors) && js.sensors.length) {
+                  js.sensors.forEach(row => {
+                    try {
+                      if (!row) return;
+                      const rawTopic = (row.topic_key || row.key || '').trim();
+                      const ts = row.last_ts ? Number(row.last_ts) : null;
+                      if (!rawTopic || !ts) return;
+                      let parts = rawTopic.split('/').filter(Boolean);
+                      if (!parts.length) return;
+                      // handle tele/stat prefixed rows
+                      if (/^(tele|stat|targ)$/i.test(parts[0])) parts = parts.slice(1);
+                      const last = parts[parts.length - 1];
+                      // strip trailing Sensor/Target/State
+                      if (/^(sensor|target|state|result)$/i.test(last)) parts = parts.slice(0, parts.length - 1);
+                      if (!parts.length) return;
+                      const base = parts.length >= 2 ? `${parts[0]}/${parts[1]}` : `${parts[0]}`;
+                      // Decide whether this row is telemetry (sensor) vs stat/state
+                      // Use topic_key heuristic: presence of '/STATE' or row.type POWER* -> stat
+                      const isStatRow = (/\/STATE$/i.test(rawTopic) || /\/STATE$/i.test(row.topic_key || '') || (row.type && /^POWER/i.test(String(row.type))));
+                      const isTeleRow = (/\/SENSOR$/i.test(rawTopic) || /tele\//i.test(rawTopic) || (!isStatRow && row.type === null));
+                      if (isTeleRow) teleSeed[base] = Math.max(teleSeed[base] || 0, ts);
+                      if (isStatRow) statSeed[base] = Math.max(statSeed[base] || 0, ts);
+                    } catch (e) {}
+                  });
+                }
+              } catch (e) {}
+
+              // 3) latest_stats array — these are per-base power stats; treat them as stat timestamps
+              try {
+                const statLists = js.latest_stats || js.stat_messages || js.stats || js.stat_messages_list || null;
+                if (Array.isArray(statLists) && statLists.length) {
+                  statLists.forEach(s => {
+                    try {
+                      const topic = s && (s.topic || s.top || s.key) ? String(s.topic || s.top || s.key) : null;
+                      const ts = s && s.last_ts ? Number(s.last_ts) : (s && s.last_ts ? Number(s.last_ts) : null);
+                      if (!topic || !ts) return;
+                      // Normalize topic into base similar to above
+                      let parts = topic.split('/').filter(Boolean);
+                      if (!parts.length) return;
+                      if (/^(tele|stat|targ)$/i.test(parts[0])) parts = parts.slice(1);
+                      const last = parts[parts.length - 1];
+                      if (/^(sensor|target|state|result)$/i.test(last)) parts = parts.slice(0, parts.length - 1);
+                      if (!parts.length) return;
+                      const base = parts.length >= 2 ? `${parts[0]}/${parts[1]}` : `${parts[0]}`;
+                      statSeed[base] = Math.max(statSeed[base] || 0, ts);
+                    } catch (e) {}
+                  });
+                }
+              } catch (e) {}
+
+              // Apply merged seeds to client state
+              if (Object.keys(teleSeed).length) setLastTeleMap(prev => ({ ...(prev || {}), ...teleSeed }));
+              if (Object.keys(statSeed).length) setLastStatMap(prev => ({ ...(prev || {}), ...statSeed }));
+
+              // If server claims it has seen messages recently, mark firstMessageAt so establishing clears
+              try {
+                const now = Date.now();
+                const allTs = Object.values(teleSeed).concat(Object.values(statSeed));
+                const anyRecent = allTs.some(ts => (now - Number(ts || 0)) < ESTABLISHING_MS);
+                if (anyRecent && !firstMessageAtRef.current) {
+                  firstMessageAtRef.current = Date.now();
+                  setFirstMessageAt(firstMessageAtRef.current);
+                }
+              } catch (e) {}
+            } catch (e) {}
     } catch (e) {}
   }
       } catch(e) {
@@ -4190,12 +4312,21 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                 if (DEBUG) {
                   try { console.debug('Dashboard: render gauge', { canonical: d.key, representative: d.representative, idx: i }); } catch (e) {}
                 }
-                // Determine offline / no-state status for UI
+                // Determine offline / no-state status for UI with an initial establishing grace period
                 const nowTs = Date.now();
                 const lastTele = (lastTeleMap && (lastTeleMap[d.key] || lastTeleMap[d.representative])) || null;
                 const lastStat = (lastStatMap && (lastStatMap[d.key] || lastStatMap[d.representative])) || null;
-                const isOffline = !(lastTele) || ((nowTs - (lastTele || 0)) > OFFLINE_MS);
-                const isNoState = !(lastStat) || ((nowTs - (lastStat || 0)) > NOSTATE_MS);
+                // Determine which start timestamp to use for establishing grace.
+                // Prefer explicit connectStartedAtRef but fall back to the component mount
+                // time so initial render shows 'Establishing' even if the connect
+                // attempt hasn't been recorded yet due to async token wiring.
+                const startTs = (connectStartedAtRef.current || mountStartedAtRef.current || 0);
+                // Treat each device independently: if the server/client has a recent
+                // telemetry or stat timestamp for this base, it's not 'establishing'.
+                const deviceHasRecent = (lastTele && ((nowTs - lastTele) < ESTABLISHING_MS)) || (lastStat && ((nowTs - lastStat) < ESTABLISHING_MS));
+                const establishing = (startTs && ((nowTs - startTs) < ESTABLISHING_MS)) && !deviceHasRecent;
+                const isOffline = establishing ? false : (!(lastTele) || ((nowTs - (lastTele || 0)) > OFFLINE_MS));
+                const isNoState = establishing ? false : (!(lastStat) || ((nowTs - (lastStat || 0)) > NOSTATE_MS));
 
                 return (
                   <View key={wrapperKey} style={{ width: columnWidth, padding: gap/2, alignItems:'center' }}>
@@ -4216,8 +4347,13 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                           min={gp.min}
                           max={gp.max}
                         />
-                        {/* Offline / No-State badges */}
-                        {(isOffline || isNoState) && (
+                        {/* Offline / No-State badges (with establishing grace period) */}
+                        {(establishing) && (
+                          <View style={{ marginTop: 6, alignItems: 'center' }}>
+                            <Text style={{ color: '#1976d2', fontSize: 11, fontWeight: '700' }}>Establishing connection...</Text>
+                          </View>
+                        )}
+                        {(!establishing && (isOffline || isNoState)) && (
                           <View style={{ marginTop: 6, alignItems: 'center' }}>
                             {isOffline && <Text style={{ color: '#b71c1c', fontSize: 11, fontWeight: '700' }}>Offline (no tele)</Text>}
                             {!isOffline && isNoState && <Text style={{ color: '#ff9800', fontSize: 11, fontWeight: '700' }}>No state received in the last 90 seconds</Text>}
@@ -4295,8 +4431,8 @@ export default function Dashboard({ token, onCustomerLoaded }) {
                                 return (
                                   <Pressable
                                     key={powerKey}
-                                    onPress={() => { if (!indicatorRenderer && !isOffline) publishPower(powerSwitches[0], powerKey, !isOn); }}
-                                    disabled={!!indicatorRenderer || isOffline}
+                                    onPress={() => { if (!indicatorRenderer && !isOffline && !establishing) publishPower(powerSwitches[0], powerKey, !isOn); }}
+                                    disabled={!!indicatorRenderer || isOffline || establishing}
                                     accessibilityRole={indicatorRenderer ? 'text' : 'button'}
                                     style={{ 
                                       paddingVertical: 6, 
