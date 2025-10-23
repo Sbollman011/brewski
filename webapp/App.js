@@ -129,29 +129,7 @@ class ErrorBoundary extends React.Component {
 
 // Removed push notification registration logic per request
 
-function SettingsScreen({ onBack }) {
-  return (
-    <View style={{ padding: 12 }}>
-      <Text style={{ fontSize: 18, fontWeight: '600' }}>Settings</Text>
-      <Text style={{ marginTop: 8, color: '#444' }}>No settings yet — coming soon.</Text>
-      <Pressable onPress={onBack} style={{ marginTop: 12 }}>
-        <Text style={{ color: '#2196f3' }}>Back</Text>
-      </Pressable>
-    </View>
-  );
-}
-
-function AboutScreen({ onBack }) {
-  return (
-    <View style={{ padding: 12 }}>
-      <Text style={{ fontSize: 18, fontWeight: '600' }}>About</Text>
-      <Text style={{ marginTop: 8, color: '#444' }}>Brew Remote — lightweight MQTT dashboard.</Text>
-      <Pressable onPress={onBack} style={{ marginTop: 12 }}>
-        <Text style={{ color: '#2196f3' }}>Back</Text>
-      </Pressable>
-    </View>
-  );
-}
+import Settings from './views/Settings';
 
 export default function App() {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -688,8 +666,7 @@ export default function App() {
                 ); })()
               ))
             )}
-            {screen === 'settings' && token && <SettingsScreen onBack={() => setScreen('dashboard')} />}
-            {screen === 'about' && token && <AboutScreen onBack={() => setScreen('dashboard')} />}
+            {screen === 'settings' && token && <Settings token={token} user={cachedUser} />}
           </View>
         </View>
       </SafeAreaView>
