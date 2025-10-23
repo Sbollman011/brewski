@@ -260,11 +260,16 @@ class NextMqttClient extends EventEmitter {
       try { console.log('[mqtt-client] publish', { topic, payload: String(payload), retain }); } catch (e) {}
     }
     this.client.publish(topic, String(payload), { qos: 0, retain }, err => {
-      if (!err && /\/(Target)$/.test(topic)) {
-        this.latestValue.set(topic, String(payload));
-        this.latestRetain.set(topic, retain);
-        if (CONFIG.ENABLE_PERSIST_LATEST && !/DUMMY/i.test(topic)) this.persistLatest();
-      }
+      try {
+        if (!err) {
+          const isTarget = String(topic || '').toLowerCase().endsWith('target');
+          if (isTarget) {
+            this.latestValue.set(topic, String(payload));
+            this.latestRetain.set(topic, retain);
+            if (CONFIG.ENABLE_PERSIST_LATEST && !/DUMMY/i.test(topic)) this.persistLatest();
+          }
+        }
+      } catch (e) {}
       if (cb) cb(err);
     });
   }
